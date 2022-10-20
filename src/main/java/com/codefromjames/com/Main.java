@@ -1,6 +1,7 @@
 package com.codefromjames.com;
 
-import com.codefromjames.com.lib.PartitionMap;
+import com.codefromjames.com.lib.data.PartitionMap;
+import com.codefromjames.com.lib.event.EventBus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
@@ -22,7 +23,8 @@ public class Main implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
-        final PartitionMap partitionMap = new PartitionMap(1024);
+        final EventBus eventBus = new EventBus();
+        final PartitionMap partitionMap = new PartitionMap(eventBus, 1024);
         IntStream.range(0, 8)
                 .mapToObj(i -> {
                     Thread t = new Thread(new LargeThrashingTest(partitionMap, 50, 1024 * 10 * (i + 1)));

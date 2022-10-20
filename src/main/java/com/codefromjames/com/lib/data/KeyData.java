@@ -1,14 +1,22 @@
-package com.codefromjames.com.lib;
+package com.codefromjames.com.lib.data;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
+import com.codefromjames.com.lib.event.events.NewDataEvent;
+
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class KeyData {
+    private final KeyMap parent;
     private final ReentrantLock lock = new ReentrantLock();
-    private final Deque<DataVersion> dataVersions = new ArrayDeque<>();
+    private final String key;
+    private DataVersion dataVersion;
+
+    public KeyData(String key, KeyMap parent) {
+        this.key = key;
+        this.parent = parent;
+    }
 
     private static class DataVersion {
         private final Map<String, byte[]> data;
@@ -20,10 +28,13 @@ public class KeyData {
         }
     }
 
-    public Optional<KeyPayload> getData(String key) {
+    public String getKey() {
+        return key;
+    }
+
+    public Optional<KeyPayload> getData() {
         lock.lock();
         try {
-            final DataVersion dataVersion = dataVersions.peekLast();
             if (dataVersion != null) {
                 return Optional.of(new KeyPayload(key, dataVersion.data));
             }
@@ -33,13 +44,14 @@ public class KeyData {
         }
     }
 
-    public void setData(KeyPayload payload) {
+    public void setData(KeyPayload payload, long version) {
         lock.lock();
         try {
-            // TODO: Implement versioning, remove old versions
-            final DataVersion dataVersion = new DataVersion(payload.getData(), 0);
-            dataVersions.clear();
-            dataVersions.push(dataVersion);
+            dataVersion = new DataVersion(payload.getData(), version);
+            parent.getEventBus().publish(new NewDataEvent(
+                    payload.getKey(),
+                    new HashMap<>(payload.getData()),
+                    version));
         } finally {
             lock.unlock();
         }

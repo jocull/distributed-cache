@@ -1,4 +1,4 @@
-package com.codefromjames.com.lib;
+package com.codefromjames.com.lib.data;
 
 import java.util.Map;
 import java.util.Objects;

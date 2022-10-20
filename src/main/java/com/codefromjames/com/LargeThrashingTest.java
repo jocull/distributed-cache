@@ -1,7 +1,7 @@
 package com.codefromjames.com;
 
-import com.codefromjames.com.lib.KeyPayload;
-import com.codefromjames.com.lib.PartitionMap;
+import com.codefromjames.com.lib.data.KeyPayload;
+import com.codefromjames.com.lib.data.PartitionMap;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.mutable.MutableInt;
 import org.slf4j.Logger;
