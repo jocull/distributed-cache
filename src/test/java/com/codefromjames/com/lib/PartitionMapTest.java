@@ -58,7 +58,7 @@ class PartitionMapTest {
                 .map(key -> {
                     final byte[] data = new byte[32];
                     random.nextBytes(data);
-                    return new KeyPayload(key, data);
+                    return new KeyPayload(key, Map.of("data", data));
                 })
                 .collect(Collectors.toList());
 

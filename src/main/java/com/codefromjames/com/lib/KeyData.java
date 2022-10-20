@@ -2,6 +2,7 @@ package com.codefromjames.com.lib;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -10,10 +11,10 @@ public class KeyData {
     private final Deque<DataVersion> dataVersions = new ArrayDeque<>();
 
     private static class DataVersion {
-        private final byte[] data;
+        private final Map<String, byte[]> data;
         private final long version;
 
-        public DataVersion(byte[] data, long version) {
+        public DataVersion(Map<String, byte[]> data, long version) {
             this.data = data;
             this.version = version;
         }
