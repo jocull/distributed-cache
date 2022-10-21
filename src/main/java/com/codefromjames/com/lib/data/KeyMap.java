@@ -6,40 +6,43 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
-public class KeyMap {
+class KeyMap {
     private final PartitionMap parent;
-    private final Map<String, KeyData> keyMap = new HashMap<>();
+    private final Partition partition;
 
-    public KeyMap(PartitionMap parent) {
+    private final Map<String, KeyValue> keyMap = new HashMap<>();
+
+    public KeyMap(PartitionMap parent, Partition partition) {
         this.parent = parent;
+        this.partition = partition;
     }
 
     EventBus getEventBus() {
         return parent.getEventBus();
     }
 
-    public Optional<KeyPayload> getData(String key) {
-        final KeyData keyData;
+    public Optional<DataVersion> getData(String key) {
+        final KeyValue keyValue;
         synchronized (keyMap) {
-            keyData = keyMap.get(key);
+            keyValue = keyMap.get(key);
         }
-        if (keyData == null) {
+        if (keyValue == null) {
             return Optional.empty();
         }
-        return keyData.getData();
+        return keyValue.getData();
     }
 
-    public void setData(KeyPayload payload, long version) {
-        final KeyData keyData;
+    public void setData(String key, DataVersion dataVersion) {
+        final KeyValue keyValue;
         synchronized (keyMap) {
-            keyData = keyMap.compute(payload.getKey(), (k, v) -> {
+            keyValue = keyMap.compute(key, (k, v) -> {
                 if (v == null) {
-                    return new KeyData(payload.getKey(), this);
+                    return new KeyValue(key, this);
                 }
                 return v;
             });
         }
-        keyData.setData(payload, version);
+        keyValue.setData(dataVersion);
     }
 
     public void getSnapshot() {

@@ -1,6 +1,7 @@
 package com.codefromjames.com;
 
-import com.codefromjames.com.lib.data.KeyPayload;
+import com.codefromjames.com.lib.communication.KeyDataInput;
+import com.codefromjames.com.lib.communication.KeyDataOutput;
 import com.codefromjames.com.lib.data.PartitionMap;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.mutable.MutableInt;
@@ -48,7 +49,7 @@ public class LargeThrashingTest implements Runnable {
             final LargeObject largeObject = new LargeObject(keyRotation.pop(), valueSizeBytes);
             try {
                 partitionMap.getData(largeObject.key)
-                        .map(KeyPayload::getData)
+                        .map(KeyDataOutput::getData)
                         .map(x -> x.get("data"))
                         .map(DigestUtils::sha1Hex)
                         .ifPresent(currentHash -> {
@@ -59,7 +60,7 @@ public class LargeThrashingTest implements Runnable {
                             }
                         });
 
-                partitionMap.setData(new KeyPayload(largeObject.key, Map.of("data", largeObject.blob)));
+                partitionMap.setData(new KeyDataInput(largeObject.key, Map.of("data", largeObject.blob)));
                 LOGGER.debug("Wrote #{}, {} w/ hash {}", counter.getAndIncrement(), largeObject.key, largeObject.hash);
                 ackedKeyHashes.put(largeObject.key, largeObject.hash);
             } catch (Exception ex) {

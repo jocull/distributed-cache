@@ -1,5 +1,7 @@
 package com.codefromjames.com.lib.data;
 
+import com.codefromjames.com.lib.communication.KeyDataOutput;
+import com.codefromjames.com.lib.communication.KeyDataInput;
 import com.codefromjames.com.lib.event.EventBus;
 
 import java.util.HashMap;
@@ -10,7 +12,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public class PartitionMap {
     private final EventBus eventBus;
-    private final AtomicLong seq = new AtomicLong(0L);
+    private final AtomicLong globalVersion = new AtomicLong(0L);
     private final Map<Partition, KeyMap> partitionMap = new HashMap<>();
 
     public PartitionMap(EventBus eventBus, int size) {
@@ -21,7 +23,8 @@ public class PartitionMap {
 
         this.eventBus = eventBus;
         for (int i = 0; i < size; i++) {
-            partitionMap.put(new Partition(i), new KeyMap(this));
+            final Partition partition = new Partition(i);
+            partitionMap.put(partition, new KeyMap(this, partition));
         }
     }
 
@@ -37,13 +40,15 @@ public class PartitionMap {
         return new Partition(Math.abs(key.hashCode() % partitionMap.size()));
     }
 
-    public Optional<KeyPayload> getData(String key) {
-        return partitionMap.get(partitionForKey(key)).getData(key);
+    public Optional<KeyDataOutput> getData(String key) {
+        return partitionMap.get(partitionForKey(key))
+                .getData(key)
+                .map(dataVersion -> new KeyDataOutput(key, dataVersion.getData(), dataVersion.getVersion()));
     }
 
-    public void setData(KeyPayload payload) {
-        final long version = seq.incrementAndGet();
-        partitionMap.get(partitionForKey(payload.getKey())).setData(payload, version);
+    public void setData(KeyDataInput input) {
+        final long version = globalVersion.incrementAndGet();
+        partitionMap.get(partitionForKey(input.getKey())).setData(input.getKey(), new DataVersion(input.getData(), version));
     }
 
     private void getReplicationSnapshot() {

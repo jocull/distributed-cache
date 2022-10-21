@@ -1,16 +1,14 @@
 package com.codefromjames.com.lib;
 
-import com.codefromjames.com.lib.data.KeyPayload;
+import com.codefromjames.com.lib.communication.KeyDataInput;
+import com.codefromjames.com.lib.communication.KeyDataOutput;
 import com.codefromjames.com.lib.data.Partition;
 import com.codefromjames.com.lib.data.PartitionMap;
 import com.codefromjames.com.lib.event.EventBus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.UUID;
+import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -65,20 +63,21 @@ class PartitionMapTest {
     void testDataGetSet() {
         final Random random = new Random();
         final PartitionMap pm = new PartitionMap(eventBus, 256);
-        final List<KeyPayload> payloads = IntStream.range(0, 1000)
+        final List<KeyDataInput> inputs = IntStream.range(0, 1000)
                 .mapToObj(i -> UUID.randomUUID().toString())
                 .map(key -> {
                     final byte[] data = new byte[32];
                     random.nextBytes(data);
-                    return new KeyPayload(key, Map.of("data", data));
+                    return new KeyDataInput(key, Map.of("data", data));
                 })
                 .collect(Collectors.toList());
 
-        payloads.forEach(pm::setData);
-        payloads.forEach(p -> {
-            final String key = p.getKey();
-            final KeyPayload payload = pm.getData(key).orElseThrow();
-            assertEquals(p, payload);
+        inputs.forEach(pm::setData);
+        inputs.forEach(input -> {
+            final String key = input.getKey();
+            final KeyDataOutput output = pm.getData(key).orElseThrow();
+            assertEquals(input.getKey(), output.getKey());
+            assertEquals(input.getData(), output.getData());
         });
     }
 }
