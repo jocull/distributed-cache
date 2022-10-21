@@ -1,6 +1,8 @@
 package com.codefromjames.com.lib.data;
 
+import com.codefromjames.com.lib.communication.KeyDataOutput;
 import com.codefromjames.com.lib.event.EventBus;
+import com.codefromjames.com.lib.event.events.DeleteDataEvent;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -21,7 +23,7 @@ class KeyMap {
         return parent.getEventBus();
     }
 
-    public Optional<DataVersion> getData(String key) {
+    public Optional<DataVersion> getEntry(String key) {
         final KeyValue keyValue;
         synchronized (keyMap) {
             keyValue = keyMap.get(key);
@@ -32,7 +34,7 @@ class KeyMap {
         return keyValue.getData();
     }
 
-    public void setData(String key, DataVersion dataVersion) {
+    public void setEntry(String key, DataVersion dataVersion) {
         final KeyValue keyValue;
         synchronized (keyMap) {
             keyValue = keyMap.compute(key, (k, v) -> {
@@ -45,8 +47,27 @@ class KeyMap {
         keyValue.setData(dataVersion);
     }
 
-    public void getSnapshot() {
-        // keyMap.forEach((k, v) -> new ???);
-        throw new UnsupportedOperationException();
+    public boolean deleteEntry(String key, long version) {
+        final KeyValue removed;
+        synchronized (keyMap) {
+            removed = keyMap.remove(key);
+        }
+        if (removed != null) {
+            getEventBus().publish(new DeleteDataEvent(key, version));
+            return true;
+        }
+        return false;
+    }
+
+    public Map<String, KeyDataOutput> getSnapshot() {
+        synchronized (keyMap) {
+            Map<String, KeyDataOutput> snapshot = new HashMap<>(keyMap.size());
+            keyMap.forEach((k, v) -> {
+                if (v.getData().isPresent()) {
+                    snapshot.put(k, new KeyDataOutput(k, v.getData().get().getData(), v.getData().get().getVersion()));
+                }
+            });
+            return snapshot;
+        }
     }
 }

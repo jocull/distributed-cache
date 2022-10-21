@@ -2,12 +2,12 @@ package com.codefromjames.com.lib.event.events;
 
 import java.util.Map;
 
-public class NewDataEvent {
+public class SetDataEvent {
     private final String key;
     private final Map<String, byte[]> data;
     private final long version;
 
-    public NewDataEvent(String key, Map<String, byte[]> data, long version) {
+    public SetDataEvent(String key, Map<String, byte[]> data, long version) {
         this.key = key;
         this.data = data;
         this.version = version;
@@ -23,5 +23,14 @@ public class NewDataEvent {
 
     public long getVersion() {
         return version;
+    }
+
+    @Override
+    public String toString() {
+        return "SetDataEvent{" +
+                "key='" + key + '\'' +
+                ", data=" + data +
+                ", version=" + version +
+                '}';
     }
 }

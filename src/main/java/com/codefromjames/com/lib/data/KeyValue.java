@@ -1,6 +1,6 @@
 package com.codefromjames.com.lib.data;
 
-import com.codefromjames.com.lib.event.events.NewDataEvent;
+import com.codefromjames.com.lib.event.events.SetDataEvent;
 
 import java.util.Optional;
 
@@ -15,23 +15,16 @@ class KeyValue {
         this.parent = parent;
     }
 
-    public String getKey() {
-        return key;
-    }
-
-    public Optional<DataVersion> getData() {
-        synchronized (this) {
-            return Optional.ofNullable(dataVersion);
-        }
+    public synchronized Optional<DataVersion> getData() {
+        return Optional.ofNullable(dataVersion);
     }
 
     public void setData(DataVersion data) {
+        final SetDataEvent event;
         synchronized (this) {
             dataVersion = data;
-            parent.getEventBus().publish(new NewDataEvent(
-                    key,
-                    data.getData(),
-                    data.getVersion()));
+            event = new SetDataEvent(key, data.getData(), data.getVersion());
         }
+        parent.getEventBus().publish(event);
     }
 }

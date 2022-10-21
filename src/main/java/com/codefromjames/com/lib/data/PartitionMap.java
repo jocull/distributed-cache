@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 public class PartitionMap {
     private final EventBus eventBus;
@@ -28,7 +29,7 @@ public class PartitionMap {
         }
     }
 
-    EventBus getEventBus() {
+    public EventBus getEventBus() {
         return eventBus;
     }
 
@@ -36,22 +37,32 @@ public class PartitionMap {
         return partitionMap.size();
     }
 
-    public Partition partitionForKey(String key) {
+    public Partition getPartitionForKey(String key) {
         return new Partition(Math.abs(key.hashCode() % partitionMap.size()));
     }
 
     public Optional<KeyDataOutput> getData(String key) {
-        return partitionMap.get(partitionForKey(key))
-                .getData(key)
+        return partitionMap.get(getPartitionForKey(key))
+                .getEntry(key)
                 .map(dataVersion -> new KeyDataOutput(key, dataVersion.getData(), dataVersion.getVersion()));
     }
 
     public void setData(KeyDataInput input) {
         final long version = globalVersion.incrementAndGet();
-        partitionMap.get(partitionForKey(input.getKey())).setData(input.getKey(), new DataVersion(input.getData(), version));
+        partitionMap.get(getPartitionForKey(input.getKey())).setEntry(input.getKey(), new DataVersion(input.getData(), version));
     }
 
-    private void getReplicationSnapshot() {
-        throw new UnsupportedOperationException();
+    public boolean deleteData(String key) {
+        final long version = globalVersion.incrementAndGet();
+        return partitionMap.get(getPartitionForKey(key)).deleteEntry(key, version);
+    }
+
+    public Map<Partition, Map<String, KeyDataOutput>> getSnapshot() {
+        // TODO: Semaphore lock the world while doing this?
+        //       Return an object that contains the global version at snapshot time?
+        //       Make the return object a better interface?
+        final Map<Partition, Map<String, KeyDataOutput>> snapshot = new HashMap<>(partitionMap.size());
+        partitionMap.forEach((k, v) -> snapshot.put(k, v.getSnapshot()));
+        return snapshot;
     }
 }

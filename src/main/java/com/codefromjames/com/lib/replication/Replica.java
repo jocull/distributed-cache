@@ -2,7 +2,7 @@ package com.codefromjames.com.lib.replication;
 
 import com.codefromjames.com.lib.event.EventBus;
 import com.codefromjames.com.lib.event.EventSubscriber;
-import com.codefromjames.com.lib.event.events.NewDataEvent;
+import com.codefromjames.com.lib.event.events.SetDataEvent;
 
 public class Replica {
     private final EventBus eventBus;
@@ -13,7 +13,7 @@ public class Replica {
         this.newDataEventSubscriber = new EventSubscriber() {
             @Override
             public void onEvent(Object event) {
-                if (event instanceof NewDataEvent) {
+                if (event instanceof SetDataEvent) {
                     // TODO: Do something here!
                 }
             }
