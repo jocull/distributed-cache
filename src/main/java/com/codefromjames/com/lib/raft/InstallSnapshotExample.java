@@ -1,6 +1,6 @@
-package com.codefromjames.com.lib.communication.raft;
+package com.codefromjames.com.lib.raft;
 
-public class InstallSnapshot {
+public class InstallSnapshotExample {
     // arguments
     long term; // leader's term
     String leaderId; // so follower can redirect clients

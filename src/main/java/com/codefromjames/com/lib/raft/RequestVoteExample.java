@@ -1,6 +1,6 @@
-package com.codefromjames.com.lib.communication.raft;
+package com.codefromjames.com.lib.raft;
 
-public class RequestVote {
+public class RequestVoteExample {
     // arguments
     long term; // candidate's term
     String candidateId; // candidate requesting vote

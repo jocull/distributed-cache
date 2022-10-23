@@ -1,8 +1,8 @@
-package com.codefromjames.com.lib.communication.raft;
+package com.codefromjames.com.lib.raft;
 
 import java.util.List;
 
-public class State {
+public class StateExample {
     // Persistent state on all servers:
     long currentTerm; // last term server has seen (starts at 0 and increments)
     String votedFor; // candidateId that received vote in current term (or null if none)

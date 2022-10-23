@@ -1,8 +1,8 @@
-package com.codefromjames.com.lib.communication.raft;
+package com.codefromjames.com.lib.raft;
 
 import java.util.List;
 
-public class AppendEntries {
+public class AppendEntriesExample {
     // arguments
     long term; // leader's term
     String leaderId; // so follower can redirect clients
