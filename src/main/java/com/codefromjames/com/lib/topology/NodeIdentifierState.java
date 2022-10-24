@@ -4,13 +4,28 @@ import com.codefromjames.com.lib.raft.NodeStates;
 
 public class NodeIdentifierState {
     private final String id;
-    private final String address;
-    private final String hostname;
-    private NodeStates state = NodeStates.NONE;
+    private final NodeAddress nodeAddress;
+    private NodeStates state = NodeStates.FOLLOWER;
 
-    public NodeIdentifierState(String id, String address, String hostname) {
+    public NodeIdentifierState(String id, NodeAddress nodeAddress) {
         this.id = id;
-        this.address = address;
-        this.hostname = hostname;
+        this.nodeAddress = nodeAddress;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    public NodeAddress getNodeAddress() {
+        return nodeAddress;
+    }
+
+    public NodeStates getState() {
+        return state;
+    }
+
+    public NodeIdentifierState setState(NodeStates state) {
+        this.state = state;
+        return this;
     }
 }
