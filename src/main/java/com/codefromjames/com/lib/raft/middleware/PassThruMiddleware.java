@@ -15,11 +15,15 @@ import java.util.function.Consumer;
 public class PassThruMiddleware implements ChannelMiddleware {
     private final Map<NodeAddress, RaftNode> addressRaftNodeMap = new HashMap<>();
 
+    public Map<NodeAddress, RaftNode> getAddressRaftNodeMap() {
+        return Map.copyOf(addressRaftNodeMap);
+    }
+
     public synchronized PassThruMiddleware addNode(RaftNode raftNode) {
         Objects.requireNonNull(raftNode);
-        addressRaftNodeMap.compute(raftNode.getSelf().getNodeAddress(), (k, v) -> {
+        addressRaftNodeMap.compute(raftNode.getNodeAddress(), (k, v) -> {
             if (v != null) {
-                throw new IllegalArgumentException("Node " + v.getSelf().getId() + " already registered!");
+                throw new IllegalArgumentException("Node " + v.getId() + " already registered!");
             }
             return raftNode;
         });
@@ -27,7 +31,7 @@ public class PassThruMiddleware implements ChannelMiddleware {
     }
 
     public synchronized boolean removeNode(RaftNode raftNode) {
-        return addressRaftNodeMap.remove(raftNode.getSelf().getNodeAddress()) != null;
+        return addressRaftNodeMap.remove(raftNode.getNodeAddress()) != null;
     }
 
     @Override
@@ -75,7 +79,7 @@ public class PassThruMiddleware implements ChannelMiddleware {
 
             @Override
             public NodeAddress getAddress() {
-                return raftNode.getNodeAddress();
+                return paired.raftNode.getNodeAddress();
             }
 
             @Override

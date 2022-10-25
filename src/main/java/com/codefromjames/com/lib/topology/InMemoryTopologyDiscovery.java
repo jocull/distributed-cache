@@ -1,13 +1,15 @@
 package com.codefromjames.com.lib.topology;
 
-import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 public class InMemoryTopologyDiscovery implements TopologyDiscovery {
-    private final List<NodeAddress> knownNodes = new ArrayList<>();
+    private final Set<NodeAddress> knownNodes = new HashSet<>();
 
-    public synchronized void addKnownNode(NodeAddress nodeAddress) {
+    public synchronized InMemoryTopologyDiscovery addKnownNode(NodeAddress nodeAddress) {
         knownNodes.add(nodeAddress);
+        return this;
     }
 
     public synchronized boolean removeKnownNode(NodeAddress nodeAddress) {

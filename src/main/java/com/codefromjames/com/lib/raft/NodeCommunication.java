@@ -1,73 +1,76 @@
 package com.codefromjames.com.lib.raft;
 
-import com.codefromjames.com.lib.raft.messages.AnnounceClusterTopology;
-import com.codefromjames.com.lib.raft.messages.Introduction;
+import com.codefromjames.com.lib.raft.messages.*;
 import com.codefromjames.com.lib.raft.middleware.ChannelMiddleware;
-import com.codefromjames.com.lib.topology.ClusterTopology;
+import com.codefromjames.com.lib.topology.NodeAddress;
+import com.codefromjames.com.lib.topology.NodeIdentifierAddress;
 import com.codefromjames.com.lib.topology.NodeIdentifierState;
 
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class NodeCommunication {
-    private final RaftManager raftManager;
-    private final NodeState self;
+    private final RaftNode owner;
     private final ChannelMiddleware.ChannelSide channel;
-    private final ClusterTopology clusterTopology;
+    private String remoteNodeId; // Unknown until introduction
 
-    private NodeState remote = null;
-
-    public NodeCommunication(RaftManager raftManager,
-                             NodeState self,
-                             ChannelMiddleware.ChannelSide channel,
-                             ClusterTopology clusterTopology) {
-        this.raftManager = raftManager;
-        this.self = self;
+    public NodeCommunication(RaftNode owner,
+                             ChannelMiddleware.ChannelSide channel) {
+        this.owner = owner;
         this.channel = channel;
-        this.clusterTopology = clusterTopology;
 
         // Register yourself into this view
-        this.clusterTopology.register(new NodeIdentifierState(self.getId(), self.getNodeAddress()));
+        this.owner.getClusterTopology().register(new NodeIdentifierState(owner.getId(), owner.getNodeAddress()));
 
         this.channel.setReceiver(this::receive);
     }
 
-    public boolean isRemoteLeader() {
-        return NodeStates.LEADER.equals(remote.getState());
+    public Optional<String> getRemoteNodeId() {
+        return Optional.ofNullable(remoteNodeId);
     }
 
-    public void send(Object message) {
+    public NodeAddress getRemoteNodeAddress() {
+        return channel.getAddress();
+    }
+
+    private void send(Object message) {
         channel.send(message);
     }
 
-    public void receive(Object message) {
+    private void receive(Object message) {
         // TODO: Initial lazy version, not very maintainable with growing number of message types
         if (message instanceof Introduction) {
             onIntroduction((Introduction) message);
         } else if (message instanceof AnnounceClusterTopology) {
             onAnnounceClusterTopology((AnnounceClusterTopology) message);
+        } else if (message instanceof VoteRequest) {
+            onVoteRequest((VoteRequest) message);
+        } else if (message instanceof VoteResponse) {
+            onVoteResponse((VoteResponse) message);
+        } else if (message instanceof AppendEntries) {
+            onAppendEntries((AppendEntries) message);
         }
     }
 
     public void introduce() {
         send(new Introduction(
-                self.getId(),
-                self.getNodeAddress(),
-                self.getLastReceivedIndex()
+                owner.getId(),
+                owner.getNodeAddress(),
+                owner.getLastReceivedIndex()
         ));
     }
 
     private void onIntroduction(Introduction introduction) {
         // We register data about the node that has introduced itself
-        clusterTopology.register(new NodeIdentifierState(
+        owner.getClusterTopology().register(new NodeIdentifierState(
                 introduction.getId(),
                 introduction.getNodeAddress()
         ));
-        remote = new NodeState(introduction.getId(), introduction.getNodeAddress())
-                .setLastReceivedIndex(introduction.getLastReceivedIndex());
+        remoteNodeId = introduction.getId();
 
         // And reply with the cluster topology as we know it
         send(new AnnounceClusterTopology(
-                clusterTopology.getTopology().stream()
+                owner.getClusterTopology().getTopology().stream()
                         .map(i -> new AnnounceClusterTopology.NodeIdentifierState(
                                 i.getId(),
                                 i.getNodeAddress(),
@@ -79,7 +82,7 @@ public class NodeCommunication {
 
     private void onAnnounceClusterTopology(AnnounceClusterTopology announceClusterTopology) {
         // When the topology has been received we can update our local view of the world
-        clusterTopology.register(announceClusterTopology.getNodeIdentifierStates().stream()
+        owner.getClusterTopology().register(announceClusterTopology.getNodeIdentifierStates().stream()
                 .map(i -> new NodeIdentifierState(
                         i.getId(),
                         i.getNodeAddress(),
@@ -87,10 +90,31 @@ public class NodeCommunication {
                 ))
                 .collect(Collectors.toList()));
 
-        if (remote == null) {
-            remote = clusterTopology.locate(channel.getAddress())
-                    .map(i -> new NodeState(i.getId(), i.getNodeAddress()))
-                    .orElseThrow(() -> new IllegalStateException("Remote address " + channel.getAddress() + " not found in cluster toplogy: {}" + clusterTopology.getTopology()));
+        if (remoteNodeId == null) {
+            remoteNodeId = owner.getClusterTopology().locate(channel.getAddress())
+                    .map(NodeIdentifierState::getId)
+                    .orElseThrow(() -> new IllegalStateException("Remote address " + channel.getAddress() + " not found in cluster toplogy: {}" + owner.getClusterTopology().getTopology()));
         }
+    }
+
+    public void requestVote(VoteRequest voteRequest) {
+        send(voteRequest);
+    }
+
+    private void onVoteRequest(VoteRequest voteRequest) {
+        owner.requestVote(remoteNodeId, voteRequest)
+                .ifPresent(this::send);
+    }
+
+    private void onVoteResponse(VoteResponse voteResponse) {
+        owner.registerVote(remoteNodeId, voteResponse);
+    }
+
+    public void appendEntries(AppendEntries appendEntries) {
+        send(appendEntries);
+    }
+
+    private void onAppendEntries(AppendEntries appendEntries) {
+        owner.appendEntries(remoteNodeId, appendEntries); // TODO: Needs ack!
     }
 }

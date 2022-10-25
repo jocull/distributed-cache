@@ -30,4 +30,8 @@ public class ClusterTopology {
     public synchronized List<NodeIdentifierState> getTopology() {
         return List.copyOf(identifiers.values());
     }
+
+    public synchronized int getMajorityCount() {
+        return (identifiers.size() / 2) + 1;
+    }
 }
