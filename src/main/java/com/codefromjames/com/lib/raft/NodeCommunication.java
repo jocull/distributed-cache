@@ -4,8 +4,9 @@ import com.codefromjames.com.lib.raft.messages.AnnounceClusterTopology;
 import com.codefromjames.com.lib.raft.messages.Introduction;
 import com.codefromjames.com.lib.raft.middleware.ChannelMiddleware;
 import com.codefromjames.com.lib.topology.ClusterTopology;
-import com.codefromjames.com.lib.topology.NodeAddress;
 import com.codefromjames.com.lib.topology.NodeIdentifierState;
+
+import java.util.stream.Collectors;
 
 public class NodeCommunication {
     private final RaftManager raftManager;
@@ -66,13 +67,25 @@ public class NodeCommunication {
 
         // And reply with the cluster topology as we know it
         send(new AnnounceClusterTopology(
-                clusterTopology.getTopology()
+                clusterTopology.getTopology().stream()
+                        .map(i -> new AnnounceClusterTopology.NodeIdentifierState(
+                                i.getId(),
+                                i.getNodeAddress(),
+                                i.getState()
+                        ))
+                        .collect(Collectors.toList())
         ));
     }
 
     private void onAnnounceClusterTopology(AnnounceClusterTopology announceClusterTopology) {
         // When the topology has been received we can update our local view of the world
-        clusterTopology.register(announceClusterTopology.getNodeIdentifierStates());
+        clusterTopology.register(announceClusterTopology.getNodeIdentifierStates().stream()
+                .map(i -> new NodeIdentifierState(
+                        i.getId(),
+                        i.getNodeAddress(),
+                        i.getState()
+                ))
+                .collect(Collectors.toList()));
 
         if (remote == null) {
             remote = clusterTopology.locate(channel.getAddress())

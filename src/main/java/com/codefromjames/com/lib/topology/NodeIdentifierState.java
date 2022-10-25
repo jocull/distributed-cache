@@ -12,6 +12,11 @@ public class NodeIdentifierState {
         this.nodeAddress = nodeAddress;
     }
 
+    public NodeIdentifierState(String id, NodeAddress nodeAddress, NodeStates nodeStates) {
+        this(id, nodeAddress);
+        this.state = nodeStates;
+    }
+
     public String getId() {
         return id;
     }
