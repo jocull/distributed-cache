@@ -246,6 +246,9 @@ public class RaftNode {
         activeElection = new ActiveElection(voteRequest.getTerm());
         activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
 
+        // Voting resets the election timeout to let the voting process settle
+        scheduleNextElectionTimeout();
+
         return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
     }
 
