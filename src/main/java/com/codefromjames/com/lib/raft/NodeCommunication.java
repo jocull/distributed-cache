@@ -3,16 +3,22 @@ package com.codefromjames.com.lib.raft;
 import com.codefromjames.com.lib.raft.messages.*;
 import com.codefromjames.com.lib.raft.middleware.ChannelMiddleware;
 import com.codefromjames.com.lib.topology.NodeAddress;
-import com.codefromjames.com.lib.topology.NodeIdentifierAddress;
 import com.codefromjames.com.lib.topology.NodeIdentifierState;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class NodeCommunication {
+    private static final Logger LOGGER = LoggerFactory.getLogger(NodeCommunication.class);
+
     private final RaftNode owner;
     private final ChannelMiddleware.ChannelSide channel;
+
     private String remoteNodeId; // Unknown until introduction
+    private long currentIndex;
+    private AppendEntries lastSentEntries;
 
     public NodeCommunication(RaftNode owner,
                              ChannelMiddleware.ChannelSide channel) {
@@ -33,6 +39,10 @@ public class NodeCommunication {
         return channel.getAddress();
     }
 
+    public long getCurrentIndex() {
+        return currentIndex;
+    }
+
     private void send(Object message) {
         channel.send(message);
     }
@@ -49,6 +59,8 @@ public class NodeCommunication {
             onVoteResponse((VoteResponse) message);
         } else if (message instanceof AppendEntries) {
             onAppendEntries((AppendEntries) message);
+        } else if (message instanceof AcknowledgeEntries) {
+            onAcknowledgeEntries((AcknowledgeEntries) message);
         }
     }
 
@@ -111,10 +123,36 @@ public class NodeCommunication {
     }
 
     public void appendEntries(AppendEntries appendEntries) {
+        // Mark the last sent entries
+        lastSentEntries = appendEntries;
         send(appendEntries);
     }
 
     private void onAppendEntries(AppendEntries appendEntries) {
-        owner.appendEntries(remoteNodeId, appendEntries); // TODO: Needs ack!
+        final AcknowledgeEntries ack = owner.appendEntries(remoteNodeId, appendEntries);
+        send(ack);
+    }
+
+    private void onAcknowledgeEntries(AcknowledgeEntries message) {
+        if (message.getTerm() > owner.getCurrentTerm()) {
+            owner.notifyTermChange(remoteNodeId, message.getTerm());
+            return;
+        }
+        if (!message.isSuccess()) {
+            LOGGER.warn("{} received AcknowledgeEntries without success from {}", owner.getId(), remoteNodeId);
+            return;
+        }
+        if (lastSentEntries == null) {
+            LOGGER.warn("{} received AcknowledgeEntries from {} but no last entry available", owner.getId(), remoteNodeId);
+            return;
+        }
+        if (!lastSentEntries.getEntries().isEmpty()) {
+            final long previous = currentIndex;
+            currentIndex = lastSentEntries.getEntries().get(lastSentEntries.getEntries().size() - 1).getIndex();
+            lastSentEntries = null;
+            LOGGER.debug("{} updated {} index. previous: {}, current: {}", owner.getId(), remoteNodeId, previous, currentIndex);
+            return;
+        }
+        owner.updateCommittedIndex();
     }
 }

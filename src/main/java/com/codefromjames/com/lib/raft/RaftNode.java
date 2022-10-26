@@ -1,5 +1,6 @@
 package com.codefromjames.com.lib.raft;
 
+import com.codefromjames.com.lib.raft.messages.AcknowledgeEntries;
 import com.codefromjames.com.lib.raft.messages.AppendEntries;
 import com.codefromjames.com.lib.raft.messages.VoteRequest;
 import com.codefromjames.com.lib.raft.messages.VoteResponse;
@@ -9,14 +10,11 @@ import com.codefromjames.com.lib.topology.NodeAddress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 public class RaftNode {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
@@ -35,12 +33,7 @@ public class RaftNode {
     private final List<NodeCommunication> activeConnections = new ArrayList<>();
 
     // Log management
-    private final AtomicLong commitIndex = new AtomicLong();
-    private final AtomicLong lastReceivedIndex = new AtomicLong();
-    // TODO: Need some better structures here?
-    //       Ways to manage log compaction?
-    //       Ways to make data pending, but not yet committed?
-    //       Ways to disconnect the logs themselves from the state machines they manage?
+    private final RaftLogs logs = new RaftLogs();
 
     // Leadership
     private ScheduledFuture<?> heartbeatTimeout;
@@ -80,7 +73,7 @@ public class RaftNode {
     }
 
     public long getLastReceivedIndex() {
-        return lastReceivedIndex.get();
+        return logs.getCurrentIndex();
     }
 
     public void connectWithTopology() {
@@ -128,6 +121,15 @@ public class RaftNode {
         return connection;
     }
 
+    // TODO: Clean up, part of the client API with the RaftNode
+    public <T> RaftLog<T> submitNewLog(T entry) {
+        if (state != NodeStates.LEADER) {
+            throw new IllegalStateException("Not currently a leader! Instead " + state);
+        }
+
+        return logs.appendLog(entry);
+    }
+
     private boolean hasNodeConnection(NodeAddress remoteAddress) {
         synchronized (activeConnections) {
             if (activeConnections.stream().anyMatch(c -> c.getRemoteNodeAddress().equals(remoteAddress))) {
@@ -135,6 +137,10 @@ public class RaftNode {
             }
             return false;
         }
+    }
+
+    public int getCurrentTerm() {
+        return currentTerm.get();
     }
 
     public ClusterTopology getClusterTopology() {
@@ -164,8 +170,25 @@ public class RaftNode {
         }
     }
 
+    private static AppendEntries.RaftLog transformLog(RaftLog<?> r) {
+        return new AppendEntries.RaftLog(r.getIndex(), r.getEntry());
+    }
+
     private void onHeartbeatTimeout() {
-        activeConnections.forEach(c -> c.appendEntries(new AppendEntries(currentTerm.get(), 0L, commitIndex.get())));
+        synchronized (activeConnections) {
+            activeConnections.forEach(c -> {
+                final List<AppendEntries.RaftLog> entries = logs.getLogRange(c.getCurrentIndex(), 25, RaftNode::transformLog);
+                final long newEndIndex = entries.isEmpty()
+                        ? c.getCurrentIndex()
+                        : entries.get(entries.size() - 1).getIndex();
+                LOGGER.debug("{} Appending {} entries setting index {} -> {} with {} entries", id, c.getRemoteNodeId().orElseThrow(), c.getCurrentIndex(), newEndIndex, entries.size());
+                c.appendEntries(new AppendEntries(
+                        currentTerm.get(),
+                        c.getCurrentIndex(),
+                        logs.getCommitIndex(),
+                        entries));
+            });
+        }
 
         // Chain to the next heartbeat
         scheduleNextHeartbeat();
@@ -182,7 +205,7 @@ public class RaftNode {
     private synchronized void startNextElection() {
         final int previousTerm = currentTerm.getAndIncrement();
         final int nextTerm = previousTerm + 1;
-        final long lastCommittedLogIndex = this.commitIndex.get();
+        final long lastCommittedLogIndex = logs.getCommitIndex();
         final VoteRequest voteRequest = new VoteRequest(nextTerm, id, lastCommittedLogIndex, previousTerm);
 
         // After the election timeout the follower becomes a candidate and starts a new election term...
@@ -195,7 +218,9 @@ public class RaftNode {
         activeElection.voteCount++;
 
         // ...and sends out Request Vote messages to other nodes.
-        activeConnections.forEach(c -> c.requestVote(voteRequest));
+        synchronized (activeConnections) {
+            activeConnections.forEach(c -> c.requestVote(voteRequest));
+        }
     }
 
     public synchronized void registerVote(String incomingNodeId, VoteResponse vote) {
@@ -214,8 +239,9 @@ public class RaftNode {
             if (activeElection.voteCount >= majority) {
                 // This node has won the election.
                 // The leader begins sending out Append Entries messages to its followers.
-                LOGGER.info("{} Became leader of term {} with {} votes of required majority {}", incomingNodeId, activeElection.term, activeElection.voteCount, majority);
+                LOGGER.info("{} Became leader of term {} with {} votes of required majority {}", id, activeElection.term, activeElection.voteCount, majority);
                 activeElection = null;
+                leaderId = id;
                 state = NodeStates.LEADER;
                 scheduleNextHeartbeat();
             }
@@ -245,6 +271,7 @@ public class RaftNode {
         final boolean grantVote = voteRequest.getLastLogIndex() >= getLastReceivedIndex();
         activeElection = new ActiveElection(voteRequest.getTerm());
         activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
+        LOGGER.info("{} Voting for {} w/ grant {}", id, activeElection.votedForNodeId, grantVote);
 
         // Voting resets the election timeout to let the voting process settle
         scheduleNextElectionTimeout();
@@ -252,25 +279,72 @@ public class RaftNode {
         return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
     }
 
-    public void appendEntries(String requestingNodeId, AppendEntries appendEntries) {
-        // TODO: Needs to ack each append message
-        if (appendEntries.getTerm() < this.currentTerm.get()) {
-            LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), this.currentTerm.get());
-            return;
+    public AcknowledgeEntries appendEntries(String requestingNodeId, AppendEntries appendEntries) {
+        if (appendEntries.getTerm() < currentTerm.get()) {
+            LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), currentTerm.get());
+            return new AcknowledgeEntries(currentTerm.get(), false);
         }
-
+        if (logs.getCurrentIndex() != appendEntries.getPreviousLogIndex()) {
+            // TODO: A chance to get stuck here? What happens if indexes get out of sync?
+            //       How should we reset? Will the election timeout take care of it?
+            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), appendEntries.getPreviousLogIndex(), logs.getCurrentIndex());
+            return new AcknowledgeEntries(currentTerm.get(), false);
+        }
+        if (leaderId != null && !leaderId.equals(requestingNodeId)) {
+            LOGGER.warn("{} Append entries request from {} who is not known leader {}", id, requestingNodeId, leaderId);
+            return new AcknowledgeEntries(currentTerm.get(), false);
+        }
         if (leaderId == null) {
             leaderId = requestingNodeId;
             state = NodeStates.FOLLOWER;
             currentTerm.set(appendEntries.getTerm());
             LOGGER.info("{} Made follower of {}", id, requestingNodeId);
-        } else if (!leaderId.equals(requestingNodeId)) {
-            LOGGER.warn("{} Append entries request from {} who is not known leader {}", id, requestingNodeId, leaderId);
-            return; // Does not count as a heartbeat
         }
+
+        // Append the logs
+        appendEntries.getEntries().forEach(r -> logs.appendLog(r.getEntry()));
 
         // Clear the current timeout and register the next one
         scheduleNextElectionTimeout();
+        return new AcknowledgeEntries(currentTerm.get(), true);
+    }
+
+    public void notifyTermChange(String remoteNodeId, int term) {
+        LOGGER.info("{} Notified of term change from {} to {} by {}", id, currentTerm.get(), term, remoteNodeId);
+        if (heartbeatTimeout != null) {
+            heartbeatTimeout.cancel(false);
+            heartbeatTimeout = null;
+        }
+
+        // Reset the follower details
+        leaderId = null;
+        state = NodeStates.FOLLOWER;
+        currentTerm.set(term);
+
+        // Rollback any uncommitted logs
+        logs.rollback();
+
+        scheduleNextElectionTimeout();
+    }
+
+    public void updateCommittedIndex() {
+        final List<Long> currentIndices;
+        synchronized (activeConnections) {
+            currentIndices = activeConnections.stream()
+                    .map(NodeCommunication::getCurrentIndex)
+                    .sorted(((Comparator<Long>) Long::compare).reversed())
+                    .collect(Collectors.toList());
+        }
+        final int majorityCount = clusterTopology.getMajorityCount();
+        if (currentIndices.size() >= majorityCount) {
+            final long majorityMinimumIndex = currentIndices.get(majorityCount - 1);
+            if (majorityMinimumIndex > logs.getCommitIndex()) {
+                LOGGER.debug("{} Has minimum majority index {} to commit", id, majorityMinimumIndex);
+                logs.commit(majorityMinimumIndex);
+            }
+        } else {
+            LOGGER.debug("{} Not a majority to commit with {}", id, currentIndices);
+        }
     }
 
     private static class ActiveElection {

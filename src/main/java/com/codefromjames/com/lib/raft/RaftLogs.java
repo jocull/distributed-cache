@@ -1,6 +1,7 @@
 package com.codefromjames.com.lib.raft;
 
 import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public class RaftLogs {
@@ -20,6 +21,14 @@ public class RaftLogs {
         final RaftLog<T> raftLog = new RaftLog<>(++currentIndex, rawLog);
         logs.add(raftLog);
         return raftLog;
+    }
+
+    public synchronized <TOut> List<TOut> getLogRange(long startIndex, int limit, Function<RaftLog<?>, TOut> fnTransform) {
+        return logs.stream()
+                .filter(r -> r.getIndex() >= startIndex)
+                .map(fnTransform)
+                .limit(limit)
+                .collect(Collectors.toList());
     }
 
     /**

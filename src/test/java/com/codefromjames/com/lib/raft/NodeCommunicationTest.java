@@ -6,6 +6,8 @@ import com.codefromjames.com.lib.topology.NodeAddress;
 import com.codefromjames.com.lib.topology.NodeIdentifierState;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -73,6 +75,59 @@ public class NodeCommunicationTest {
 
             assertEquals(1, leaderCount, "Leader count not as expected!");
             assertEquals(2, followerCount, "Follower count not as expected!");
+        }
+    }
+
+    @Test
+    void testLogReplication() throws InterruptedException {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        final PassThruMiddleware middleware = new PassThruMiddleware();
+        try (RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
+            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
+            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+
+            assertTimeout(Duration.ofSeconds(1), () -> {
+                while (true) {
+                    final int leaderCount = (int) middleware.getAddressRaftNodeMap().values().stream()
+                            .filter(r -> r.getState().equals(NodeStates.LEADER))
+                            .count();
+                    final int followerCount = (int) middleware.getAddressRaftNodeMap().values().stream()
+                            .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
+                            .count();
+
+                    if (leaderCount == 1 && followerCount == 2) {
+                        break;
+                    }
+                    Thread.sleep(100);
+                }
+            }, "Timed out waiting for valid leader and followers");
+
+            final RaftNode raftLeader = middleware.getAddressRaftNodeMap().values().stream()
+                    .filter(r -> r.getState().equals(NodeStates.LEADER))
+                    .findFirst()
+                    .orElseThrow();
+
+            final List<RaftNode> raftFollowers = middleware.getAddressRaftNodeMap().values().stream()
+                    .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
+                    .collect(Collectors.toList());
+
+            raftFollowers.forEach(r -> {
+                assertThrows(IllegalStateException.class, () -> r.submitNewLog("hello"));
+            });
+
+            final RaftLog<String> leaderLog1 = raftLeader.submitNewLog("hello");
+
+            Thread.sleep(1000);
         }
     }
 }

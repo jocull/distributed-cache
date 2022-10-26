@@ -16,7 +16,7 @@ public class RaftLogsTest {
 
         final RaftLog<String> log1 = raftLogs.appendLog("hello");
         assertEquals(1L, log1.getIndex());
-        assertEquals("hello", log1.getLog());
+        assertEquals("hello", log1.getEntry());
         assertEquals(String.class, log1.getLogClass());
 
         assertEquals(1L, raftLogs.getCurrentIndex());
@@ -24,7 +24,7 @@ public class RaftLogsTest {
 
         final RaftLog<String> log2 = raftLogs.appendLog("world");
         assertEquals(2L, log2.getIndex());
-        assertEquals("world", log2.getLog());
+        assertEquals("world", log2.getEntry());
         assertEquals(String.class, log2.getLogClass());
 
         assertEquals(2L, raftLogs.getCurrentIndex());

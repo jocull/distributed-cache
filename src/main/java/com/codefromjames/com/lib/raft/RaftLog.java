@@ -4,13 +4,13 @@ import java.util.Objects;
 
 public class RaftLog<T> {
     private final long index;
-    private final T log;
+    private final T entry;
 
-    public RaftLog(long index, T log) {
-        Objects.requireNonNull(log);
+    public RaftLog(long index, T entry) {
+        Objects.requireNonNull(entry);
 
         this.index = index;
-        this.log = log;
+        this.entry = entry;
     }
 
     public long getIndex() {
@@ -18,18 +18,18 @@ public class RaftLog<T> {
     }
 
     public Class<?> getLogClass() {
-        return log.getClass();
+        return entry.getClass();
     }
 
-    public T getLog() {
-        return log;
+    public T getEntry() {
+        return entry;
     }
 
     @Override
     public String toString() {
         return "RaftLog{" +
                 "index=" + index +
-                ", log=" + log +
+                ", entry=" + entry +
                 '}';
     }
 }
