@@ -188,7 +188,7 @@ public class RaftNode {
         // After the election timeout the follower becomes a candidate and starts a new election term...
         leaderId = null;
         state = NodeStates.CANDIDATE;
-        LOGGER.info("{} Candidate node starting a new election at term {}", id, nextTerm);
+        LOGGER.info("{} Candidate starting a new election at term {}", id, nextTerm);
 
         activeElection = new ActiveElection(nextTerm);
         activeElection.votedForNodeId = id; // ...votes for itself...
@@ -200,15 +200,15 @@ public class RaftNode {
 
     public synchronized void registerVote(String incomingNodeId, VoteResponse vote) {
         if (activeElection == null) {
-            LOGGER.warn("{} Received a vote, but no election is active: {}", id, vote);
+            LOGGER.warn("{} Received a vote from {}, but no election is active: {}", id, incomingNodeId, vote);
             return;
         }
         if (vote.getTerm() != currentTerm.get()) {
-            LOGGER.warn("{} Received a vote, but for the wrong term: {}", id, vote);
+            LOGGER.warn("{} Received a vote from {}, but for the wrong term: {}", id, incomingNodeId, vote);
             return;
         }
         if (vote.isVoteGranted()) {
-            LOGGER.info("{} Received a vote for term {} from node {}", id, vote.getTerm(), incomingNodeId);
+            LOGGER.info("{} Received a vote from {} for term {}", id, incomingNodeId, vote.getTerm());
             activeElection.voteCount++;
             final int majority = clusterTopology.getMajorityCount();
             if (activeElection.voteCount >= majority) {
