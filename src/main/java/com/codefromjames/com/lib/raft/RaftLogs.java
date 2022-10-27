@@ -25,7 +25,7 @@ public class RaftLogs {
 
     public synchronized <TOut> List<TOut> getLogRange(long startIndex, int limit, Function<RaftLog<?>, TOut> fnTransform) {
         return logs.stream()
-                .filter(r -> r.getIndex() >= startIndex)
+                .filter(r -> r.getIndex() > startIndex)
                 .map(fnTransform)
                 .limit(limit)
                 .collect(Collectors.toList());

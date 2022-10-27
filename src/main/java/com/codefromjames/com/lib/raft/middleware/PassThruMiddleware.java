@@ -6,14 +6,26 @@ import com.codefromjames.com.lib.topology.NodeAddress;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Random;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
  * A pass-thru object middleware, great for testing "networks" in memory to validate
- * communication strategies between objects.
+ * communication strategies between objects. Adds random delays between calls to simulate
+ * a fairly low latency network.
  */
-public class PassThruMiddleware implements ChannelMiddleware {
+public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
+    private final Random random = new Random();
+    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(1);
     private final Map<NodeAddress, RaftNode> addressRaftNodeMap = new HashMap<>();
+
+    @Override
+    public void close() {
+        executor.shutdownNow();
+    }
 
     public Map<NodeAddress, RaftNode> getAddressRaftNodeMap() {
         return Map.copyOf(addressRaftNodeMap);
@@ -45,7 +57,7 @@ public class PassThruMiddleware implements ChannelMiddleware {
         return pair.getLeft();
     }
 
-    private static class PassThruPair implements ChannelMiddleware.ChannelPair {
+    private class PassThruPair implements ChannelMiddleware.ChannelPair {
         private final PassThruChannelSide left;
         private final PassThruChannelSide right;
 
@@ -67,34 +79,34 @@ public class PassThruMiddleware implements ChannelMiddleware {
         public ChannelSide getRight() {
             return right;
         }
+    }
 
-        private static class PassThruChannelSide implements ChannelSide {
-            private final RaftNode raftNode;
-            private PassThruChannelSide paired;
-            private Consumer<Object> receiver;
+    private class PassThruChannelSide implements ChannelSide {
+        private final RaftNode raftNode;
+        private PassThruChannelSide paired;
+        private Consumer<Object> receiver;
 
-            private PassThruChannelSide(RaftNode raftNode) {
-                this.raftNode = raftNode;
-            }
+        private PassThruChannelSide(RaftNode raftNode) {
+            this.raftNode = raftNode;
+        }
 
-            @Override
-            public NodeAddress getAddress() {
-                return paired.raftNode.getNodeAddress();
-            }
+        @Override
+        public NodeAddress getAddress() {
+            return paired.raftNode.getNodeAddress();
+        }
 
-            @Override
-            public void setReceiver(Consumer<Object> receiver) {
-                this.receiver = receiver;
-            }
+        @Override
+        public void setReceiver(Consumer<Object> receiver) {
+            this.receiver = receiver;
+        }
 
-            @Override
-            public void send(Object message) {
-                paired.receive(message);
-            }
+        @Override
+        public void send(Object message) {
+            executor.schedule(() -> paired.receive(message), 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
+        }
 
-            private void receive(Object message) {
-                receiver.accept(message);
-            }
+        private void receive(Object message) {
+            executor.schedule(() -> receiver.accept(message), 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
         }
     }
 }

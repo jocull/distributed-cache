@@ -18,7 +18,6 @@ import java.util.stream.Collectors;
 
 public class RaftNode {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
-    private static final Random RANDOM = new Random();
 
     // Node details
     private final String id;
@@ -147,6 +146,10 @@ public class RaftNode {
         return clusterTopology;
     }
 
+    public RaftManager getManager() {
+        return manager;
+    }
+
     private void scheduleNextElectionTimeout() {
         if (!NodeStates.LEADER.equals(state)) {
             // The election timeout is randomized to be between 150ms and 300ms.
@@ -156,7 +159,7 @@ public class RaftNode {
                 electionTimeout.cancel(false);
                 electionTimeout = null;
             }
-            electionTimeout = manager.schedule(this::onElectionTimeout, 150 + RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
+            electionTimeout = manager.schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
         }
     }
 
@@ -181,7 +184,7 @@ public class RaftNode {
                 final long newEndIndex = entries.isEmpty()
                         ? c.getCurrentIndex()
                         : entries.get(entries.size() - 1).getIndex();
-                LOGGER.debug("{} Appending {} entries setting index {} -> {} with {} entries", id, c.getRemoteNodeId().orElseThrow(), c.getCurrentIndex(), newEndIndex, entries.size());
+                LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries", id, c.getRemoteNodeId().orElseThrow(), c.getCurrentIndex(), newEndIndex, entries.size());
                 c.appendEntries(new AppendEntries(
                         currentTerm.get(),
                         c.getCurrentIndex(),
@@ -191,36 +194,30 @@ public class RaftNode {
         }
 
         // Chain to the next heartbeat
+        heartbeatTimeout = null;
         scheduleNextHeartbeat();
     }
 
-    private void onElectionTimeout() {
-        startNextElection();
-
-        // The election timeout keeps going while we wait for responses back.
-        electionTimeout = null; // Avoid canceling this process when scheduling next.
-        scheduleNextElectionTimeout();
-    }
-
-    private synchronized void startNextElection() {
+    private synchronized void onElectionTimeout() {
+        // After the election timeout the follower becomes a candidate and starts a new election term...
+        // ...and sends out Request Vote messages to other nodes.
         final int previousTerm = currentTerm.getAndIncrement();
         final int nextTerm = previousTerm + 1;
         final long lastCommittedLogIndex = logs.getCommitIndex();
         final VoteRequest voteRequest = new VoteRequest(nextTerm, id, lastCommittedLogIndex, previousTerm);
-
-        // After the election timeout the follower becomes a candidate and starts a new election term...
         leaderId = null;
         state = NodeStates.CANDIDATE;
         LOGGER.info("{} Candidate starting a new election at term {}", id, nextTerm);
-
         activeElection = new ActiveElection(nextTerm);
         activeElection.votedForNodeId = id; // ...votes for itself...
         activeElection.voteCount++;
-
-        // ...and sends out Request Vote messages to other nodes.
         synchronized (activeConnections) {
             activeConnections.forEach(c -> c.requestVote(voteRequest));
         }
+
+        // The election timeout keeps going while we wait for responses back.
+        electionTimeout = null; // Avoid canceling this process when scheduling next.
+        scheduleNextElectionTimeout();
     }
 
     public synchronized void registerVote(String incomingNodeId, VoteResponse vote) {
@@ -243,56 +240,58 @@ public class RaftNode {
                 activeElection = null;
                 leaderId = id;
                 state = NodeStates.LEADER;
-                scheduleNextHeartbeat();
+                scheduleNextHeartbeat(); // TODO: This is a hack to clear election timeout...
+                onHeartbeatTimeout(); // Send this heartbeat immediately to announce election results
             }
         }
     }
 
     public synchronized Optional<VoteResponse> requestVote(String requestingNodeId, VoteRequest voteRequest) {
-        if (voteRequest.getTerm() < this.currentTerm.get()) {
-            LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", id, requestingNodeId, voteRequest.getTerm(), this.currentTerm.get());
-            return Optional.empty();
-        }
-        if (activeElection != null) {
-            if (activeElection.term == voteRequest.getTerm()) {
-                LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.votedForNodeId);
+        try {
+            if (voteRequest.getTerm() < this.currentTerm.get()) {
+                LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", id, requestingNodeId, voteRequest.getTerm(), this.currentTerm.get());
                 return Optional.empty();
             }
-            LOGGER.info("{} Resetting active election from term {} to {}", id, activeElection.term, voteRequest.getTerm());
+            if (activeElection != null) {
+                if (activeElection.term == voteRequest.getTerm()) {
+                    LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.votedForNodeId);
+                    return Optional.empty();
+                }
+                LOGGER.info("{} Resetting active election from term {} to {}", id, activeElection.term, voteRequest.getTerm());
+            }
+
+            // If the receiving node hasn't voted yet in this term then it votes for the candidate...
+            // ...and the node resets its election timeout.
+            if (leaderId != null) {
+                LOGGER.info("{} Removing current leader {}", id, leaderId);
+                leaderId = null; // Remove the current leader
+            }
+
+            final boolean grantVote = voteRequest.getLastLogIndex() >= getLastReceivedIndex();
+            activeElection = new ActiveElection(voteRequest.getTerm());
+            activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
+            LOGGER.info("{} Voting for {} w/ grant {}", id, activeElection.votedForNodeId, grantVote);
+            return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
+        } finally {
+            // Voting resets the election timeout to let the voting process settle
+            scheduleNextElectionTimeout();
         }
-
-        // If the receiving node hasn't voted yet in this term then it votes for the candidate...
-        // ...and the node resets its election timeout.
-        if (leaderId != null) {
-            LOGGER.info("{} Removing current leader {}", id, leaderId);
-            leaderId = null; // Remove the current leader
-        }
-
-        final boolean grantVote = voteRequest.getLastLogIndex() >= getLastReceivedIndex();
-        activeElection = new ActiveElection(voteRequest.getTerm());
-        activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
-        LOGGER.info("{} Voting for {} w/ grant {}", id, activeElection.votedForNodeId, grantVote);
-
-        // Voting resets the election timeout to let the voting process settle
-        scheduleNextElectionTimeout();
-
-        return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
     }
 
     public AcknowledgeEntries appendEntries(String requestingNodeId, AppendEntries appendEntries) {
         if (appendEntries.getTerm() < currentTerm.get()) {
             LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), currentTerm.get());
-            return new AcknowledgeEntries(currentTerm.get(), false);
+            return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
         }
         if (logs.getCurrentIndex() != appendEntries.getPreviousLogIndex()) {
             // TODO: A chance to get stuck here? What happens if indexes get out of sync?
             //       How should we reset? Will the election timeout take care of it?
             LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), appendEntries.getPreviousLogIndex(), logs.getCurrentIndex());
-            return new AcknowledgeEntries(currentTerm.get(), false);
+            return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
         }
         if (leaderId != null && !leaderId.equals(requestingNodeId)) {
             LOGGER.warn("{} Append entries request from {} who is not known leader {}", id, requestingNodeId, leaderId);
-            return new AcknowledgeEntries(currentTerm.get(), false);
+            return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
         }
         if (leaderId == null) {
             leaderId = requestingNodeId;
@@ -302,11 +301,17 @@ public class RaftNode {
         }
 
         // Append the logs
+        final long newEndIndex = appendEntries.getEntries().isEmpty()
+                ? logs.getCurrentIndex()
+                : appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
+        LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries", id, requestingNodeId, logs.getCurrentIndex(), newEndIndex, appendEntries.getEntries().size());
         appendEntries.getEntries().forEach(r -> logs.appendLog(r.getEntry()));
+        // Align the commit index with the leader
+        logs.commit(appendEntries.getLeaderCommitIndex());
 
         // Clear the current timeout and register the next one
         scheduleNextElectionTimeout();
-        return new AcknowledgeEntries(currentTerm.get(), true);
+        return new AcknowledgeEntries(currentTerm.get(), true, logs.getCurrentIndex());
     }
 
     public void notifyTermChange(String remoteNodeId, int term) {

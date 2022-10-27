@@ -18,7 +18,6 @@ public class NodeCommunication {
 
     private String remoteNodeId; // Unknown until introduction
     private long currentIndex;
-    private AppendEntries lastSentEntries;
 
     public NodeCommunication(RaftNode owner,
                              ChannelMiddleware.ChannelSide channel) {
@@ -123,8 +122,6 @@ public class NodeCommunication {
     }
 
     public void appendEntries(AppendEntries appendEntries) {
-        // Mark the last sent entries
-        lastSentEntries = appendEntries;
         send(appendEntries);
     }
 
@@ -142,17 +139,7 @@ public class NodeCommunication {
             LOGGER.warn("{} received AcknowledgeEntries without success from {}", owner.getId(), remoteNodeId);
             return;
         }
-        if (lastSentEntries == null) {
-            LOGGER.warn("{} received AcknowledgeEntries from {} but no last entry available", owner.getId(), remoteNodeId);
-            return;
-        }
-        if (!lastSentEntries.getEntries().isEmpty()) {
-            final long previous = currentIndex;
-            currentIndex = lastSentEntries.getEntries().get(lastSentEntries.getEntries().size() - 1).getIndex();
-            lastSentEntries = null;
-            LOGGER.debug("{} updated {} index. previous: {}, current: {}", owner.getId(), remoteNodeId, previous, currentIndex);
-            return;
-        }
+        currentIndex = message.getCurrentIndex();
         owner.updateCommittedIndex();
     }
 }

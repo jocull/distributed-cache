@@ -5,11 +5,14 @@ import com.codefromjames.com.lib.topology.NodeAddress;
 import com.codefromjames.com.lib.topology.TopologyDiscovery;
 
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class RaftManager implements AutoCloseable {
     private static final AtomicInteger RAFT_MANAGER_COUNTER = new AtomicInteger();
+
+    static final Random RANDOM = new Random();
 
     private final TopologyDiscovery topologyDiscovery;
     private final ChannelMiddleware channelMiddleware;
@@ -30,7 +33,7 @@ public class RaftManager implements AutoCloseable {
 
     @Override
     public void close() {
-        scheduledExecutor.shutdown();
+        scheduledExecutor.shutdownNow();
     }
 
     // region Channel Middleware delegates
