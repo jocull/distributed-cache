@@ -83,11 +83,9 @@ public class RaftNode {
                 continue;
             }
             // Skip nodes already connected with
-            synchronized (activeConnections) {
-                if (hasNodeConnection(remoteAddress)) {
-                    LOGGER.debug("{} Already has connection to {} - skipping", id, remoteAddress.getAddress());
-                    continue;
-                }
+            if (hasNodeConnection(remoteAddress)) {
+                LOGGER.debug("{} Already has connection to {} - skipping", id, remoteAddress.getAddress());
+                continue;
             }
             connectTo(remoteAddress);
         }
@@ -101,6 +99,7 @@ public class RaftNode {
             throw new IllegalStateException("Node " + remoteAddress.getAddress() + " already has a connection");
         }
 
+        LOGGER.debug("{} Establishing connection to {}", id, remoteAddress.getAddress());
         final NodeCommunication connection = new NodeCommunication(this, manager.openChannel(this, remoteAddress));
         synchronized (activeConnections) {
             activeConnections.add(connection);
@@ -113,6 +112,7 @@ public class RaftNode {
      * When a connection is made to this node.
      */
     public NodeCommunication onConnection(ChannelMiddleware.ChannelSide incoming) {
+        LOGGER.debug("{} Incoming connection from {}", id, incoming.getAddress());
         final NodeCommunication connection = new NodeCommunication(this, incoming);
         synchronized (activeConnections) {
             activeConnections.add(connection);
