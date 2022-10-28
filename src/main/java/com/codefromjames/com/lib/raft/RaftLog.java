@@ -3,14 +3,20 @@ package com.codefromjames.com.lib.raft;
 import java.util.Objects;
 
 public class RaftLog<T> {
+    private final int term;
     private final long index;
     private final T entry;
 
-    public RaftLog(long index, T entry) {
+    public RaftLog(int term, long index, T entry) {
         Objects.requireNonNull(entry);
 
+        this.term = term;
         this.index = index;
         this.entry = entry;
+    }
+
+    public int getTerm() {
+        return term;
     }
 
     public long getIndex() {
@@ -28,7 +34,8 @@ public class RaftLog<T> {
     @Override
     public String toString() {
         return "RaftLog{" +
-                "index=" + index +
+                "term=" + term +
+                ", index=" + index +
                 ", entry=" + entry +
                 '}';
     }

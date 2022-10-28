@@ -126,7 +126,7 @@ public class RaftNode {
             throw new IllegalStateException("Not currently a leader! Instead " + state);
         }
 
-        return logs.appendLog(entry);
+        return logs.appendLog(getCurrentTerm(), entry);
     }
 
     private boolean hasNodeConnection(NodeAddress remoteAddress) {
@@ -281,7 +281,7 @@ public class RaftNode {
             LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), currentTerm.get());
             return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
         }
-        if (logs.getCurrentIndex() != appendEntries.getPreviousLogIndex()) {
+        if (!logs.containsStartPoint(appendEntries.getTerm(), appendEntries.getPreviousLogIndex())) {
             // TODO: A chance to get stuck here? What happens if indexes get out of sync?
             //       How should we reset? Will the election timeout take care of it?
             LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), appendEntries.getPreviousLogIndex(), logs.getCurrentIndex());
@@ -305,7 +305,7 @@ public class RaftNode {
         } else {
             LOGGER.debug("{} Received heartbeat from {}", id, requestingNodeId);
         }
-        appendEntries.getEntries().forEach(r -> logs.appendLog(r.getEntry()));
+        appendEntries.getEntries().forEach(r -> logs.appendLog(appendEntries.getTerm(), r.getIndex(), r.getEntry()));
         // Align the commit index with the leader
         logs.commit(appendEntries.getLeaderCommitIndex());
 
