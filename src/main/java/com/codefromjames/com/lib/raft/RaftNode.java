@@ -157,7 +157,6 @@ public class RaftNode {
                     && !electionTimeout.isCancelled()
                     && !electionTimeout.isDone()) {
                 electionTimeout.cancel(false);
-                electionTimeout = null;
             }
             electionTimeout = manager.schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
         }
@@ -181,10 +180,12 @@ public class RaftNode {
         synchronized (activeConnections) {
             activeConnections.forEach(c -> {
                 final List<AppendEntries.RaftLog> entries = logs.getLogRange(c.getCurrentIndex(), 25, RaftNode::transformLog);
-                final long newEndIndex = entries.isEmpty()
-                        ? c.getCurrentIndex()
-                        : entries.get(entries.size() - 1).getIndex();
-                LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries", id, c.getRemoteNodeId().orElseThrow(), c.getCurrentIndex(), newEndIndex, entries.size());
+                if (!entries.isEmpty()) {
+                    final long newEndIndex = entries.get(entries.size() - 1).getIndex();
+                    LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries", id, c.getRemoteNodeId().orElseThrow(), c.getCurrentIndex(), newEndIndex, entries.size());
+                } else {
+                    LOGGER.debug("{} Sending heartbeat to {}", id, c.getRemoteNodeId().orElseThrow());
+                }
                 c.appendEntries(new AppendEntries(
                         currentTerm.get(),
                         c.getCurrentIndex(),
@@ -230,13 +231,13 @@ public class RaftNode {
             return;
         }
         if (vote.isVoteGranted()) {
-            LOGGER.info("{} Received a vote from {} for term {}", id, incomingNodeId, vote.getTerm());
             activeElection.voteCount++;
+            LOGGER.info("{} Received a vote from {} for term {} and now has {} votes", id, incomingNodeId, vote.getTerm(), activeElection.voteCount);
             final int majority = clusterTopology.getMajorityCount();
             if (activeElection.voteCount >= majority) {
                 // This node has won the election.
                 // The leader begins sending out Append Entries messages to its followers.
-                LOGGER.info("{} Became leader of term {} with {} votes of required majority {}", id, activeElection.term, activeElection.voteCount, majority);
+                LOGGER.info("{} Became leader of term {} with {} votes of required majority {} of {}", id, activeElection.term, activeElection.voteCount, majority, clusterTopology.getTopology().size());
                 activeElection = null;
                 leaderId = id;
                 state = NodeStates.LEADER;
@@ -301,10 +302,12 @@ public class RaftNode {
         }
 
         // Append the logs
-        final long newEndIndex = appendEntries.getEntries().isEmpty()
-                ? logs.getCurrentIndex()
-                : appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
-        LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries", id, requestingNodeId, logs.getCurrentIndex(), newEndIndex, appendEntries.getEntries().size());
+        if (!appendEntries.getEntries().isEmpty()) {
+            final long newEndIndex = appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
+            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries", id, requestingNodeId, logs.getCurrentIndex(), newEndIndex, appendEntries.getEntries().size());
+        } else {
+            LOGGER.debug("{} Received heartbeat from {}", id, requestingNodeId);
+        }
         appendEntries.getEntries().forEach(r -> logs.appendLog(r.getEntry()));
         // Align the commit index with the leader
         logs.commit(appendEntries.getLeaderCommitIndex());
