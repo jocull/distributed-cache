@@ -248,35 +248,32 @@ public class RaftNode {
     }
 
     public synchronized Optional<VoteResponse> requestVote(String requestingNodeId, VoteRequest voteRequest) {
-        try {
-            if (voteRequest.getTerm() < this.currentTerm.get()) {
-                LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", id, requestingNodeId, voteRequest.getTerm(), this.currentTerm.get());
+        if (voteRequest.getTerm() < this.currentTerm.get()) {
+            LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", id, requestingNodeId, voteRequest.getTerm(), this.currentTerm.get());
+            return Optional.empty();
+        }
+        if (activeElection != null) {
+            if (activeElection.term == voteRequest.getTerm()) {
+                LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.votedForNodeId);
                 return Optional.empty();
             }
-            if (activeElection != null) {
-                if (activeElection.term == voteRequest.getTerm()) {
-                    LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.votedForNodeId);
-                    return Optional.empty();
-                }
-                LOGGER.info("{} Resetting active election from term {} to {}", id, activeElection.term, voteRequest.getTerm());
-            }
-
-            // If the receiving node hasn't voted yet in this term then it votes for the candidate...
-            // ...and the node resets its election timeout.
-            if (leaderId != null) {
-                LOGGER.info("{} Removing current leader {}", id, leaderId);
-                leaderId = null; // Remove the current leader
-            }
-
-            final boolean grantVote = voteRequest.getLastLogIndex() >= getLastReceivedIndex();
-            activeElection = new ActiveElection(voteRequest.getTerm());
-            activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
-            LOGGER.info("{} Voting for {} w/ grant {}", id, activeElection.votedForNodeId, grantVote);
-            return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
-        } finally {
-            // Voting resets the election timeout to let the voting process settle
-            scheduleNextElectionTimeout();
+            LOGGER.info("{} Resetting active election from term {} to {}", id, activeElection.term, voteRequest.getTerm());
         }
+
+        // If the receiving node hasn't voted yet in this term then it votes for the candidate...
+        // ...and the node resets its election timeout.
+        if (leaderId != null) {
+            LOGGER.info("{} Removing current leader {}", id, leaderId);
+            leaderId = null; // Remove the current leader
+        }
+
+        final boolean grantVote = voteRequest.getLastLogIndex() >= getLastReceivedIndex();
+        activeElection = new ActiveElection(voteRequest.getTerm());
+        activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
+        LOGGER.info("{} Voting for {} w/ grant {}", id, activeElection.votedForNodeId, grantVote);
+        // Voting resets the election timeout to let the voting process settle
+        scheduleNextElectionTimeout();
+        return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
     }
 
     public AcknowledgeEntries appendEntries(String requestingNodeId, AppendEntries appendEntries) {
