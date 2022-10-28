@@ -35,11 +35,11 @@ public class RaftNode {
     private final RaftLogs logs = new RaftLogs();
 
     // Leadership
-    private ScheduledFuture<?> heartbeatTimeout;
+    private volatile ScheduledFuture<?> heartbeatTimeout;
     private String leaderId;
 
     // Elections
-    private ScheduledFuture<?> electionTimeout;
+    private volatile ScheduledFuture<?> electionTimeout;
     private ActiveElection activeElection = null;
     private final AtomicInteger currentTerm = new AtomicInteger();
 
@@ -168,7 +168,13 @@ public class RaftNode {
                 electionTimeout.cancel(false);
                 electionTimeout = null;
             }
-            heartbeatTimeout = manager.schedule(this::onHeartbeatTimeout, 50, TimeUnit.MILLISECONDS);
+            LOGGER.debug("{} Scheduled next heartbeat", id);
+            if (heartbeatTimeout != null
+                    && !heartbeatTimeout.isDone()
+                    && !heartbeatTimeout.isCancelled()) {
+                heartbeatTimeout.cancel(false);
+            }
+            heartbeatTimeout = manager.schedule(() -> this.onHeartbeatTimeout(false), 50, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -176,7 +182,13 @@ public class RaftNode {
         return new AppendEntries.RaftLog(r.getIndex(), r.getEntry());
     }
 
-    private void onHeartbeatTimeout() {
+    private void onHeartbeatTimeout(boolean forced) {
+        if (forced) {
+            LOGGER.debug("{} Forced heartbeat timeout!", id);
+        } else {
+            LOGGER.debug("{} Heartbeat timeout!", id);
+        }
+
         synchronized (activeConnections) {
             activeConnections.forEach(c -> {
                 final List<AppendEntries.RaftLog> entries = logs.getLogRange(c.getCurrentIndex(), 25, RaftNode::transformLog);
@@ -242,7 +254,7 @@ public class RaftNode {
                 leaderId = id;
                 state = NodeStates.LEADER;
                 scheduleNextHeartbeat(); // TODO: This is a hack to clear election timeout...
-                onHeartbeatTimeout(); // Send this heartbeat immediately to announce election results
+                onHeartbeatTimeout(true); // Send this heartbeat immediately to announce election results
             }
         }
     }
