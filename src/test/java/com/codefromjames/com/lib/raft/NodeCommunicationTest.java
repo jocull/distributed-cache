@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -66,23 +68,15 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            int leaderCount = 0;
-            int followerCount = 0;
-            final long deadline = System.currentTimeMillis() + 5000;
-            while (System.currentTimeMillis() < deadline) {
-                leaderCount = (int) middleware.getAddressRaftNodeMap().values().stream()
+            assertWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final long leaderCount = (int) middleware.getAddressRaftNodeMap().values().stream()
                         .filter(r -> r.getState().equals(NodeStates.LEADER))
                         .count();
-                followerCount = (int) middleware.getAddressRaftNodeMap().values().stream()
+                final long followerCount = (int) middleware.getAddressRaftNodeMap().values().stream()
                         .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
                         .count();
-                if (leaderCount == 1 && followerCount == 2) {
-                    break;
-                }
-            }
-
-            assertEquals(1, leaderCount, "Leader count not as expected!");
-            assertEquals(2, followerCount, "Follower count not as expected!");
+                return leaderCount == 1 && followerCount == 2;
+            });
         }
     }
 
@@ -104,36 +98,68 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            RaftNode raftLeader = null;
-            List<RaftNode> raftFollowers = null;
-            final long deadline = System.currentTimeMillis() + 5000;
-            while (System.currentTimeMillis() < deadline) {
-                raftLeader = middleware.getAddressRaftNodeMap().values().stream()
+            final LeaderAndFollowers nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final RaftNode raftLeader = middleware.getAddressRaftNodeMap().values().stream()
                         .filter(r -> r.getState().equals(NodeStates.LEADER))
                         .findFirst()
                         .orElse(null);
-                raftFollowers = middleware.getAddressRaftNodeMap().values().stream()
+                final List<RaftNode> raftFollowers = middleware.getAddressRaftNodeMap().values().stream()
                         .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
                         .collect(Collectors.toList());
                 if (raftLeader != null && raftFollowers.size() == 2) {
-                    break;
-                }
-            }
-            assertNotNull(raftLeader, "Leader count not as expected!");
-            assertEquals(2, raftFollowers.size(), "Follower count not as expected!");
+                    return new LeaderAndFollowers() {
+                        @Override
+                        public RaftNode leader() {
+                            return raftLeader;
+                        }
 
-            raftFollowers.forEach(r -> {
+                        @Override
+                        public List<RaftNode> followers() {
+                            return raftFollowers;
+                        }
+                    };
+                }
+                return null;
+            });
+
+            nodes.followers().forEach(r -> {
                 assertThrows(IllegalStateException.class, () -> r.submitNewLog("hello"));
             });
 
-            final RaftLog<String> leaderLog1 = raftLeader.submitNewLog("hello");
+            final RaftLog<String> leaderLog1 = nodes.leader().submitNewLog("hello");
 
             Thread.sleep(500);
-            raftLeader.submitNewLog("hello again");
+            nodes.leader().submitNewLog("hello again");
             Thread.sleep(500);
-            raftLeader.submitNewLog("hello one last time");
+            nodes.leader().submitNewLog("hello one last time");
 
             Thread.sleep(1000);
         }
+    }
+
+    private interface LeaderAndFollowers {
+        RaftNode leader();
+
+        List<RaftNode> followers();
+    }
+
+    private void assertWithinTimeout(String message, long wait, TimeUnit unit, Supplier<Boolean> fnAction) {
+        assertResultWithinTimeout(message, wait, unit, () -> {
+            if (fnAction.get()) {
+                return true;
+            }
+            return null;
+        });
+    }
+
+    private <T> T assertResultWithinTimeout(String message, long wait, TimeUnit unit, Supplier<T> fnAction) {
+        final long deadline = System.currentTimeMillis() + unit.toMillis(wait);
+        while (System.currentTimeMillis() < deadline) {
+            final T result = fnAction.get();
+            if (result != null) {
+                return result;
+            }
+        }
+        throw new AssertionError(message);
     }
 }
