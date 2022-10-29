@@ -85,6 +85,48 @@ public class NodeCommunicationTest {
     }
 
     @Test
+    void testElectionWithFailure() throws InterruptedException {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
+            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
+            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+
+            final LeaderAndFollowers nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+
+            // TODO: Validate this test. The network disconnect wasn't working properly when it was written.
+            final NodeCommunication connection = nodes1.leader().getActiveConnections().get(0);
+            nodes1.leader().disconnect(connection);
+            Thread.sleep(2000);
+            nodes1.leader().connectTo(connection.getRemoteNodeAddress());
+
+            final LeaderAndFollowers nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+        }
+    }
+
+    @Test
     void testLogReplication() throws InterruptedException {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
@@ -103,25 +145,9 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
             final LeaderAndFollowers nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final RaftNode raftLeader = middleware.getAddressRaftNodeMap().values().stream()
-                        .filter(r -> r.getState().equals(NodeStates.LEADER))
-                        .findFirst()
-                        .orElse(null);
-                final List<RaftNode> raftFollowers = middleware.getAddressRaftNodeMap().values().stream()
-                        .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
-                        .collect(Collectors.toList());
-                if (raftLeader != null && raftFollowers.size() == 2) {
-                    return new LeaderAndFollowers() {
-                        @Override
-                        public RaftNode leader() {
-                            return raftLeader;
-                        }
-
-                        @Override
-                        public List<RaftNode> followers() {
-                            return raftFollowers;
-                        }
-                    };
+                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
                 }
                 return null;
             });
@@ -147,9 +173,85 @@ public class NodeCommunicationTest {
                     .collect(Collectors.toList());
 
             final RaftLog<Integer> logLast = logList.get(logList.size() - 1);
-            assertWithinTimeout("Followers didn't get log 3", 5, TimeUnit.SECONDS, () ->
+            assertWithinTimeout("Followers didn't get final log", 5, TimeUnit.SECONDS, () ->
                     nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())));
         }
+    }
+
+    @Test
+    void testLogReplicationDuringTermChange() throws InterruptedException {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
+            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
+            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+
+            final LeaderAndFollowers nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+
+            nodes.followers().forEach(r -> {
+                assertThrows(IllegalStateException.class, () -> r.submitNewLog("hello"));
+            });
+
+            final List<RaftLog<Integer>> logList = IntStream.range(0, 1000)
+                    .mapToObj(i -> nodes.leader().submitNewLog(i))
+                    .collect(Collectors.toList());
+
+            // TODO: Validate this test. The network disconnect wasn't working properly when it was written.
+            Thread.sleep(125);
+            final NodeCommunication connection = nodes.leader().getActiveConnections().get(0);
+            nodes.leader().disconnect(connection);
+            Thread.sleep(500);
+            nodes.leader().connectTo(connection.getRemoteNodeAddress());
+
+            final RaftLog<Integer> logLast = logList.get(logList.size() - 1);
+            assertWithinTimeout("Followers didn't get final log", 5, TimeUnit.SECONDS, () ->
+                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())));
+        }
+    }
+
+    private static LeaderAndFollowers getRaftLeaderAndFollowers(PassThruMiddleware middleware) {
+        final RaftNode leader = getRaftLeader(middleware);
+        final List<RaftNode> followers = getRaftFollowers(middleware);
+        return new LeaderAndFollowers() {
+            @Override
+            public RaftNode leader() {
+                return leader;
+            }
+
+            @Override
+            public List<RaftNode> followers() {
+                return followers;
+            }
+        };
+    }
+
+    private static List<RaftNode> getRaftFollowers(PassThruMiddleware middleware) {
+        return middleware.getAddressRaftNodeMap().values().stream()
+                .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
+                .collect(Collectors.toList());
+    }
+
+    private static RaftNode getRaftLeader(PassThruMiddleware middleware) {
+        return middleware.getAddressRaftNodeMap().values().stream()
+                .filter(r -> r.getState().equals(NodeStates.LEADER))
+                .findFirst()
+                .orElse(null);
     }
 
     private interface LeaderAndFollowers {

@@ -136,10 +136,10 @@ public class NodeCommunication {
             return;
         }
         if (!message.isSuccess()) {
-            LOGGER.warn("{} received AcknowledgeEntries without success from {}", owner.getId(), remoteNodeId);
+            LOGGER.warn("{} received AcknowledgeEntries without success from {}: {}, {}", owner.getId(), remoteNodeId, message.getTerm(), message.getCurrentIndex());
             return;
         }
-        LOGGER.warn("{} received AcknowledgeEntries from {} moving index to {}", owner.getId(), remoteNodeId, message.getCurrentIndex());
+        LOGGER.warn("{} received AcknowledgeEntries from {} moving index {} -> {}", owner.getId(), remoteNodeId, currentIndex, message.getCurrentIndex());
         currentIndex = message.getCurrentIndex();
         owner.updateCommittedIndex();
     }

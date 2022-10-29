@@ -1,5 +1,6 @@
 package com.codefromjames.com.lib.raft;
 
+import com.codefromjames.com.lib.raft.events.LogsCommitted;
 import com.codefromjames.com.lib.raft.messages.AcknowledgeEntries;
 import com.codefromjames.com.lib.raft.messages.AppendEntries;
 import com.codefromjames.com.lib.raft.messages.VoteRequest;
@@ -125,6 +126,21 @@ public class RaftNode {
             activeConnections.add(connection);
         }
         return connection;
+    }
+
+    /* package-private-for-test */ List<NodeCommunication> getActiveConnections() {
+        synchronized (activeConnections) {
+            return List.copyOf(activeConnections);
+        }
+    }
+
+    public void disconnect(NodeCommunication connection) {
+        LOGGER.debug("{} Disconnecting from {}", id, connection.getRemoteNodeAddress().getAddress());
+        synchronized (activeConnections) {
+            if (!activeConnections.removeIf(c -> c.getRemoteNodeAddress().equals(connection.getRemoteNodeAddress()))) {
+                throw new IllegalArgumentException("There is no active connection to " + connection.getRemoteNodeAddress().getAddress());
+            }
+        }
     }
 
     // TODO: Clean up, part of the client API with the RaftNode
@@ -325,8 +341,10 @@ public class RaftNode {
             LOGGER.debug("{} Received heartbeat from {}", id, requestingNodeId);
         }
         appendEntries.getEntries().forEach(r -> logs.appendLog(appendEntries.getTerm(), r.getIndex(), r.getEntry()));
+
         // Align the commit index with the leader
-        logs.commit(appendEntries.getLeaderCommitIndex());
+        final List<RaftLog<?>> committedLogs = logs.commit(appendEntries.getLeaderCommitIndex());
+        manager.getEventBus().publish(new LogsCommitted(committedLogs));
 
         // Clear the current timeout and register the next one
         scheduleNextElectionTimeout();
@@ -364,7 +382,8 @@ public class RaftNode {
             final long majorityMinimumIndex = currentIndices.get(majorityCount - 1);
             if (majorityMinimumIndex > logs.getCommitIndex()) {
                 LOGGER.debug("{} Has minimum majority index {} to commit", id, majorityMinimumIndex);
-                logs.commit(majorityMinimumIndex);
+                final List<RaftLog<?>> committedLogs = logs.commit(majorityMinimumIndex);
+                manager.getEventBus().publish(new LogsCommitted(committedLogs));
             }
         } else {
             LOGGER.debug("{} Not a majority to commit with {}", id, currentIndices);

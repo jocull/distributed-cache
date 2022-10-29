@@ -1,5 +1,6 @@
 package com.codefromjames.com.lib.raft;
 
+import com.codefromjames.com.lib.event.EventBus;
 import com.codefromjames.com.lib.raft.middleware.ChannelMiddleware;
 import com.codefromjames.com.lib.topology.NodeAddress;
 import com.codefromjames.com.lib.topology.TopologyDiscovery;
@@ -14,6 +15,7 @@ public class RaftManager implements AutoCloseable {
 
     static final Random RANDOM = new Random();
 
+    private final EventBus eventBus = new EventBus();
     private final TopologyDiscovery topologyDiscovery;
     private final ChannelMiddleware channelMiddleware;
     private final ScheduledThreadPoolExecutor scheduledExecutor;
@@ -37,6 +39,10 @@ public class RaftManager implements AutoCloseable {
     @Override
     public void close() {
         scheduledExecutor.shutdownNow();
+    }
+
+    public EventBus getEventBus() {
+        return eventBus;
     }
 
     // region Channel Middleware delegates
