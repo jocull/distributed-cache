@@ -32,16 +32,19 @@ public class NodeCommunicationTest {
 
             nodeA.connectTo(nodeB.getNodeAddress());
 
-            // Let the "network" settle
-            Thread.sleep(100);
-
             // nodeA self registers, and contacts nodeB
-            assertEquals(Set.of("nodeA", "nodeB"), nodeA.getClusterTopology().getTopology().stream()
-                    .map(NodeIdentifierState::getId)
-                    .collect(Collectors.toSet()));
-            assertEquals(Set.of("nodeA", "nodeB"), nodeB.getClusterTopology().getTopology().stream()
-                    .map(NodeIdentifierState::getId)
-                    .collect(Collectors.toSet()));
+            assertWithinTimeout("nodeA's topology did not settle with nodeA, nodeB", 100, TimeUnit.MILLISECONDS, () -> {
+                final Set<String> nodeTopology = nodeA.getClusterTopology().getTopology().stream()
+                        .map(NodeIdentifierState::getId)
+                        .collect(Collectors.toSet());
+                return Set.of("nodeA", "nodeB").equals(nodeTopology);
+            });
+            assertWithinTimeout("nodeB's topology did not settle with nodeA, nodeB", 100, TimeUnit.MILLISECONDS, () -> {
+                final Set<String> nodeTopology = nodeB.getClusterTopology().getTopology().stream()
+                        .map(NodeIdentifierState::getId)
+                        .collect(Collectors.toSet());
+                return Set.of("nodeA", "nodeB").equals(nodeTopology);
+            });
         }
     }
 
@@ -126,14 +129,17 @@ public class NodeCommunicationTest {
                 assertThrows(IllegalStateException.class, () -> r.submitNewLog("hello"));
             });
 
-            final RaftLog<String> leaderLog1 = nodes.leader().submitNewLog("hello");
+            final RaftLog<String> log1 = nodes.leader().submitNewLog("hello");
+            assertWithinTimeout("Followers didn't get log 1", 1, TimeUnit.SECONDS, () ->
+                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log1.getTerm(), log1.getIndex())));
 
-            Thread.sleep(500);
-            nodes.leader().submitNewLog("hello again");
-            Thread.sleep(500);
-            nodes.leader().submitNewLog("hello one last time");
+            final RaftLog<String> log2 = nodes.leader().submitNewLog("hello again");
+            assertWithinTimeout("Followers didn't get log 2", 1, TimeUnit.SECONDS, () ->
+                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log2.getTerm(), log2.getIndex())));
 
-            Thread.sleep(1000);
+            final RaftLog<String> log3 = nodes.leader().submitNewLog("hello one last time");
+            assertWithinTimeout("Followers didn't get log 3", 1, TimeUnit.SECONDS, () ->
+                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTerm(), log3.getIndex())));
         }
     }
 

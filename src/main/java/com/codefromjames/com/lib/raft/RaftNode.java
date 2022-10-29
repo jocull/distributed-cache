@@ -75,6 +75,10 @@ public class RaftNode {
         return logs.getCurrentIndex();
     }
 
+    /* package-private-for-test */ RaftLogs getLogs() {
+        return logs;
+    }
+
     public void connectWithTopology() {
         final List<NodeAddress> nodeAddresses = manager.discoverNodes();
         for (NodeAddress remoteAddress : nodeAddresses) {
