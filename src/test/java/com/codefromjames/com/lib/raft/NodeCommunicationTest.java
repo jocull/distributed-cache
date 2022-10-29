@@ -11,6 +11,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -140,6 +141,14 @@ public class NodeCommunicationTest {
             final RaftLog<String> log3 = nodes.leader().submitNewLog("hello one last time");
             assertWithinTimeout("Followers didn't get log 3", 1, TimeUnit.SECONDS, () ->
                     nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTerm(), log3.getIndex())));
+
+            final List<RaftLog<Integer>> logList = IntStream.range(0, 1000)
+                    .mapToObj(i -> nodes.leader().submitNewLog(i))
+                    .collect(Collectors.toList());
+
+            final RaftLog<Integer> logLast = logList.get(logList.size() - 1);
+            assertWithinTimeout("Followers didn't get log 3", 5, TimeUnit.SECONDS, () ->
+                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())));
         }
     }
 

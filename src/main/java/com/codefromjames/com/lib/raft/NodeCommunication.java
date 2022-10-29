@@ -17,7 +17,7 @@ public class NodeCommunication {
     private final ChannelMiddleware.ChannelSide channel;
 
     private String remoteNodeId; // Unknown until introduction
-    private long currentIndex;
+    private volatile long currentIndex;
 
     public NodeCommunication(RaftNode owner,
                              ChannelMiddleware.ChannelSide channel) {
@@ -71,7 +71,7 @@ public class NodeCommunication {
         ));
     }
 
-    private void onIntroduction(Introduction introduction) {
+    private synchronized void onIntroduction(Introduction introduction) {
         // We register data about the node that has introduced itself
         owner.getClusterTopology().register(new NodeIdentifierState(
                 introduction.getId(),
@@ -139,6 +139,7 @@ public class NodeCommunication {
             LOGGER.warn("{} received AcknowledgeEntries without success from {}", owner.getId(), remoteNodeId);
             return;
         }
+        LOGGER.warn("{} received AcknowledgeEntries from {} moving index to {}", owner.getId(), remoteNodeId, message.getCurrentIndex());
         currentIndex = message.getCurrentIndex();
         owner.updateCommittedIndex();
     }

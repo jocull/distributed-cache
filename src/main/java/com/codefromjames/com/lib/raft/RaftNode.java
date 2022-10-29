@@ -10,7 +10,10 @@ import com.codefromjames.com.lib.topology.NodeAddress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -22,7 +25,7 @@ public class RaftNode {
     // Node details
     private final String id;
     private final NodeAddress nodeAddress;
-    private NodeStates state = NodeStates.FOLLOWER; // All nodes start in FOLLOWER state until they hear from a leader or start an election
+    private volatile NodeStates state = NodeStates.FOLLOWER; // All nodes start in FOLLOWER state until they hear from a leader or start an election
 
     // Node management
     private final RaftManager manager;
@@ -36,11 +39,11 @@ public class RaftNode {
 
     // Leadership
     private volatile ScheduledFuture<?> heartbeatTimeout;
-    private String leaderId;
+    private volatile String leaderId;
 
     // Elections
     private volatile ScheduledFuture<?> electionTimeout;
-    private ActiveElection activeElection = null;
+    private volatile ActiveElection activeElection = null;
     private final AtomicInteger currentTerm = new AtomicInteger();
 
     public RaftNode(String id,
@@ -156,12 +159,12 @@ public class RaftNode {
 
     private void scheduleNextElectionTimeout() {
         if (!NodeStates.LEADER.equals(state)) {
-            // The election timeout is randomized to be between 150ms and 300ms.
             if (electionTimeout != null
                     && !electionTimeout.isCancelled()
                     && !electionTimeout.isDone()) {
                 electionTimeout.cancel(false);
             }
+            // The election timeout is randomized to be between 150ms and 300ms.
             electionTimeout = manager.schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
         }
     }
