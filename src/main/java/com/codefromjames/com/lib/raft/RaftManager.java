@@ -29,6 +29,9 @@ public class RaftManager implements AutoCloseable {
         scheduledExecutor = new ScheduledThreadPoolExecutor(
                 Runtime.getRuntime().availableProcessors() * 2 ,
                 r -> new Thread(r, "raft-manager-" + thisManagerCount + "-" + threadCounter.getAndIncrement()));
+        scheduledExecutor.setRemoveOnCancelPolicy(true);
+        scheduledExecutor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        scheduledExecutor.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
     }
 
     @Override
