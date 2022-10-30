@@ -257,7 +257,7 @@ public class RaftNode {
         scheduleNextElectionTimeout();
     }
 
-    public synchronized void registerVote(String incomingNodeId, VoteResponse vote) {
+    public synchronized void onVoteResponse(String incomingNodeId, VoteResponse vote) {
         if (activeElection == null) {
             LOGGER.warn("{} Received a vote from {}, but no election is active: {}", id, incomingNodeId, vote);
             return;
@@ -283,17 +283,27 @@ public class RaftNode {
         }
     }
 
-    public synchronized Optional<VoteResponse> requestVote(String requestingNodeId, VoteRequest voteRequest) {
+    public synchronized Optional<VoteResponse> onRequestVote(String requestingNodeId, VoteRequest voteRequest) {
         if (voteRequest.getTerm() < this.currentTerm.get()) {
             LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", id, requestingNodeId, voteRequest.getTerm(), this.currentTerm.get());
             return Optional.empty();
         }
         if (activeElection != null) {
-            if (activeElection.term == voteRequest.getTerm()) {
+            if (voteRequest.getTerm() < activeElection.term) {
+                LOGGER.info("{} Received a vote request from {} for term {} but active voting term is {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.term);
+                return Optional.empty();
+            } else if (voteRequest.getTerm() == activeElection.term
+                    && activeElection.votedForNodeId != null) {
                 LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.votedForNodeId);
                 return Optional.empty();
+            } else if (voteRequest.getTerm() > activeElection.term) {
+                LOGGER.info("{} Received a vote request from {} for term {}, and reset active election from term {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.term);
+                activeElection = new ActiveElection(voteRequest.getTerm());
+                currentTerm.set(voteRequest.getTerm());
             }
-            LOGGER.info("{} Resetting active election from term {} to {}", id, activeElection.term, voteRequest.getTerm());
+        } else {
+            LOGGER.info("{} Received a vote request from {} for term {} will begin a new active election", id, requestingNodeId, voteRequest.getTerm());
+            activeElection = new ActiveElection(voteRequest.getTerm());
         }
 
         // If the receiving node hasn't voted yet in this term then it votes for the candidate...
@@ -303,16 +313,16 @@ public class RaftNode {
             leaderId = null; // Remove the current leader
         }
 
-        final boolean grantVote = voteRequest.getLastLogIndex() >= getLastReceivedIndex();
-        activeElection = new ActiveElection(voteRequest.getTerm());
+        final long lastReceivedIndex = getLastReceivedIndex();
+        final boolean grantVote = voteRequest.getLastLogIndex() >= lastReceivedIndex;
         activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
-        LOGGER.info("{} Voting for {} w/ grant {}", id, activeElection.votedForNodeId, grantVote);
+        LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", id, activeElection.term, activeElection.votedForNodeId, grantVote, voteRequest.getLastLogIndex(), lastReceivedIndex);
         // Voting resets the election timeout to let the voting process settle
         scheduleNextElectionTimeout();
         return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
     }
 
-    public AcknowledgeEntries appendEntries(String requestingNodeId, AppendEntries appendEntries) {
+    public AcknowledgeEntries onAppendEntries(String requestingNodeId, AppendEntries appendEntries) {
         if (appendEntries.getTerm() < currentTerm.get()) {
             LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), currentTerm.get());
             return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
@@ -370,7 +380,7 @@ public class RaftNode {
         scheduleNextElectionTimeout();
     }
 
-    public void updateCommittedIndex() {
+    public synchronized void updateCommittedIndex() {
         final List<Long> currentIndices;
         synchronized (activeConnections) {
             currentIndices = activeConnections.stream()

@@ -113,12 +113,12 @@ public class NodeCommunication {
     }
 
     private void onVoteRequest(VoteRequest voteRequest) {
-        owner.requestVote(remoteNodeId, voteRequest)
+        owner.onRequestVote(remoteNodeId, voteRequest)
                 .ifPresent(this::send);
     }
 
     private void onVoteResponse(VoteResponse voteResponse) {
-        owner.registerVote(remoteNodeId, voteResponse);
+        owner.onVoteResponse(remoteNodeId, voteResponse);
     }
 
     public void appendEntries(AppendEntries appendEntries) {
@@ -126,7 +126,7 @@ public class NodeCommunication {
     }
 
     private void onAppendEntries(AppendEntries appendEntries) {
-        final AcknowledgeEntries ack = owner.appendEntries(remoteNodeId, appendEntries);
+        final AcknowledgeEntries ack = owner.onAppendEntries(remoteNodeId, appendEntries);
         send(ack);
     }
 
