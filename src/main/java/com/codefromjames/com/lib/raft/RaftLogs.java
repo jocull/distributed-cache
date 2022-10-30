@@ -66,13 +66,13 @@ public class RaftLogs {
                 break;
             }
             if (next.getIndex() == index) {
-                LOGGER.debug("Existing log found from term {}, index {}", next.getTerm(), next.getIndex());
+                LOGGER.trace("Existing log found from term {}, index {}", next.getTerm(), next.getIndex());
                 //noinspection unchecked
                 return (RaftLog<T>) next;
             }
         }
 
-        LOGGER.debug("Added new log with term {}, index {}", term, index);
+        LOGGER.trace("Added new log with term {}, index {}", term, index);
         final RaftLog<T> raftLog = new RaftLog<>(term, index, rawLog);
         logs.add(raftLog);
         if (index > currentIndex) {
