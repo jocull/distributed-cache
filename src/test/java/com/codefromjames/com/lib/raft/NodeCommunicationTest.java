@@ -38,13 +38,13 @@ public class NodeCommunicationTest {
             nodeA.connectTo(nodeB.getNodeAddress());
 
             // nodeA self registers, and contacts nodeB
-            assertWithinTimeout("nodeA's topology did not settle with nodeA, nodeB", 100, TimeUnit.MILLISECONDS, () -> {
+            assertWithinTimeout("nodeA's topology did not settle with nodeA, nodeB", 1000, TimeUnit.MILLISECONDS, () -> {
                 final Set<String> nodeTopology = nodeA.getClusterTopology().getTopology().stream()
                         .map(NodeIdentifierState::getId)
                         .collect(Collectors.toSet());
                 return Set.of("nodeA", "nodeB").equals(nodeTopology);
             });
-            assertWithinTimeout("nodeB's topology did not settle with nodeA, nodeB", 100, TimeUnit.MILLISECONDS, () -> {
+            assertWithinTimeout("nodeB's topology did not settle with nodeA, nodeB", 1000, TimeUnit.MILLISECONDS, () -> {
                 final Set<String> nodeTopology = nodeB.getClusterTopology().getTopology().stream()
                         .map(NodeIdentifierState::getId)
                         .collect(Collectors.toSet());
