@@ -23,13 +23,13 @@ import java.util.stream.Collectors;
 public class RaftNode {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
 
+    // Node management
+    private final RaftManager manager;
+
     // Node details
     private final String id;
     private final NodeAddress nodeAddress;
-    private volatile NodeStates state = NodeStates.FOLLOWER; // All nodes start in FOLLOWER state until they hear from a leader or start an election
-
-    // Node management
-    private final RaftManager manager;
+    private volatile RaftNodeBehavior behavior;
 
     // Topology and connections
     private final ClusterTopology clusterTopology;
@@ -37,15 +37,6 @@ public class RaftNode {
 
     // Log management
     private final RaftLogs logs = new RaftLogs();
-
-    // Leadership
-    private volatile ScheduledFuture<?> heartbeatTimeout;
-    private volatile String leaderId;
-
-    // Elections
-    private volatile ScheduledFuture<?> electionTimeout;
-    private volatile ActiveElection activeElection = null;
-    private final AtomicInteger currentTerm = new AtomicInteger();
 
     public RaftNode(String id,
                     NodeAddress nodeAddress,
@@ -59,8 +50,8 @@ public class RaftNode {
     }
 
     public void start() {
-        // TODO: This only starts if we're a follower, otherwise we emit heartbeats on an interval.
-        scheduleNextElectionTimeout();
+        // All nodes start in FOLLOWER state until they hear from a leader or start an election
+        behavior = new RaftNodeBehaviorFollower(this, 0);
     }
 
     public String getId() {
@@ -72,7 +63,7 @@ public class RaftNode {
     }
 
     public NodeStates getState() {
-        return state;
+        return behavior.getState();
     }
 
     public long getLastReceivedIndex() {
@@ -146,8 +137,8 @@ public class RaftNode {
 
     // TODO: Clean up, part of the client API with the RaftNode
     public <T> RaftLog<T> submitNewLog(T entry) {
-        if (state != NodeStates.LEADER) {
-            throw new IllegalStateException("Not currently a leader! Instead " + state);
+        if (getState() != NodeStates.LEADER) {
+            throw new IllegalStateException("Not currently a leader! Instead " + getState());
         }
 
         return logs.appendLog(getCurrentTerm(), entry);
@@ -163,7 +154,7 @@ public class RaftNode {
     }
 
     public int getCurrentTerm() {
-        return currentTerm.get();
+        return behavior.getTerm();
     }
 
     public ClusterTopology getClusterTopology() {
@@ -174,87 +165,8 @@ public class RaftNode {
         return manager;
     }
 
-    private void scheduleNextElectionTimeout() {
-        if (!NodeStates.LEADER.equals(state)) {
-            if (electionTimeout != null
-                    && !electionTimeout.isCancelled()
-                    && !electionTimeout.isDone()) {
-                electionTimeout.cancel(false);
-            }
-            // The election timeout is randomized to be between 150ms and 300ms.
-            electionTimeout = manager.schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
-        }
-    }
-
-    private void scheduleNextHeartbeat() {
-        if (NodeStates.LEADER.equals(state)) {
-            if (electionTimeout != null) {
-                electionTimeout.cancel(false);
-                electionTimeout = null;
-            }
-            LOGGER.debug("{} Scheduled next heartbeat", id);
-            if (heartbeatTimeout != null
-                    && !heartbeatTimeout.isDone()
-                    && !heartbeatTimeout.isCancelled()) {
-                heartbeatTimeout.cancel(false);
-            }
-            heartbeatTimeout = manager.schedule(() -> this.onHeartbeatTimeout(false), 50, TimeUnit.MILLISECONDS);
-        }
-    }
-
     private static AppendEntries.RaftLog transformLog(RaftLog<?> r) {
         return new AppendEntries.RaftLog(r.getIndex(), r.getEntry());
-    }
-
-    private void onHeartbeatTimeout(boolean forced) {
-        if (forced) {
-            LOGGER.debug("{} Forced heartbeat timeout!", id);
-        } else {
-            LOGGER.debug("{} Heartbeat timeout!", id);
-        }
-
-        synchronized (activeConnections) {
-            activeConnections.forEach(c -> {
-                final List<AppendEntries.RaftLog> entries = logs.getLogRange(c.getCurrentIndex(), 25, RaftNode::transformLog);
-                if (!entries.isEmpty()) {
-                    final long newEndIndex = entries.get(entries.size() - 1).getIndex();
-                    LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries", id, c.getRemoteNodeId().orElseThrow(), c.getCurrentIndex(), newEndIndex, entries.size());
-                } else {
-                    LOGGER.debug("{} Sending heartbeat to {}", id, c.getRemoteNodeId().orElseThrow());
-                }
-                c.appendEntries(new AppendEntries(
-                        currentTerm.get(),
-                        c.getCurrentIndex(),
-                        logs.getCommitIndex(),
-                        entries));
-            });
-        }
-
-        // Chain to the next heartbeat
-        heartbeatTimeout = null;
-        scheduleNextHeartbeat();
-    }
-
-    private synchronized void onElectionTimeout() {
-        // After the election timeout the follower becomes a candidate and starts a new election term...
-        // ...and sends out Request Vote messages to other nodes.
-        final int previousTerm = currentTerm.getAndIncrement();
-        final int nextTerm = previousTerm + 1;
-        final long lastCommittedLogIndex = logs.getCommitIndex();
-        final VoteRequest voteRequest = new VoteRequest(nextTerm, id, lastCommittedLogIndex, previousTerm);
-        leaderId = null;
-        state = NodeStates.CANDIDATE;
-        LOGGER.info("{} Candidate starting a new election at term {}", id, nextTerm);
-        activeElection = new ActiveElection(nextTerm);
-        activeElection.votedForNodeId = id; // ...votes for itself...
-        activeElection.voteCount++;
-        synchronized (activeConnections) {
-            activeConnections.forEach(c -> c.requestVote(voteRequest));
-        }
-
-        // The election timeout keeps going while we wait for responses back.
-        electionTimeout = null; // Avoid canceling this process when scheduling next.
-        scheduleNextElectionTimeout();
     }
 
     public synchronized void onVoteResponse(String incomingNodeId, VoteResponse vote) {
@@ -362,6 +274,7 @@ public class RaftNode {
         return new AcknowledgeEntries(currentTerm.get(), true, logs.getCurrentIndex());
     }
 
+    @Deprecated
     public void notifyTermChange(String remoteNodeId, int term) {
         LOGGER.info("{} Notified of term change from {} to {} by {}", id, currentTerm.get(), term, remoteNodeId);
         if (heartbeatTimeout != null) {
@@ -398,16 +311,6 @@ public class RaftNode {
             }
         } else {
             LOGGER.debug("{} Not a majority to commit with {}", id, currentIndices);
-        }
-    }
-
-    private static class ActiveElection {
-        private final int term;
-        private int voteCount;
-        private String votedForNodeId;
-
-        public ActiveElection(int term) {
-            this.term = term;
         }
     }
 }
