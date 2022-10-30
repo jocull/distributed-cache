@@ -3,10 +3,7 @@ package com.codefromjames.com.lib.raft.middleware;
 import com.codefromjames.com.lib.raft.RaftNode;
 import com.codefromjames.com.lib.topology.NodeAddress;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -21,6 +18,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
     private final Random random = new Random();
     private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(1);
     private final Map<NodeAddress, RaftNode> addressRaftNodeMap = new HashMap<>();
+    private final List<PassThruPair> connections = new ArrayList<>();
 
     @Override
     public void close() {
@@ -46,6 +44,26 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
         return addressRaftNodeMap.remove(raftNode.getNodeAddress()) != null;
     }
 
+    public void interrupt(NodeAddress nodeAddress) {
+        synchronized (connections) {
+            connections.forEach(c -> {
+                if (c.left.getAddress().equals(nodeAddress) || c.right.getAddress().equals(nodeAddress)) {
+                    c.interrupt();
+                }
+            });
+        }
+    }
+
+    public void restore(NodeAddress nodeAddress) {
+        synchronized (connections) {
+            connections.forEach(c -> {
+                if (c.left.getAddress().equals(nodeAddress) || c.right.getAddress().equals(nodeAddress)) {
+                    c.restore();
+                }
+            });
+        }
+    }
+
     @Override
     public ChannelMiddleware.ChannelSide openChannel(RaftNode source, NodeAddress targetAddress) {
         final RaftNode target = addressRaftNodeMap.get(targetAddress);
@@ -54,6 +72,9 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
         }
         final PassThruPair pair = new PassThruPair(source, target);
         target.onConnection(pair.getRight());
+        synchronized (connections) {
+            connections.add(pair);
+        }
         return pair.getLeft();
     }
 
@@ -68,6 +89,16 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
             // Link left and right together
             left.paired = right;
             right.paired = left;
+        }
+
+        public void interrupt() {
+            left.interrupted = true;
+            right.interrupted = true;
+        }
+
+        public void restore() {
+            left.interrupted = false;
+            right.interrupted = false;
         }
 
         @Override
@@ -85,6 +116,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
         private final RaftNode raftNode;
         private PassThruChannelSide paired;
         private Consumer<Object> receiver;
+        private volatile boolean interrupted = false;
 
         private PassThruChannelSide(RaftNode raftNode) {
             this.raftNode = raftNode;
@@ -102,11 +134,23 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
 
         @Override
         public void send(Object message) {
-            executor.schedule(() -> paired.receive(message), 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
+            if (!interrupted) {
+                executor.schedule(() -> {
+                    if (!interrupted) {
+                        paired.receive(message);
+                    }
+                }, 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
+            }
         }
 
         private void receive(Object message) {
-            executor.schedule(() -> receiver.accept(message), 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
+            if (!interrupted) {
+                executor.schedule(() -> {
+                    if (!interrupted) {
+                        receiver.accept(message);
+                    }
+                }, 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
+            }
         }
     }
 }

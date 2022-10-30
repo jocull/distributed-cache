@@ -5,6 +5,8 @@ import com.codefromjames.com.lib.topology.InMemoryTopologyDiscovery;
 import com.codefromjames.com.lib.topology.NodeAddress;
 import com.codefromjames.com.lib.topology.NodeIdentifierState;
 import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Set;
@@ -16,6 +18,8 @@ import java.util.stream.IntStream;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class NodeCommunicationTest {
+    private static final Logger LOGGER = LoggerFactory.getLogger(NodeCommunicationTest.class);
+
     @Test
     void testNodeIntroductions() throws InterruptedException {
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
@@ -110,13 +114,19 @@ public class NodeCommunicationTest {
                 return null;
             });
 
-            // TODO: Validate this test. The network disconnect wasn't working properly when it was written.
-            final NodeCommunication connection = nodes1.leader().getActiveConnections().get(0);
-            nodes1.leader().disconnect(connection);
-            Thread.sleep(2000);
-            nodes1.leader().connectTo(connection.getRemoteNodeAddress());
-
+            LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
+            middleware.interrupt(nodes1.leader().getNodeAddress());
             final LeaderAndFollowers nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 1) {
+                    return result;
+                }
+                return null;
+            });
+
+            LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
+            middleware.restore(nodes1.leader().getNodeAddress());
+            final LeaderAndFollowers nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -196,7 +206,7 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            final LeaderAndFollowers nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+            final LeaderAndFollowers nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -204,24 +214,41 @@ public class NodeCommunicationTest {
                 return null;
             });
 
-            nodes.followers().forEach(r -> {
+            nodes1.followers().forEach(r -> {
                 assertThrows(IllegalStateException.class, () -> r.submitNewLog("hello"));
             });
 
             final List<RaftLog<Integer>> logList = IntStream.range(0, 1000)
-                    .mapToObj(i -> nodes.leader().submitNewLog(i))
+                    .mapToObj(i -> nodes1.leader().submitNewLog(i))
                     .collect(Collectors.toList());
 
-            // TODO: Validate this test. The network disconnect wasn't working properly when it was written.
             Thread.sleep(125);
-            final NodeCommunication connection = nodes.leader().getActiveConnections().get(0);
-            nodes.leader().disconnect(connection);
-            Thread.sleep(500);
-            nodes.leader().connectTo(connection.getRemoteNodeAddress());
+            LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
+            middleware.interrupt(nodes1.leader().getNodeAddress());
+            final LeaderAndFollowers nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 1) {
+                    return result;
+                }
+                return null;
+            });
+
+            // Stay interrupted for a while
+            Thread.sleep(2000);
+
+            LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
+            middleware.restore(nodes1.leader().getNodeAddress());
+            final LeaderAndFollowers nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
 
             final RaftLog<Integer> logLast = logList.get(logList.size() - 1);
             assertWithinTimeout("Followers didn't get final log", 5, TimeUnit.SECONDS, () ->
-                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())));
+                    nodes1.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())));
         }
     }
 
@@ -275,6 +302,12 @@ public class NodeCommunicationTest {
             final T result = fnAction.get();
             if (result != null) {
                 return result;
+            }
+            try {
+                //noinspection BusyWait
+                Thread.sleep(50);
+            } catch (InterruptedException ex) {
+                throw new RuntimeException(ex);
             }
         }
         throw new AssertionError(message);

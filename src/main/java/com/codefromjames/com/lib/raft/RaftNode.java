@@ -136,11 +136,12 @@ public class RaftNode {
 
     public void disconnect(NodeCommunication connection) {
         LOGGER.debug("{} Disconnecting from {}", id, connection.getRemoteNodeAddress().getAddress());
-        synchronized (activeConnections) {
-            if (!activeConnections.removeIf(c -> c.getRemoteNodeAddress().equals(connection.getRemoteNodeAddress()))) {
-                throw new IllegalArgumentException("There is no active connection to " + connection.getRemoteNodeAddress().getAddress());
-            }
-        }
+        throw new UnsupportedOperationException("Disconnect not yet implemented!");
+//        synchronized (activeConnections) {
+//            if (!activeConnections.removeIf(c -> c.getRemoteNodeAddress().equals(connection.getRemoteNodeAddress()))) {
+//                throw new IllegalArgumentException("There is no active connection to " + connection.getRemoteNodeAddress().getAddress());
+//            }
+//        }
     }
 
     // TODO: Clean up, part of the client API with the RaftNode
