@@ -19,7 +19,7 @@ public class RaftNode {
     // Node details
     private final String id;
     private final NodeAddress nodeAddress;
-    private volatile RaftNodeBehavior behavior;
+    private volatile RaftNodeBehavior behavior = new RaftNodeBehaviorFollowerInitial(this);
 
     // Topology and connections
     private final ClusterTopology clusterTopology;
@@ -41,6 +41,7 @@ public class RaftNode {
 
     public void start() {
         // All nodes start in FOLLOWER state until they hear from a leader or start an election
+        behavior.close();
         behavior = new RaftNodeBehaviorFollower(this, 0);
     }
 
