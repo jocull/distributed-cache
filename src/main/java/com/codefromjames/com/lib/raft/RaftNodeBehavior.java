@@ -30,6 +30,14 @@ abstract class RaftNodeBehavior {
         return term;
     }
 
+    public String getLeaderId() {
+        return leaderId;
+    }
+
+    public void setLeaderId(String leaderId) {
+        this.leaderId = leaderId;
+    }
+
     abstract void close();
 
     AnnounceClusterTopology onIntroduction(Introduction introduction) {
@@ -60,11 +68,11 @@ abstract class RaftNodeBehavior {
                 .collect(Collectors.toList()));
     }
 
-    abstract Optional<VoteResponse> onVoteRequest(String remoteNodeId, VoteRequest voteRequest);
+    abstract Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest);
 
-    abstract void onVoteResponse(String remoteNodeId, VoteResponse voteResponse);
+    abstract void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse);
 
-    abstract AcknowledgeEntries onAppendEntries(String remoteNodeId, AppendEntries appendEntries);
+    abstract AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries);
 
-    abstract void onAcknowledgeEntries(String remoteNodeId, AcknowledgeEntries acknowledgeEntries);
+    abstract void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries);
 }

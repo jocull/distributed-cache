@@ -34,4 +34,8 @@ public class ClusterTopology {
     public synchronized int getMajorityCount() {
         return (identifiers.size() / 2) + 1;
     }
+
+    public synchronized int getClusterCount() {
+        return identifiers.size();
+    }
 }

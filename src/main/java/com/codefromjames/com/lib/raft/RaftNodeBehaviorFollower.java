@@ -24,6 +24,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     void close() {
         if (electionTimeout != null) {
             electionTimeout.cancel(false);
+            electionTimeout = null;
         }
     }
 
@@ -42,18 +43,19 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     }
 
     @Override
-    Optional<VoteResponse> onVoteRequest(String remoteNodeId, VoteRequest voteRequest) {
+    Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
         if (voteRequest.getTerm() < term) {
-            LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", self.getId(), remoteNodeId, voteRequest.getTerm(), term);
+            LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term);
             return Optional.empty();
         }
         if (voteRequest.getTerm() == term && votedForNodeId != null) {
-            LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", self.getId(), remoteNodeId, voteRequest.getTerm(), votedForNodeId);
+            LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), votedForNodeId);
             return Optional.empty();
         }
         if (voteRequest.getTerm() > term) {
-            LOGGER.info("{} Received a vote request from {} for term {} will begin a new active election", self.getId(), remoteNodeId, voteRequest.getTerm());
-            return self.convertToFollowerWithVote(term, remoteNodeId);
+            LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
+            self.convertToFollower(voteRequest.getTerm());
+            return Optional.of(new VoteResponse(voteRequest.getTerm(), true));
         }
 
         // If the receiving node hasn't voted yet in this term then it votes for the candidate...
@@ -65,7 +67,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
         final long lastReceivedIndex = self.getLastReceivedIndex();
         final boolean grantVote = voteRequest.getLastLogIndex() >= lastReceivedIndex;
-        votedForNodeId = grantVote ? remoteNodeId : self.getId(); // Vote for self instead
+        votedForNodeId = grantVote ? remote.getRemoteNodeId() : self.getId(); // Vote for self instead
         LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", self.getState(), term,
                 votedForNodeId, grantVote, voteRequest.getLastLogIndex(), lastReceivedIndex);
         // Voting resets the election timeout to let the voting process settle
@@ -74,50 +76,51 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     }
 
     @Override
-    void onVoteResponse(String remoteNodeId, VoteResponse voteResponse) {
+    void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
         if (voteResponse.getTerm() > term) {
-            LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self.getId(), remoteNodeId, voteResponse.getTerm(), term);
-            self.convertToFollower(term);
+            LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
+            self.convertToFollower(voteResponse.getTerm());
             return;
         }
 
-        LOGGER.info("{} Received a vote request from {} for term {} but will stay follower of term {}", self.getId(), remoteNodeId, voteResponse.getTerm(), term);
+        LOGGER.info("{} Received a vote request from {} for term {} but will stay follower of term {}", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
     }
 
     @Override
-    AcknowledgeEntries onAppendEntries(String remoteNodeId, AppendEntries appendEntries) {
+    AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
         if (appendEntries.getTerm() > term) {
-            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), remoteNodeId, appendEntries.getTerm(), term);
-            return self.convertToFollowerForNewLeader(remoteNodeId, appendEntries);
+            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
+            return self.convertToFollowerForNewLeader(remote.getRemoteNodeId(), appendEntries)
+                    .onAppendEntries(remote, appendEntries);
         }
         if (appendEntries.getTerm() < term) {
-            LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", self.getId(), remoteNodeId, appendEntries.getTerm(), term);
+            LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
             return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
         }
         if (!self.getLogs().containsStartPoint(appendEntries.getTerm(), appendEntries.getPreviousLogIndex())) {
             // TODO: A chance to get stuck here? What happens if indexes get out of sync?
             //       How should we reset? Will the election timeout take care of it?
-            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", self.getId(), remoteNodeId, appendEntries.getTerm(), appendEntries.getPreviousLogIndex(), self.getLogs().getCurrentIndex());
+            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), appendEntries.getPreviousLogIndex(), self.getLogs().getCurrentIndex());
             return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
         }
-        if (leaderId != null && !leaderId.equals(remoteNodeId)) {
+        if (leaderId != null && !leaderId.equals(remote.getRemoteNodeId())) {
             // TODO: Does this matter...?
-            LOGGER.warn("{} Append entries request from {} who is not known leader {}", self.getId(), remoteNodeId, leaderId);
+            LOGGER.warn("{} Append entries request from {} who is not known leader {}", self.getId(), remote.getRemoteNodeId(), leaderId);
             return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
         }
 
         // TODO: Move this code to self.convertToFollowerForNewLeader ?
         if (leaderId == null) {
-            leaderId = remoteNodeId;
-            LOGGER.info("{} Made follower of {}", self.getId(), remoteNodeId);
+            leaderId = remote.getRemoteNodeId();
+            LOGGER.info("{} Made follower of {}", self.getId(), remote.getRemoteNodeId());
         }
 
         // Append the logs
         if (!appendEntries.getEntries().isEmpty()) {
             final long newEndIndex = appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
-            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries", self.getId(), remoteNodeId, self.getLogs().getCurrentIndex(), newEndIndex, appendEntries.getEntries().size());
+            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries", self.getId(), remote.getRemoteNodeId(), self.getLogs().getCurrentIndex(), newEndIndex, appendEntries.getEntries().size());
         } else {
-            LOGGER.debug("{} Received heartbeat from {}", self.getId(), remoteNodeId);
+            LOGGER.debug("{} Received heartbeat from {}", self.getId(), remote.getRemoteNodeId());
         }
         appendEntries.getEntries().forEach(r -> self.getLogs().appendLog(appendEntries.getTerm(), r.getIndex(), r.getEntry()));
 
@@ -131,7 +134,13 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     }
 
     @Override
-    void onAcknowledgeEntries(String remoteNodeId, AcknowledgeEntries acknowledgeEntries) {
-        throw new UnsupportedOperationException("Not implemented yet");
+    void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
+        if (acknowledgeEntries.getTerm() > term) {
+            LOGGER.info("{} Received acknowledge entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
+            self.convertToFollower(acknowledgeEntries.getTerm());
+            return;
+        }
+
+        LOGGER.warn("{} Received acknowledge entries from {} for term {} but doesn't make sense as follower of term {}", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
     }
 }

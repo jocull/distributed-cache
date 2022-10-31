@@ -1,14 +1,17 @@
 package com.codefromjames.com.lib.raft;
 
+import com.codefromjames.com.lib.raft.events.LogsCommitted;
 import com.codefromjames.com.lib.raft.messages.AcknowledgeEntries;
 import com.codefromjames.com.lib.raft.messages.AppendEntries;
 import com.codefromjames.com.lib.raft.messages.VoteRequest;
 import com.codefromjames.com.lib.raft.messages.VoteResponse;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     private volatile ScheduledFuture<?> heartbeatTimeout;
@@ -23,6 +26,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     void close() {
         if (heartbeatTimeout != null) {
             heartbeatTimeout.cancel(false);
+            heartbeatTimeout = null;
         }
     }
 
@@ -42,9 +46,9 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                 final List<AppendEntries.RaftLog> entries = self.getLogs().getLogRange(c.getCurrentIndex(), 25, this::transformLog);
                 if (!entries.isEmpty()) {
                     final long newEndIndex = entries.get(entries.size() - 1).getIndex();
-                    LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries", self.getId(), c.getRemoteNodeId().orElseThrow(), c.getCurrentIndex(), newEndIndex, entries.size());
+                    LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries", self.getId(), c.getRemoteNodeId(), c.getCurrentIndex(), newEndIndex, entries.size());
                 } else {
-                    LOGGER.debug("{} Sending heartbeat to {}", self.getId(), c.getRemoteNodeId().orElseThrow());
+                    LOGGER.debug("{} Sending heartbeat to {}", self.getId(), c.getRemoteNodeId());
                 }
                 c.appendEntries(new AppendEntries(
                         self.getCurrentTerm(),
@@ -59,41 +63,76 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
         LOGGER.debug("{} Scheduled next heartbeat", self.getId());
     }
 
+    synchronized void updateCommittedIndex() {
+        final List<Long> currentIndices;
+        synchronized (self.getActiveConnections()) {
+            currentIndices = self.getActiveConnections().stream()
+                    .map(NodeCommunication::getCurrentIndex)
+                    .sorted(((Comparator<Long>) Long::compare).reversed())
+                    .collect(Collectors.toList());
+        }
+        final int majorityCount = self.getClusterTopology().getMajorityCount();
+        if (currentIndices.size() >= majorityCount) {
+            final long majorityMinimumIndex = currentIndices.get(majorityCount - 1);
+            if (majorityMinimumIndex > self.getLogs().getCommitIndex()) {
+                LOGGER.debug("{} Has minimum majority index {} to commit", self.getId(), majorityMinimumIndex);
+                final List<RaftLog<?>> committedLogs = self.getLogs().commit(majorityMinimumIndex);
+                self.getManager().getEventBus().publish(new LogsCommitted(committedLogs));
+            }
+        } else {
+            LOGGER.debug("{} Not a majority to commit with {}", self.getId(), currentIndices);
+        }
+    }
+
     @Override
-    Optional<VoteResponse> onVoteRequest(String remoteNodeId, VoteRequest voteRequest) {
+    Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
         if (voteRequest.getTerm() > term) {
-            LOGGER.info("{} Received a vote request from {} for term {} will begin a new active election", self.getId(), remoteNodeId, voteRequest.getTerm());
-            return self.convertToFollowerWithVote(term, remoteNodeId);
+            LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
+            self.convertToFollower(voteRequest.getTerm());
+            return Optional.of(new VoteResponse(voteRequest.getTerm(), true));
         }
 
-        LOGGER.info("{} Received a vote request from {} for term {} but won't vote as leader of term {}", self.getId(), remoteNodeId, voteRequest.getTerm(), term);
+        LOGGER.info("{} Received a vote request from {} for term {} but won't vote as leader of term {}", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term);
         return Optional.empty();
     }
 
     @Override
-    void onVoteResponse(String remoteNodeId, VoteResponse voteResponse) {
+    void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
         if (voteResponse.getTerm() > term) {
-            LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self.getId(), remoteNodeId, voteResponse.getTerm(), term);
-            self.convertToFollower(term);
+            LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
+            self.convertToFollower(voteResponse.getTerm());
             return;
         }
 
-        LOGGER.info("{} Received a vote request from {} for term {} but already leader of term {}", self.getId(), remoteNodeId, voteResponse.getTerm(), term);
+        LOGGER.info("{} Received a vote request from {} for term {} but already leader of term {}", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
     }
 
     @Override
-    AcknowledgeEntries onAppendEntries(String remoteNodeId, AppendEntries appendEntries) {
+    AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
         if (appendEntries.getTerm() > term) {
-            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), remoteNodeId, appendEntries.getTerm(), term);
-            return self.convertToFollowerForNewLeader(remoteNodeId, appendEntries);
+            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
+            return self.convertToFollowerForNewLeader(remote.getRemoteNodeId(), appendEntries)
+                    .onAppendEntries(remote, appendEntries);
         }
 
-        LOGGER.info("{} Received append entries from {} for term {} but won't succeed as leader of term {}", self.getId(), remoteNodeId, appendEntries.getTerm(), term);
+        LOGGER.info("{} Received append entries from {} for term {} but won't succeed as leader of term {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
         return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
     }
 
     @Override
-    void onAcknowledgeEntries(String remoteNodeId, AcknowledgeEntries acknowledgeEntries) {
-        throw new UnsupportedOperationException("Not implemented yet");
+    void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
+        if (acknowledgeEntries.getTerm() > term) {
+            LOGGER.info("{} Received acknowledge entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
+            self.convertToFollower(acknowledgeEntries.getTerm());
+            return;
+        }
+        if (!acknowledgeEntries.isSuccess()) {
+            LOGGER.warn("{} received AcknowledgeEntries without success from {}: {}, {}", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), acknowledgeEntries.getCurrentIndex());
+            return;
+        }
+
+        LOGGER.debug("{} received AcknowledgeEntries from {} moving index {} -> {}", self.getId(), remote.getRemoteNodeId(), remote.getCurrentIndex(), acknowledgeEntries.getCurrentIndex());
+        remote.setCurrentIndex(acknowledgeEntries.getCurrentIndex());
+        updateCommittedIndex();
     }
 }

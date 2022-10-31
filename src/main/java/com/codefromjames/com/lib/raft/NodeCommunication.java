@@ -30,8 +30,8 @@ public class NodeCommunication {
         this.channel.setReceiver(this::receive);
     }
 
-    public Optional<String> getRemoteNodeId() {
-        return Optional.ofNullable(remoteNodeId);
+    public String getRemoteNodeId() {
+        return remoteNodeId;
     }
 
     public NodeAddress getRemoteNodeAddress() {
@@ -42,6 +42,10 @@ public class NodeCommunication {
         return currentIndex;
     }
 
+    public void setCurrentIndex(long currentIndex) {
+        this.currentIndex = currentIndex;
+    }
+
     private void send(Object message) {
         channel.send(message);
     }
@@ -50,7 +54,14 @@ public class NodeCommunication {
         // TODO: Initial lazy version, not very maintainable with growing number of message types
         if (message instanceof Introduction) {
             onIntroduction((Introduction) message);
-        } else if (message instanceof AnnounceClusterTopology) {
+            return;
+        }
+        if (remoteNodeId == null) {
+            throw new IllegalStateException("Cannot process " + message.getClass().getSimpleName()
+                    + " before introduction! remoteNodeId is null");
+        }
+
+        if (message instanceof AnnounceClusterTopology) {
             onAnnounceClusterTopology((AnnounceClusterTopology) message);
         } else if (message instanceof VoteRequest) {
             onVoteRequest((VoteRequest) message);
@@ -113,12 +124,12 @@ public class NodeCommunication {
     }
 
     private void onVoteRequest(VoteRequest voteRequest) {
-        owner.onRequestVote(remoteNodeId, voteRequest)
+        owner.getBehavior().onVoteRequest(this, voteRequest)
                 .ifPresent(this::send);
     }
 
     private void onVoteResponse(VoteResponse voteResponse) {
-        owner.onVoteResponse(remoteNodeId, voteResponse);
+        owner.getBehavior().onVoteResponse(this, voteResponse);
     }
 
     public void appendEntries(AppendEntries appendEntries) {
@@ -126,21 +137,11 @@ public class NodeCommunication {
     }
 
     private void onAppendEntries(AppendEntries appendEntries) {
-        final AcknowledgeEntries ack = owner.onAppendEntries(remoteNodeId, appendEntries);
+        final AcknowledgeEntries ack = owner.getBehavior().onAppendEntries(this, appendEntries);
         send(ack);
     }
 
-    private void onAcknowledgeEntries(AcknowledgeEntries message) {
-        if (message.getTerm() > owner.getCurrentTerm()) {
-            owner.notifyTermChange(remoteNodeId, message.getTerm());
-            return;
-        }
-        if (!message.isSuccess()) {
-            LOGGER.warn("{} received AcknowledgeEntries without success from {}: {}, {}", owner.getId(), remoteNodeId, message.getTerm(), message.getCurrentIndex());
-            return;
-        }
-        LOGGER.warn("{} received AcknowledgeEntries from {} moving index {} -> {}", owner.getId(), remoteNodeId, currentIndex, message.getCurrentIndex());
-        currentIndex = message.getCurrentIndex();
-        owner.updateCommittedIndex();
+    private void onAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries) {
+        owner.getBehavior().onAcknowledgeEntries(this, acknowledgeEntries);
     }
 }

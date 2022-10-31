@@ -5,13 +5,15 @@ import com.codefromjames.com.lib.raft.messages.AppendEntries;
 import com.codefromjames.com.lib.raft.messages.VoteRequest;
 import com.codefromjames.com.lib.raft.messages.VoteResponse;
 
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
     private volatile ScheduledFuture<?> electionTimeout;
-    private int voteCount;
+    private final Set<String> votes = new HashSet<>();
 
     public RaftNodeBehaviorCandidate(RaftNode self, int term) {
         super(self, NodeStates.CANDIDATE, term);
@@ -23,7 +25,7 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
         final VoteRequest voteRequest = new VoteRequest(term, self.getId(), lastCommittedLogIndex, previousTerm);
 
         LOGGER.info("{} Candidate starting a new election at term {}", self.getId(), term);
-        voteCount = 1; // ...votes for itself...
+        votes.add(self.getId()); // ...votes for itself...
         synchronized (self.getActiveConnections()) {
             self.getActiveConnections().forEach(c -> c.requestVote(voteRequest));
         }
@@ -36,39 +38,71 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
         electionTimeout = self.getManager().schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
     }
 
+    @Override
+    void close() {
+        if (electionTimeout != null) {
+            electionTimeout.cancel(false);
+            electionTimeout = null;
+        }
+    }
+
     private void onElectionTimeout() {
         throw new UnsupportedOperationException("Not implemented yet");
     }
 
     @Override
-    Optional<VoteResponse> onVoteRequest(String remoteNodeId, VoteRequest voteRequest) {
+    Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
         if (voteRequest.getTerm() > term) {
-            LOGGER.info("{} Received a vote request from {} for term {} will begin a new active election", self.getId(), remoteNodeId, voteRequest.getTerm());
-            return self.convertToFollowerWithVote(term, remoteNodeId);
+            LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
+            self.convertToFollower(voteRequest.getTerm());
+            return Optional.of(new VoteResponse(voteRequest.getTerm(), true));
         }
 
-        LOGGER.info("{} Received a vote request from {} for term {} but won't vote as candidate of term {}", self.getId(), remoteNodeId, voteRequest.getTerm(), term);
+        LOGGER.info("{} Received a vote request from {} for term {} but won't vote as candidate of term {}", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term);
         return Optional.empty();
     }
 
     @Override
-    void onVoteResponse(String remoteNodeId, VoteResponse voteResponse) {
-        throw new UnsupportedOperationException("Not implemented yet");
+    void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
+        if (voteResponse.getTerm() > term) {
+            LOGGER.info("{} Received vote response from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
+            self.convertToFollower(voteResponse.getTerm());
+            return;
+        }
+        if (voteResponse.getTerm() < term) {
+            LOGGER.warn("{} Received vote response from {} for term {} and will ignore because term is {}", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
+            return;
+        }
+        synchronized (votes) {
+            votes.add(remote.getRemoteNodeId());
+            LOGGER.info("{} Received vote response from {} for term {} - new vote count {}", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), votes.size());
+            if (votes.size() >= self.getClusterTopology().getMajorityCount()) {
+                self.convertToLeader();
+                LOGGER.info("{} Became leader of term {} with {}/{} votes", self.getId(), voteResponse.getTerm(), votes.size(), self.getClusterTopology().getClusterCount());
+            }
+        }
     }
 
     @Override
-    AcknowledgeEntries onAppendEntries(String remoteNodeId, AppendEntries appendEntries) {
+    AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
         if (appendEntries.getTerm() > term) {
-            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), remoteNodeId, appendEntries.getTerm(), term);
-            return self.convertToFollowerForNewLeader(remoteNodeId, appendEntries);
+            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
+            return self.convertToFollowerForNewLeader(remote.getRemoteNodeId(), appendEntries)
+                    .onAppendEntries(remote, appendEntries);
         }
 
-        LOGGER.info("{} Received append entries from {} for term {} but won't succeed as candidate of term {}", self.getId(), remoteNodeId, appendEntries.getTerm(), term);
+        LOGGER.info("{} Received append entries from {} for term {} but won't succeed as candidate of term {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
         return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
     }
 
     @Override
-    void onAcknowledgeEntries(String remoteNodeId, AcknowledgeEntries acknowledgeEntries) {
-        throw new UnsupportedOperationException("Not implemented yet");
+    void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
+        if (acknowledgeEntries.getTerm() > term) {
+            LOGGER.info("{} Received acknowledge entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
+            self.convertToFollower(acknowledgeEntries.getTerm());
+            return;
+        }
+
+        LOGGER.warn("{} Received acknowledge entries from {} for term {} but doesn't make sense as candidate of term {}", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
     }
 }

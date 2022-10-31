@@ -1,10 +1,6 @@
 package com.codefromjames.com.lib.raft;
 
-import com.codefromjames.com.lib.raft.events.LogsCommitted;
-import com.codefromjames.com.lib.raft.messages.AcknowledgeEntries;
 import com.codefromjames.com.lib.raft.messages.AppendEntries;
-import com.codefromjames.com.lib.raft.messages.VoteRequest;
-import com.codefromjames.com.lib.raft.messages.VoteResponse;
 import com.codefromjames.com.lib.raft.middleware.ChannelMiddleware;
 import com.codefromjames.com.lib.topology.ClusterTopology;
 import com.codefromjames.com.lib.topology.NodeAddress;
@@ -12,13 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 public class RaftNode {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
@@ -64,6 +54,10 @@ public class RaftNode {
 
     public NodeStates getState() {
         return behavior.getState();
+    }
+
+    public RaftNodeBehavior getBehavior() {
+        return behavior;
     }
 
     public long getLastReceivedIndex() {
@@ -165,152 +159,50 @@ public class RaftNode {
         return manager;
     }
 
-    private static AppendEntries.RaftLog transformLog(RaftLog<?> r) {
-        return new AppendEntries.RaftLog(r.getIndex(), r.getEntry());
+    private void rollback(int oldTerm, int newTerm) {
+        final long previousIndex = logs.getCurrentIndex();
+        final List<RaftLog<?>> rollback = logs.rollback();
+        final long newIndex = logs.getCurrentIndex();
+        LOGGER.info("{} Rolling back {} logs from term {} -> {}, index {} -> {}",
+                id, rollback.size(), oldTerm, newTerm, previousIndex, newIndex);
     }
 
-    public synchronized void onVoteResponse(String incomingNodeId, VoteResponse vote) {
-        if (activeElection == null) {
-            LOGGER.warn("{} Received a vote from {}, but no election is active: {}", id, incomingNodeId, vote);
-            return;
-        }
-        if (vote.getTerm() != currentTerm.get()) {
-            LOGGER.warn("{} Received a vote from {}, but for the wrong term: {}", id, incomingNodeId, vote);
-            return;
-        }
-        if (vote.isVoteGranted()) {
-            activeElection.voteCount++;
-            LOGGER.info("{} Received a vote from {} for term {} and now has {} votes", id, incomingNodeId, vote.getTerm(), activeElection.voteCount);
-            final int majority = clusterTopology.getMajorityCount();
-            if (activeElection.voteCount >= majority) {
-                // This node has won the election.
-                // The leader begins sending out Append Entries messages to its followers.
-                LOGGER.info("{} Became leader of term {} with {} votes of required majority {} of {}", id, activeElection.term, activeElection.voteCount, majority, clusterTopology.getTopology().size());
-                activeElection = null;
-                leaderId = id;
-                state = NodeStates.LEADER;
-                scheduleNextHeartbeat(); // TODO: This is a hack to clear election timeout...
-                onHeartbeatTimeout(true); // Send this heartbeat immediately to announce election results
-            }
-        }
+    synchronized RaftNodeBehaviorFollower convertToFollower(int newTerm) {
+        behavior.close();
+        final int oldTerm = behavior.getTerm();
+        rollback(oldTerm, newTerm);
+
+        behavior = new RaftNodeBehaviorFollower(this, newTerm);
+        return (RaftNodeBehaviorFollower) behavior;
     }
 
-    public synchronized Optional<VoteResponse> onRequestVote(String requestingNodeId, VoteRequest voteRequest) {
-        if (voteRequest.getTerm() < this.currentTerm.get()) {
-            LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", id, requestingNodeId, voteRequest.getTerm(), this.currentTerm.get());
-            return Optional.empty();
-        }
-        if (activeElection != null) {
-            if (voteRequest.getTerm() < activeElection.term) {
-                LOGGER.info("{} Received a vote request from {} for term {} but active voting term is {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.term);
-                return Optional.empty();
-            } else if (voteRequest.getTerm() == activeElection.term
-                    && activeElection.votedForNodeId != null) {
-                LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.votedForNodeId);
-                return Optional.empty();
-            } else if (voteRequest.getTerm() > activeElection.term) {
-                LOGGER.info("{} Received a vote request from {} for term {}, and reset active election from term {}", id, requestingNodeId, voteRequest.getTerm(), activeElection.term);
-                activeElection = new ActiveElection(voteRequest.getTerm());
-                currentTerm.set(voteRequest.getTerm());
-            }
-        } else {
-            LOGGER.info("{} Received a vote request from {} for term {} will begin a new active election", id, requestingNodeId, voteRequest.getTerm());
-            activeElection = new ActiveElection(voteRequest.getTerm());
-        }
+    synchronized RaftNodeBehaviorFollower convertToFollowerForNewLeader(String remoteNodeId, AppendEntries appendEntries) {
+        behavior.close();
+        final int oldTerm = behavior.getTerm();
+        rollback(oldTerm, appendEntries.getTerm());
 
-        // If the receiving node hasn't voted yet in this term then it votes for the candidate...
-        // ...and the node resets its election timeout.
-        if (leaderId != null) {
-            LOGGER.info("{} Removing current leader {}", id, leaderId);
-            leaderId = null; // Remove the current leader
-        }
+        behavior = new RaftNodeBehaviorFollower(this, appendEntries.getTerm());
+        behavior.setLeaderId(remoteNodeId);
+        LOGGER.info("{} Changed leader to {}", id, remoteNodeId);
 
-        final long lastReceivedIndex = getLastReceivedIndex();
-        final boolean grantVote = voteRequest.getLastLogIndex() >= lastReceivedIndex;
-        activeElection.votedForNodeId = grantVote ? requestingNodeId : id; // Vote for self instead
-        LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", id, activeElection.term, activeElection.votedForNodeId, grantVote, voteRequest.getLastLogIndex(), lastReceivedIndex);
-        // Voting resets the election timeout to let the voting process settle
-        scheduleNextElectionTimeout();
-        return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
+        return (RaftNodeBehaviorFollower) behavior;
     }
 
-    public AcknowledgeEntries onAppendEntries(String requestingNodeId, AppendEntries appendEntries) {
-        if (appendEntries.getTerm() < currentTerm.get()) {
-            LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), currentTerm.get());
-            return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
-        }
-        if (!logs.containsStartPoint(appendEntries.getTerm(), appendEntries.getPreviousLogIndex())) {
-            // TODO: A chance to get stuck here? What happens if indexes get out of sync?
-            //       How should we reset? Will the election timeout take care of it?
-            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", id, requestingNodeId, appendEntries.getTerm(), appendEntries.getPreviousLogIndex(), logs.getCurrentIndex());
-            return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
-        }
-        if (leaderId != null && !leaderId.equals(requestingNodeId)) {
-            LOGGER.warn("{} Append entries request from {} who is not known leader {}", id, requestingNodeId, leaderId);
-            return new AcknowledgeEntries(currentTerm.get(), false, logs.getCurrentIndex());
-        }
-        if (leaderId == null) {
-            leaderId = requestingNodeId;
-            state = NodeStates.FOLLOWER;
-            currentTerm.set(appendEntries.getTerm());
-            LOGGER.info("{} Made follower of {}", id, requestingNodeId);
-        }
+    synchronized RaftNodeBehaviorCandidate convertToCandidate(int newTerm) {
+        behavior.close();
+        // TODO: Does a rollback need to happen at this state?
+        // final int oldTerm = behavior.getTerm();
+        // rollback(oldTerm, newTerm);
 
-        // Append the logs
-        if (!appendEntries.getEntries().isEmpty()) {
-            final long newEndIndex = appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
-            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries", id, requestingNodeId, logs.getCurrentIndex(), newEndIndex, appendEntries.getEntries().size());
-        } else {
-            LOGGER.debug("{} Received heartbeat from {}", id, requestingNodeId);
-        }
-        appendEntries.getEntries().forEach(r -> logs.appendLog(appendEntries.getTerm(), r.getIndex(), r.getEntry()));
-
-        // Align the commit index with the leader
-        final List<RaftLog<?>> committedLogs = logs.commit(appendEntries.getLeaderCommitIndex());
-        manager.getEventBus().publish(new LogsCommitted(committedLogs));
-
-        // Clear the current timeout and register the next one
-        scheduleNextElectionTimeout();
-        return new AcknowledgeEntries(currentTerm.get(), true, logs.getCurrentIndex());
+        behavior = new RaftNodeBehaviorCandidate(this, newTerm);
+        return (RaftNodeBehaviorCandidate) behavior;
     }
 
-    @Deprecated
-    public void notifyTermChange(String remoteNodeId, int term) {
-        LOGGER.info("{} Notified of term change from {} to {} by {}", id, currentTerm.get(), term, remoteNodeId);
-        if (heartbeatTimeout != null) {
-            heartbeatTimeout.cancel(false);
-            heartbeatTimeout = null;
-        }
+    synchronized RaftNodeBehaviorLeader convertToLeader() {
+        behavior.close();
 
-        // Reset the follower details
-        leaderId = null;
-        state = NodeStates.FOLLOWER;
-        currentTerm.set(term);
-
-        // Rollback any uncommitted logs
-        logs.rollback();
-
-        scheduleNextElectionTimeout();
-    }
-
-    public synchronized void updateCommittedIndex() {
-        final List<Long> currentIndices;
-        synchronized (activeConnections) {
-            currentIndices = activeConnections.stream()
-                    .map(NodeCommunication::getCurrentIndex)
-                    .sorted(((Comparator<Long>) Long::compare).reversed())
-                    .collect(Collectors.toList());
-        }
-        final int majorityCount = clusterTopology.getMajorityCount();
-        if (currentIndices.size() >= majorityCount) {
-            final long majorityMinimumIndex = currentIndices.get(majorityCount - 1);
-            if (majorityMinimumIndex > logs.getCommitIndex()) {
-                LOGGER.debug("{} Has minimum majority index {} to commit", id, majorityMinimumIndex);
-                final List<RaftLog<?>> committedLogs = logs.commit(majorityMinimumIndex);
-                manager.getEventBus().publish(new LogsCommitted(committedLogs));
-            }
-        } else {
-            LOGGER.debug("{} Not a majority to commit with {}", id, currentIndices);
-        }
+        final int term = behavior.getTerm();
+        behavior = new RaftNodeBehaviorLeader(this, term);
+        return (RaftNodeBehaviorLeader) behavior;
     }
 }
