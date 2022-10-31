@@ -53,9 +53,10 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             return Optional.empty();
         }
         if (voteRequest.getTerm() > term) {
-            LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
-            self.convertToFollower(voteRequest.getTerm());
-            return Optional.of(new VoteResponse(voteRequest.getTerm(), true));
+            // TODO: This operation isn't atomic, so two candidates asking for votes will race to the updated follower behavior instance!
+            LOGGER.info("{} Received a vote request from {} for term {} and will convert to follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
+            return self.convertToFollower(voteRequest.getTerm())
+                    .onVoteRequest(remote, voteRequest);
         }
 
         // If the receiving node hasn't voted yet in this term then it votes for the candidate...
@@ -68,7 +69,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         final long lastReceivedIndex = self.getLastReceivedIndex();
         final boolean grantVote = voteRequest.getLastLogIndex() >= lastReceivedIndex;
         votedForNodeId = grantVote ? remote.getRemoteNodeId() : self.getId(); // Vote for self instead
-        LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", self.getState(), term,
+        LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", self.getId(), term,
                 votedForNodeId, grantVote, voteRequest.getLastLogIndex(), lastReceivedIndex);
         // Voting resets the election timeout to let the voting process settle
         scheduleNextElectionTimeout();

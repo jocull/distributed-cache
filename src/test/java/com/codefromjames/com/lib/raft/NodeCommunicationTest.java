@@ -89,7 +89,7 @@ public class NodeCommunicationTest {
     }
 
     @Test
-    void testElectionWithFailure() throws InterruptedException {
+    void testElectionWithFailure_oneNode() throws InterruptedException {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
@@ -106,8 +106,8 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            final LeaderAndFollowers nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+            final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
                 }
@@ -116,8 +116,8 @@ public class NodeCommunicationTest {
 
             LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
             middleware.interrupt(nodes1.leader().getNodeAddress());
-            final LeaderAndFollowers nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+            final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 1) {
                     return result;
                 }
@@ -126,8 +126,58 @@ public class NodeCommunicationTest {
 
             LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
             middleware.restore(nodes1.leader().getNodeAddress());
-            final LeaderAndFollowers nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+            final ClusterNodes nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+        }
+    }
+
+    @Test
+    void testElectionWithFailure_twoNodes() throws InterruptedException {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
+            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
+            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
+            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+
+            final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+
+            LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
+            middleware.interrupt(nodes1.leader().getNodeAddress());
+            middleware.interrupt(nodes1.followers().get(0).getNodeAddress());
+            final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and candidates", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.candidates().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+
+            LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
+            middleware.restore(nodes1.leader().getNodeAddress());
+            middleware.restore(nodes1.followers().get(0).getNodeAddress());
+            final ClusterNodes nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
                 }
@@ -154,8 +204,8 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            final LeaderAndFollowers nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+            final ClusterNodes nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
                 }
@@ -206,8 +256,8 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            final LeaderAndFollowers nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+            final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
                 }
@@ -225,8 +275,8 @@ public class NodeCommunicationTest {
             Thread.sleep(125);
             LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
             middleware.interrupt(nodes1.leader().getNodeAddress());
-            final LeaderAndFollowers nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+            final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 1) {
                     return result;
                 }
@@ -238,8 +288,8 @@ public class NodeCommunicationTest {
 
             LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
             middleware.restore(nodes1.leader().getNodeAddress());
-            final LeaderAndFollowers nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final LeaderAndFollowers result = getRaftLeaderAndFollowers(middleware);
+            final ClusterNodes nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
                 }
@@ -252,15 +302,19 @@ public class NodeCommunicationTest {
         }
     }
 
-    private static LeaderAndFollowers getRaftLeaderAndFollowers(PassThruMiddleware middleware) {
+    private static ClusterNodes getRaftLeaderAndFollowers(PassThruMiddleware middleware) {
         final RaftNode leader = getRaftLeader(middleware);
         final List<RaftNode> followers = getRaftFollowers(middleware);
-        return new LeaderAndFollowers() {
+        final List<RaftNode> candidates = getRaftCandidates(middleware);
+        return new ClusterNodes() {
             @Override
             public RaftNode leader() {
                 return leader;
             }
-
+            @Override
+            public List<RaftNode> candidates() {
+                return candidates;
+            }
             @Override
             public List<RaftNode> followers() {
                 return followers;
@@ -274,6 +328,12 @@ public class NodeCommunicationTest {
                 .collect(Collectors.toList());
     }
 
+    private static List<RaftNode> getRaftCandidates(PassThruMiddleware middleware) {
+        return middleware.getAddressRaftNodeMap().values().stream()
+                .filter(r -> r.getState().equals(NodeStates.CANDIDATE))
+                .collect(Collectors.toList());
+    }
+
     private static RaftNode getRaftLeader(PassThruMiddleware middleware) {
         return middleware.getAddressRaftNodeMap().values().stream()
                 .filter(r -> r.getState().equals(NodeStates.LEADER))
@@ -281,9 +341,9 @@ public class NodeCommunicationTest {
                 .orElse(null);
     }
 
-    private interface LeaderAndFollowers {
+    private interface ClusterNodes {
         RaftNode leader();
-
+        List<RaftNode> candidates();
         List<RaftNode> followers();
     }
 

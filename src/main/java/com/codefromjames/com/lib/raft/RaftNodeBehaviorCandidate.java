@@ -47,7 +47,10 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
     }
 
     private void onElectionTimeout() {
-        throw new UnsupportedOperationException("Not implemented yet");
+        synchronized (votes) {
+            LOGGER.info("{} Election timeout passed with {}/{} votes - Starting a new election", self.getId(), votes.size(), self.getClusterTopology().getClusterCount());
+        }
+        self.convertToCandidate(term + 1);
     }
 
     @Override
@@ -73,13 +76,16 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
             LOGGER.warn("{} Received vote response from {} for term {} and will ignore because term is {}", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
             return;
         }
+
+        final int newVoteSize;
         synchronized (votes) {
             votes.add(remote.getRemoteNodeId());
-            LOGGER.info("{} Received vote response from {} for term {} - new vote count {}", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), votes.size());
-            if (votes.size() >= self.getClusterTopology().getMajorityCount()) {
-                self.convertToLeader();
-                LOGGER.info("{} Became leader of term {} with {}/{} votes", self.getId(), voteResponse.getTerm(), votes.size(), self.getClusterTopology().getClusterCount());
-            }
+            newVoteSize = votes.size();
+        }
+        LOGGER.info("{} Received vote response from {} for term {} - new vote count {}", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), newVoteSize);
+        if (newVoteSize >= self.getClusterTopology().getMajorityCount()) {
+            self.convertToLeader();
+            LOGGER.info("{} Became leader of term {} with {}/{} votes", self.getId(), voteResponse.getTerm(), newVoteSize, self.getClusterTopology().getClusterCount());
         }
     }
 
