@@ -2,10 +2,11 @@ package com.codefromjames.com.lib.raft.middleware;
 
 import com.codefromjames.com.lib.raft.RaftNode;
 import com.codefromjames.com.lib.topology.NodeAddress;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -15,14 +16,18 @@ import java.util.function.Consumer;
  * a fairly low latency network.
  */
 public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
+    private static final Logger LOGGER = LoggerFactory.getLogger(PassThruMiddleware.class);
     private final Random random = new Random();
-    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(1);
     private final Map<NodeAddress, RaftNode> addressRaftNodeMap = new HashMap<>();
     private final List<PassThruPair> connections = new ArrayList<>();
+    private final Deque<CompletableFuture<?>> futures = new ArrayDeque<>();
 
     @Override
     public void close() {
-        executor.shutdownNow();
+        synchronized (futures) {
+            futures.forEach(f -> f.cancel(false));
+            futures.clear();
+        }
     }
 
     public Map<NodeAddress, RaftNode> getAddressRaftNodeMap() {
@@ -42,6 +47,13 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
 
     public synchronized boolean removeNode(RaftNode raftNode) {
         return addressRaftNodeMap.remove(raftNode.getNodeAddress()) != null;
+    }
+
+    private void addAndCleanFuture(CompletableFuture<?> future) {
+        synchronized (futures) {
+            futures.removeIf(next -> next.isDone() || next.isCancelled());
+            futures.add(future);
+        }
     }
 
     public void interrupt(NodeAddress nodeAddress) {
@@ -135,21 +147,35 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
         @Override
         public void send(Object message) {
             if (!interrupted) {
-                executor.schedule(() -> {
-                    if (!interrupted) {
-                        paired.receive(message);
-                    }
-                }, 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
+                final CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                            if (!interrupted) {
+                                paired.receive(message);
+                            }
+                        }, CompletableFuture.delayedExecutor(1 + random.nextInt(9), TimeUnit.MILLISECONDS))
+                        .exceptionally(throwable -> {
+                            LOGGER.error("Send failed", throwable);
+                            return null;
+                        });
+                synchronized (futures) {
+                    futures.add(future);
+                }
             }
         }
 
         private void receive(Object message) {
             if (!interrupted) {
-                executor.schedule(() -> {
-                    if (!interrupted) {
-                        receiver.accept(message);
-                    }
-                }, 1 + random.nextInt(9), TimeUnit.MILLISECONDS);
+                final CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                            if (!interrupted) {
+                                receiver.accept(message);
+                            }
+                        }, CompletableFuture.delayedExecutor(1 + random.nextInt(9), TimeUnit.MILLISECONDS))
+                        .exceptionally(throwable -> {
+                            LOGGER.error("Receive failed", throwable);
+                            return null;
+                        });
+                synchronized (futures) {
+                    futures.add(future);
+                }
             }
         }
     }
