@@ -50,10 +50,15 @@ public class NodeCommunication {
         channel.send(message);
     }
 
+    // TODO: Initial lazy version, not very maintainable with growing number of message types
     private void receive(Object message) {
-        // TODO: Initial lazy version, not very maintainable with growing number of message types
+        // Introductions must be completed first to establish node IDs
         if (message instanceof Introduction) {
             onIntroduction((Introduction) message);
+            return;
+        }
+        if (message instanceof AnnounceClusterTopology) {
+            onAnnounceClusterTopology((AnnounceClusterTopology) message);
             return;
         }
         if (remoteNodeId == null) {
@@ -61,9 +66,8 @@ public class NodeCommunication {
                     + " before introduction! remoteNodeId is null");
         }
 
-        if (message instanceof AnnounceClusterTopology) {
-            onAnnounceClusterTopology((AnnounceClusterTopology) message);
-        } else if (message instanceof VoteRequest) {
+        // After introductions, any message can process
+        if (message instanceof VoteRequest) {
             onVoteRequest((VoteRequest) message);
         } else if (message instanceof VoteResponse) {
             onVoteResponse((VoteResponse) message);
