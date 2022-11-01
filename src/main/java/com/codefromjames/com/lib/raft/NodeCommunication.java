@@ -46,39 +46,35 @@ public class NodeCommunication {
     }
 
     private void send(Object message) {
-        owner.getOperationsExecutor().submit(() -> {
-            channel.send(message);
-        });
+        channel.send(message);
     }
 
     // TODO: Initial lazy version, not very maintainable with growing number of message types
     private void receive(Object message) {
-        owner.getOperationsExecutor().submit(() -> {
-            // Introductions must be completed first to establish node IDs
-            if (message instanceof Introduction) {
-                onIntroduction((Introduction) message);
-                return;
-            }
-            if (message instanceof AnnounceClusterTopology) {
-                onAnnounceClusterTopology((AnnounceClusterTopology) message);
-                return;
-            }
-            if (remoteNodeId == null) {
-                throw new IllegalStateException("Cannot process " + message.getClass().getSimpleName()
-                        + " before introduction! remoteNodeId is null");
-            }
+        // Introductions must be completed first to establish node IDs
+        if (message instanceof Introduction) {
+            onIntroduction((Introduction) message);
+            return;
+        }
+        if (message instanceof AnnounceClusterTopology) {
+            onAnnounceClusterTopology((AnnounceClusterTopology) message);
+            return;
+        }
+        if (remoteNodeId == null) {
+            throw new IllegalStateException("Cannot process " + message.getClass().getSimpleName()
+                    + " before introduction! remoteNodeId is null");
+        }
 
-            // After introductions, any message can process
-            if (message instanceof VoteRequest) {
-                onVoteRequest((VoteRequest) message);
-            } else if (message instanceof VoteResponse) {
-                onVoteResponse((VoteResponse) message);
-            } else if (message instanceof AppendEntries) {
-                onAppendEntries((AppendEntries) message);
-            } else if (message instanceof AcknowledgeEntries) {
-                onAcknowledgeEntries((AcknowledgeEntries) message);
-            }
-        });
+        // After introductions, any message can process
+        if (message instanceof VoteRequest) {
+            onVoteRequest((VoteRequest) message);
+        } else if (message instanceof VoteResponse) {
+            onVoteResponse((VoteResponse) message);
+        } else if (message instanceof AppendEntries) {
+            onAppendEntries((AppendEntries) message);
+        } else if (message instanceof AcknowledgeEntries) {
+            onAcknowledgeEntries((AcknowledgeEntries) message);
+        }
     }
 
     public void introduce() {
@@ -131,8 +127,15 @@ public class NodeCommunication {
     }
 
     private void onVoteRequest(VoteRequest voteRequest) {
-        owner.getBehavior().onVoteRequest(this, voteRequest)
-                .ifPresent(this::send);
+        owner.getNodeLock().lock();
+        LOGGER.debug("{} LOCKED!", owner.getId());
+        try {
+            owner.getBehavior().onVoteRequest(this, voteRequest)
+                    .ifPresent(this::send);
+        } finally {
+            LOGGER.debug("{} UNLOCKING!", owner.getId());
+            owner.getNodeLock().unlock();
+        }
     }
 
     private void onVoteResponse(VoteResponse voteResponse) {
