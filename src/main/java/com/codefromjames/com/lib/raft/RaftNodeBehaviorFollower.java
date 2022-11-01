@@ -53,8 +53,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             return Optional.empty();
         }
         if (voteRequest.getTerm() > term) {
-            // TODO: This operation isn't atomic, so two candidates asking for votes will race to the updated follower behavior instance!
-            LOGGER.info("{} Received a vote request from {} for term {} and will convert to follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
+            LOGGER.info("{} Received a vote request from {} for term {} and will convert to follower (from term {})", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term);
             return self.convertToFollower(voteRequest.getTerm())
                     .onVoteRequest(remote, voteRequest);
         }
