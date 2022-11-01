@@ -9,6 +9,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class RaftNode {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
@@ -24,6 +26,7 @@ public class RaftNode {
     // Topology and connections
     private final ClusterTopology clusterTopology;
     private final List<NodeCommunication> activeConnections = new ArrayList<>();
+    private final ExecutorService operationsExecutor;
 
     // Log management
     private final RaftLogs logs = new RaftLogs();
@@ -37,6 +40,13 @@ public class RaftNode {
 
         // Each node has its own view of cluster topology
         clusterTopology = new ClusterTopology();
+
+        this.operationsExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            final Thread t = new Thread(r);
+            t.setName("raft-node-" + this.id);
+            t.setUncaughtExceptionHandler((t1, ex) -> LOGGER.error("Unhandled exception in operations thread", ex));
+            return t;
+        }); // TODO: NEEDS SHUTDOWN
     }
 
     public void start() {
@@ -59,6 +69,10 @@ public class RaftNode {
 
     public RaftNodeBehavior getBehavior() {
         return behavior;
+    }
+
+    public ExecutorService getOperationsExecutor() {
+        return operationsExecutor;
     }
 
     public long getLastReceivedIndex() {

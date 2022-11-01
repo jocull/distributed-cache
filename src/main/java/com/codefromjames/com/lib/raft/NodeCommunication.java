@@ -7,7 +7,6 @@ import com.codefromjames.com.lib.topology.NodeIdentifierState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class NodeCommunication {
@@ -47,35 +46,39 @@ public class NodeCommunication {
     }
 
     private void send(Object message) {
-        channel.send(message);
+        owner.getOperationsExecutor().submit(() -> {
+            channel.send(message);
+        });
     }
 
     // TODO: Initial lazy version, not very maintainable with growing number of message types
     private void receive(Object message) {
-        // Introductions must be completed first to establish node IDs
-        if (message instanceof Introduction) {
-            onIntroduction((Introduction) message);
-            return;
-        }
-        if (message instanceof AnnounceClusterTopology) {
-            onAnnounceClusterTopology((AnnounceClusterTopology) message);
-            return;
-        }
-        if (remoteNodeId == null) {
-            throw new IllegalStateException("Cannot process " + message.getClass().getSimpleName()
-                    + " before introduction! remoteNodeId is null");
-        }
+        owner.getOperationsExecutor().submit(() -> {
+            // Introductions must be completed first to establish node IDs
+            if (message instanceof Introduction) {
+                onIntroduction((Introduction) message);
+                return;
+            }
+            if (message instanceof AnnounceClusterTopology) {
+                onAnnounceClusterTopology((AnnounceClusterTopology) message);
+                return;
+            }
+            if (remoteNodeId == null) {
+                throw new IllegalStateException("Cannot process " + message.getClass().getSimpleName()
+                        + " before introduction! remoteNodeId is null");
+            }
 
-        // After introductions, any message can process
-        if (message instanceof VoteRequest) {
-            onVoteRequest((VoteRequest) message);
-        } else if (message instanceof VoteResponse) {
-            onVoteResponse((VoteResponse) message);
-        } else if (message instanceof AppendEntries) {
-            onAppendEntries((AppendEntries) message);
-        } else if (message instanceof AcknowledgeEntries) {
-            onAcknowledgeEntries((AcknowledgeEntries) message);
-        }
+            // After introductions, any message can process
+            if (message instanceof VoteRequest) {
+                onVoteRequest((VoteRequest) message);
+            } else if (message instanceof VoteResponse) {
+                onVoteResponse((VoteResponse) message);
+            } else if (message instanceof AppendEntries) {
+                onAppendEntries((AppendEntries) message);
+            } else if (message instanceof AcknowledgeEntries) {
+                onAcknowledgeEntries((AcknowledgeEntries) message);
+            }
+        });
     }
 
     public void introduce() {
