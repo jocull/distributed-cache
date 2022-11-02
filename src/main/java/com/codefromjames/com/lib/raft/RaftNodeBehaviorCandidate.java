@@ -91,7 +91,8 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
 
     @Override
     AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
-        if (appendEntries.getTerm() > term) {
+        // "If AppendEntries RPC received from new leader: convert to follower"
+        if (appendEntries.getTerm() >= term) {
             LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
             return self.convertToFollowerForNewLeader(remote.getRemoteNodeId(), appendEntries)
                     .onAppendEntries(remote, appendEntries);
