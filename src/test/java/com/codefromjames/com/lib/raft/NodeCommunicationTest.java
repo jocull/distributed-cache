@@ -4,7 +4,9 @@ import com.codefromjames.com.lib.raft.middleware.PassThruMiddleware;
 import com.codefromjames.com.lib.topology.InMemoryTopologyDiscovery;
 import com.codefromjames.com.lib.topology.NodeAddress;
 import com.codefromjames.com.lib.topology.NodeIdentifierState;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,14 +16,26 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 public class NodeCommunicationTest {
     private static final Logger LOGGER = LoggerFactory.getLogger(NodeCommunicationTest.class);
 
-    @Test
-    void testNodeIntroductions() throws InterruptedException {
+    private static Stream<Arguments> provideIterationsLong() {
+        return IntStream.range(1, 31)
+                .mapToObj(Arguments::of);
+    }
+
+    private static Stream<Arguments> provideIterationsShort() {
+        return IntStream.range(1, 6)
+                .mapToObj(Arguments::of);
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideIterationsLong")
+    void testNodeIntroductions(int iteration) {
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
             final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
@@ -53,8 +67,9 @@ public class NodeCommunicationTest {
         }
     }
 
-    @Test
-    void testElection() {
+    @ParameterizedTest
+    @MethodSource("provideIterationsLong")
+    void testElection(int iteration) {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
@@ -88,8 +103,9 @@ public class NodeCommunicationTest {
         }
     }
 
-    @Test
-    void testElectionWithFailure_oneNode() throws InterruptedException {
+    @ParameterizedTest
+    @MethodSource("provideIterationsLong")
+    void testElectionWithFailure_oneNode(int iteration) {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
@@ -136,8 +152,9 @@ public class NodeCommunicationTest {
         }
     }
 
-    @Test
-    void testElectionWithFailure_twoNodes() throws InterruptedException {
+    @ParameterizedTest
+    @MethodSource("provideIterationsLong")
+    void testElectionWithFailure_twoNodes(int iteration) {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
@@ -186,8 +203,9 @@ public class NodeCommunicationTest {
         }
     }
 
-    @Test
-    void testLogReplication() throws InterruptedException {
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testLogReplication(int iteration) {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
@@ -238,8 +256,9 @@ public class NodeCommunicationTest {
         }
     }
 
-    @Test
-    void testLogReplicationDuringTermChange() throws InterruptedException {
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testLogReplicationDuringTermChange(int iteration) throws InterruptedException {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
