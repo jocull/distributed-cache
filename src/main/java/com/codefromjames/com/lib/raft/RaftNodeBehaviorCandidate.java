@@ -8,6 +8,7 @@ import com.codefromjames.com.lib.raft.messages.VoteResponse;
 import java.util.HashSet;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -35,7 +36,14 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
         // node will become a fresh candidate in the next term instead.
         //
         // The election timeout runs while we wait for responses back.
-        electionTimeout = self.getManager().schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
+        try {
+            electionTimeout = self.getManager().schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
+            LOGGER.trace("{} Scheduled next election timeout", self.getId());
+        } catch (RejectedExecutionException ex) {
+            if (!self.getManager().isShutdown()) {
+                throw ex;
+            }
+        }
     }
 
     @Override

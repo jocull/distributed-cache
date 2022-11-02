@@ -10,8 +10,6 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
 
 public class RaftNode {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
@@ -40,12 +38,21 @@ public class RaftNode {
 
         // Each node has its own view of cluster topology
         clusterTopology = new ClusterTopology();
+
+        // Make the manager aware that this node is referencing it
+        this.manager.addManagedNode(this);
     }
 
     public synchronized void start() {
         // All nodes start in FOLLOWER state until they hear from a leader or start an election
         behavior.close();
         behavior = new RaftNodeBehaviorFollower(this, 0);
+    }
+
+    public synchronized void stop() {
+        // Stopping the node stops any timers and resets the term back to a beginning state
+        behavior.close();
+        behavior = new RaftNodeBehaviorFollowerInitial(this);
     }
 
     public String getId() {

@@ -19,6 +19,7 @@ public class RaftManager implements AutoCloseable {
     private final TopologyDiscovery topologyDiscovery;
     private final ChannelMiddleware channelMiddleware;
     private final ScheduledThreadPoolExecutor scheduledExecutor;
+    private final List<RaftNode> managedNodes = new CopyOnWriteArrayList<>();
 
     public RaftManager(TopologyDiscovery topologyDiscovery,
                        ChannelMiddleware channelMiddleware) {
@@ -38,11 +39,24 @@ public class RaftManager implements AutoCloseable {
 
     @Override
     public void close() {
+        managedNodes.forEach(RaftNode::stop);
         scheduledExecutor.shutdownNow();
     }
 
     public EventBus getEventBus() {
         return eventBus;
+    }
+
+    void addManagedNode(RaftNode raftNode) {
+        managedNodes.add(raftNode);
+    }
+
+    boolean removeManagedNode(RaftNode raftNode) {
+        return managedNodes.remove(raftNode);
+    }
+
+    List<RaftNode> getManagedNodes() {
+        return managedNodes;
     }
 
     // region Channel Middleware delegates
@@ -62,6 +76,10 @@ public class RaftManager implements AutoCloseable {
     // endregion
 
     // region Executor delegates
+
+    public boolean isShutdown() {
+        return scheduledExecutor.isShutdown();
+    }
 
     public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
         return scheduledExecutor.schedule(command, delay, unit);

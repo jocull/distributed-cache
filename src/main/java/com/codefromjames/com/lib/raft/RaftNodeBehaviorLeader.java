@@ -9,6 +9,7 @@ import com.codefromjames.com.lib.raft.messages.VoteResponse;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -59,8 +60,14 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
         }
 
         // Chain to the next heartbeat
-        heartbeatTimeout = self.getManager().schedule(() -> this.onHeartbeatTimeout(false), 50, TimeUnit.MILLISECONDS);
-        LOGGER.debug("{} Scheduled next heartbeat", self.getId());
+        try {
+            heartbeatTimeout = self.getManager().schedule(() -> this.onHeartbeatTimeout(false), 50, TimeUnit.MILLISECONDS);
+            LOGGER.trace("{} Scheduled next heartbeat", self.getId());
+        } catch (RejectedExecutionException ex) {
+            if (!self.getManager().isShutdown()) {
+                throw ex;
+            }
+        }
     }
 
     private void updateCommittedIndex() {
