@@ -127,19 +127,12 @@ public class NodeCommunication {
     }
 
     private void onVoteRequest(VoteRequest voteRequest) {
-        owner.getNodeLock().lock();
-        LOGGER.debug("{} LOCKED!", owner.getId());
-        try {
-            owner.getBehavior().onVoteRequest(this, voteRequest)
-                    .ifPresent(this::send);
-        } finally {
-            LOGGER.debug("{} UNLOCKING!", owner.getId());
-            owner.getNodeLock().unlock();
-        }
+        owner.onVoteRequest(this, voteRequest)
+                .ifPresent(this::send);
     }
 
     private void onVoteResponse(VoteResponse voteResponse) {
-        owner.getBehavior().onVoteResponse(this, voteResponse);
+        owner.onVoteResponse(this, voteResponse);
     }
 
     public void appendEntries(AppendEntries appendEntries) {
@@ -147,11 +140,10 @@ public class NodeCommunication {
     }
 
     private void onAppendEntries(AppendEntries appendEntries) {
-        final AcknowledgeEntries ack = owner.getBehavior().onAppendEntries(this, appendEntries);
-        send(ack);
+        send(owner.onAppendEntries(this, appendEntries));
     }
 
     private void onAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries) {
-        owner.getBehavior().onAcknowledgeEntries(this, acknowledgeEntries);
+        owner.onAcknowledgeEntries(this, acknowledgeEntries);
     }
 }

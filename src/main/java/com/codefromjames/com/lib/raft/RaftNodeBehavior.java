@@ -14,7 +14,6 @@ abstract class RaftNodeBehavior {
     protected final RaftNode self;
     protected final NodeStates state;
     protected final int term;
-    protected volatile String leaderId;
 
     public RaftNodeBehavior(RaftNode self, NodeStates state, int term) {
         this.self = self;
@@ -28,14 +27,6 @@ abstract class RaftNodeBehavior {
 
     public int getTerm() {
         return term;
-    }
-
-    public String getLeaderId() {
-        return leaderId;
-    }
-
-    public void setLeaderId(String leaderId) {
-        this.leaderId = leaderId;
     }
 
     abstract void close();

@@ -14,6 +14,7 @@ import java.util.concurrent.TimeUnit;
 class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     private volatile ScheduledFuture<?> electionTimeout;
     private volatile String votedForNodeId;
+    protected volatile String leaderId;
 
     public RaftNodeBehaviorFollower(RaftNode self, int term) {
         super(self, NodeStates.FOLLOWER, term);
@@ -28,6 +29,14 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         }
     }
 
+    public String getLeaderId() {
+        return leaderId;
+    }
+
+    public void setLeaderId(String leaderId) {
+        this.leaderId = leaderId;
+    }
+
     private void scheduleNextElectionTimeout() {
         if (electionTimeout != null
                 && !electionTimeout.isCancelled()
@@ -38,7 +47,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         electionTimeout = self.getManager().schedule(this::onElectionTimeout, 150 + RaftManager.RANDOM.nextInt(151), TimeUnit.MILLISECONDS);
     }
 
-    private synchronized void onElectionTimeout() {
+    private void onElectionTimeout() {
         self.convertToCandidate(term + 1);
     }
 

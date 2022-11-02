@@ -63,7 +63,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
         LOGGER.debug("{} Scheduled next heartbeat", self.getId());
     }
 
-    synchronized void updateCommittedIndex() {
+    private void updateCommittedIndex() {
         final List<Long> currentIndices;
         synchronized (self.getActiveConnections()) {
             currentIndices = self.getActiveConnections().stream()

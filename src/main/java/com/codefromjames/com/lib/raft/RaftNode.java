@@ -1,6 +1,6 @@
 package com.codefromjames.com.lib.raft;
 
-import com.codefromjames.com.lib.raft.messages.AppendEntries;
+import com.codefromjames.com.lib.raft.messages.*;
 import com.codefromjames.com.lib.raft.middleware.ChannelMiddleware;
 import com.codefromjames.com.lib.topology.ClusterTopology;
 import com.codefromjames.com.lib.topology.NodeAddress;
@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -17,12 +18,11 @@ public class RaftNode {
 
     // Node management
     private final RaftManager manager;
-    private final Lock nodeLock;
 
     // Node details
     private final String id;
     private final NodeAddress nodeAddress;
-    private volatile RaftNodeBehavior behavior = new RaftNodeBehaviorFollowerInitial(this);
+    private RaftNodeBehavior behavior = new RaftNodeBehaviorFollowerInitial(this);
 
     // Topology and connections
     private final ClusterTopology clusterTopology;
@@ -37,13 +37,12 @@ public class RaftNode {
         this.id = id;
         this.nodeAddress = nodeAddress;
         this.manager = manager;
-        this.nodeLock = new ReentrantLock();
 
         // Each node has its own view of cluster topology
         clusterTopology = new ClusterTopology();
     }
 
-    public void start() {
+    public synchronized void start() {
         // All nodes start in FOLLOWER state until they hear from a leader or start an election
         behavior.close();
         behavior = new RaftNodeBehaviorFollower(this, 0);
@@ -57,16 +56,8 @@ public class RaftNode {
         return nodeAddress;
     }
 
-    public NodeStates getState() {
+    public synchronized NodeStates getState() {
         return behavior.getState();
-    }
-
-    public RaftNodeBehavior getBehavior() {
-        return behavior;
-    }
-
-    Lock getNodeLock() {
-        return nodeLock;
     }
 
     public long getLastReceivedIndex() {
@@ -156,7 +147,7 @@ public class RaftNode {
         }
     }
 
-    public int getCurrentTerm() {
+    public synchronized int getCurrentTerm() {
         return behavior.getTerm();
     }
 
@@ -176,6 +167,8 @@ public class RaftNode {
                 id, rollback.size(), oldTerm, newTerm, previousIndex, newIndex);
     }
 
+    // region Node type conversions
+
     synchronized RaftNodeBehaviorFollower convertToFollower(int newTerm) {
         behavior.close();
         final int oldTerm = behavior.getTerm();
@@ -191,7 +184,7 @@ public class RaftNode {
         rollback(oldTerm, appendEntries.getTerm());
 
         behavior = new RaftNodeBehaviorFollower(this, appendEntries.getTerm());
-        behavior.setLeaderId(remoteNodeId);
+        ((RaftNodeBehaviorFollower) behavior).setLeaderId(remoteNodeId);
         LOGGER.info("{} Changed leader to {}", id, remoteNodeId);
 
         return (RaftNodeBehaviorFollower) behavior;
@@ -214,4 +207,34 @@ public class RaftNode {
         behavior = new RaftNodeBehaviorLeader(this, term);
         return (RaftNodeBehaviorLeader) behavior;
     }
+
+    // endregion
+
+    // region Behavior delegate methods
+
+    synchronized AnnounceClusterTopology onIntroduction(Introduction introduction) {
+        return behavior.onIntroduction(introduction);
+    }
+
+    synchronized void onAnnounceClusterTopology(AnnounceClusterTopology announceClusterTopology) {
+        behavior.onAnnounceClusterTopology(announceClusterTopology);
+    }
+
+    synchronized Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
+        return behavior.onVoteRequest(remote, voteRequest);
+    }
+
+    synchronized void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
+        behavior.onVoteResponse(remote, voteResponse);
+    }
+
+    synchronized AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
+        return behavior.onAppendEntries(remote, appendEntries);
+    }
+
+    synchronized void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
+        behavior.onAcknowledgeEntries(remote, acknowledgeEntries);
+    }
+
+    // endregion
 }
