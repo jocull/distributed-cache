@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -12,7 +13,7 @@ public class RaftLogs {
 
     private long currentIndex = 0L;
     private long commitIndex = 0L;
-    private final Deque<RaftLog<?>> logs = new ArrayDeque<>(); // TODO: Is this the right data structure?
+    private final Deque<CompletableRaftLog<?>> logs = new ArrayDeque<>(); // TODO: Is this the right data structure?
 
     public synchronized long getCurrentIndex() {
         return currentIndex;
@@ -37,14 +38,30 @@ public class RaftLogs {
         return commitIndex;
     }
 
-    public synchronized <T> RaftLog<T> appendLog(int term, T rawLog) {
-        return appendLog(term, currentIndex + 1, rawLog);
+    public synchronized  <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, T entry) {
+        return appendLogInternal(currentTerm, entry).getFuture();
     }
 
-    public synchronized <T> RaftLog<T> appendLog(int term, long index, T rawLog) {
-        final Iterator<RaftLog<?>> iterator = logs.iterator();
+    public synchronized  <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, long index, T entry) {
+        return appendLogInternal(currentTerm, index, entry).getFuture();
+    }
+
+    public synchronized <T> RaftLog<T> appendLog(int term, T rawLog) {
+        return appendLogInternal(term, rawLog);
+    }
+
+    public synchronized  <T> RaftLog<T> appendLog(int term, long index, T rawLog) {
+        return appendLogInternal(term, index, rawLog);
+    }
+
+    private <T> CompletableRaftLog<T> appendLogInternal(int term, T rawLog) {
+        return appendLogInternal(term, currentIndex + 1, rawLog);
+    }
+
+    private <T> CompletableRaftLog<T> appendLogInternal(int term, long index, T rawLog) {
+        final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
-            final RaftLog<?> next = iterator.next();
+            final CompletableRaftLog<?> next = iterator.next();
             if (next.getIndex() < index) {
                 continue;
             }
@@ -68,12 +85,12 @@ public class RaftLogs {
             if (next.getIndex() == index) {
                 LOGGER.trace("Existing log found from term {}, index {}", next.getTerm(), next.getIndex());
                 //noinspection unchecked
-                return (RaftLog<T>) next;
+                return (CompletableRaftLog<T>) next;
             }
         }
 
         LOGGER.trace("Added new log with term {}, index {}", term, index);
-        final RaftLog<T> raftLog = new RaftLog<>(term, index, rawLog);
+        final CompletableRaftLog<T> raftLog = new CompletableRaftLog<>(term, index, rawLog);
         logs.add(raftLog);
         if (index > currentIndex) {
             currentIndex = index;
@@ -102,11 +119,12 @@ public class RaftLogs {
         currentIndex = commitIndex;
 
         final List<RaftLog<?>> removed = new ArrayList<>();
-        final Iterator<RaftLog<?>> iterator = logs.iterator();
+        final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
-            final RaftLog<?> log = iterator.next();
+            final CompletableRaftLog<?> log = iterator.next();
             if (log.getIndex() > commitIndex) {
                 removed.add(log);
+                log.rollback();
                 iterator.remove();
             }
         }
@@ -122,10 +140,36 @@ public class RaftLogs {
         }
 
         // Move the commit index forwards and return the committed logs
-        final List<RaftLog<?>> committed = logs.stream()
-                .filter(r -> r.getIndex() > commitIndex && r.getIndex() <= index)
-                .collect(Collectors.toList());
+        final long previousCommitIndex = commitIndex;
         commitIndex = index;
-        return committed;
+        return logs.stream()
+                .filter(r -> r.getIndex() > previousCommitIndex && r.getIndex() <= index)
+                .peek(CompletableRaftLog::commit)
+                .collect(Collectors.toList());
+    }
+
+    private static class CompletableRaftLog<T> extends RaftLog<T> {
+        private final CompletableFuture<RaftLog<T>> future;
+
+        public CompletableRaftLog(int term, long index, T entry) {
+            super(term, index, entry);
+            this.future = new CompletableFuture<>();
+        }
+
+        public CompletableFuture<RaftLog<T>> getFuture() {
+            return future;
+        }
+
+        // TODO: These commits and rollbacks will happen synchronously when these methods are called,
+        //       impacting an unknown number of chained futures downstream from here. Should these
+        //       operations be offloaded to a thread pool so that we can release any locks on the logs earlier?
+
+        public void rollback() {
+            future.cancel(false);
+        }
+
+        public void commit() {
+            future.complete(this);
+        }
     }
 }

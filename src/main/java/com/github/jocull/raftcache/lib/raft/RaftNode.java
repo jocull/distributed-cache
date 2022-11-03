@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 public class RaftNode {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
@@ -251,6 +252,15 @@ public class RaftNode {
             }
 
             return logs.appendLog(getCurrentTerm(), entry);
+        }
+
+        @Override
+        public <T> CompletableFuture<RaftLog<T>> submit(T entry) {
+            if (getState() != NodeStates.LEADER) {
+                throw new IllegalStateException("Not currently a leader! Instead " + getState());
+            }
+
+            return logs.appendFutureLog(getCurrentTerm(), entry);
         }
     }
 }
