@@ -231,23 +231,23 @@ public class NodeCommunicationTest {
             });
 
             nodes.followers().forEach(r -> {
-                assertThrows(IllegalStateException.class, () -> r.submitNewLog("hello"));
+                assertThrows(IllegalStateException.class, () -> r.getOperations().submitNewLog("hello"));
             });
 
-            final RaftLog<String> log1 = nodes.leader().submitNewLog("hello");
+            final RaftLog<String> log1 = nodes.leader().getOperations().submitNewLog("hello");
             assertWithinTimeout("Followers didn't get log 1", 1, TimeUnit.SECONDS, () ->
                     nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log1.getTerm(), log1.getIndex())));
 
-            final RaftLog<String> log2 = nodes.leader().submitNewLog("hello again");
+            final RaftLog<String> log2 = nodes.leader().getOperations().submitNewLog("hello again");
             assertWithinTimeout("Followers didn't get log 2", 1, TimeUnit.SECONDS, () ->
                     nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log2.getTerm(), log2.getIndex())));
 
-            final RaftLog<String> log3 = nodes.leader().submitNewLog("hello one last time");
+            final RaftLog<String> log3 = nodes.leader().getOperations().submitNewLog("hello one last time");
             assertWithinTimeout("Followers didn't get log 3", 1, TimeUnit.SECONDS, () ->
                     nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTerm(), log3.getIndex())));
 
             final List<RaftLog<Integer>> logList = IntStream.range(0, 1000)
-                    .mapToObj(i -> nodes.leader().submitNewLog(i))
+                    .mapToObj(i -> nodes.leader().getOperations().submitNewLog(i))
                     .collect(Collectors.toList());
 
             final RaftLog<Integer> logLast = logList.get(logList.size() - 1);
@@ -284,11 +284,11 @@ public class NodeCommunicationTest {
             });
 
             nodes1.followers().forEach(r -> {
-                assertThrows(IllegalStateException.class, () -> r.submitNewLog("hello"));
+                assertThrows(IllegalStateException.class, () -> r.getOperations().submitNewLog("hello"));
             });
 
             final List<RaftLog<Integer>> logList = IntStream.range(0, 1000)
-                    .mapToObj(i -> nodes1.leader().submitNewLog(i))
+                    .mapToObj(i -> nodes1.leader().getOperations().submitNewLog(i))
                     .collect(Collectors.toList());
 
             Thread.sleep(125);

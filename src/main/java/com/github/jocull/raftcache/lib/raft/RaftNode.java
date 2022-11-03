@@ -29,6 +29,9 @@ public class RaftNode {
     // Log management
     private final RaftLogs logs = new RaftLogs();
 
+    // Node interface
+    private final RaftOperations raftOperations = new LocalRaftOperations();
+
     public RaftNode(String id,
                     NodeAddress nodeAddress,
                     RaftManager manager) {
@@ -108,6 +111,28 @@ public class RaftNode {
         return connection;
     }
 
+    public synchronized int getCurrentTerm() {
+        return behavior.getTerm();
+    }
+
+    public ClusterTopology getClusterTopology() {
+        return clusterTopology;
+    }
+
+    public RaftManager getManager() {
+        return manager;
+    }
+
+    public RaftOperations getOperations() {
+        return raftOperations;
+    }
+
+    /* package-private-for-test */ List<NodeCommunication> getActiveConnections() {
+        synchronized (activeConnections) {
+            return List.copyOf(activeConnections);
+        }
+    }
+
     /**
      * When a connection is made to this node.
      */
@@ -120,12 +145,6 @@ public class RaftNode {
         return connection;
     }
 
-    /* package-private-for-test */ List<NodeCommunication> getActiveConnections() {
-        synchronized (activeConnections) {
-            return List.copyOf(activeConnections);
-        }
-    }
-
     public void disconnect(NodeCommunication connection) {
         LOGGER.debug("{} Disconnecting from {}", id, connection.getRemoteNodeAddress().getAddress());
         throw new UnsupportedOperationException("Disconnect not yet implemented!");
@@ -136,15 +155,6 @@ public class RaftNode {
 //        }
     }
 
-    // TODO: Clean up, part of the client API with the RaftNode
-    public <T> RaftLog<T> submitNewLog(T entry) {
-        if (getState() != NodeStates.LEADER) {
-            throw new IllegalStateException("Not currently a leader! Instead " + getState());
-        }
-
-        return logs.appendLog(getCurrentTerm(), entry);
-    }
-
     private boolean hasNodeConnection(NodeAddress remoteAddress) {
         synchronized (activeConnections) {
             if (activeConnections.stream().anyMatch(c -> c.getRemoteNodeAddress().equals(remoteAddress))) {
@@ -152,18 +162,6 @@ public class RaftNode {
             }
             return false;
         }
-    }
-
-    public synchronized int getCurrentTerm() {
-        return behavior.getTerm();
-    }
-
-    public ClusterTopology getClusterTopology() {
-        return clusterTopology;
-    }
-
-    public RaftManager getManager() {
-        return manager;
     }
 
     private void rollback(int oldTerm, int newTerm) {
@@ -244,4 +242,15 @@ public class RaftNode {
     }
 
     // endregion
+
+    private class LocalRaftOperations implements RaftOperations {
+        @Override
+        public <T> RaftLog<T> submitNewLog(T entry) {
+            if (getState() != NodeStates.LEADER) {
+                throw new IllegalStateException("Not currently a leader! Instead " + getState());
+            }
+
+            return logs.appendLog(getCurrentTerm(), entry);
+        }
+    }
 }
