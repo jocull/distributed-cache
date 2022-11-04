@@ -17,6 +17,9 @@ public class NodeCommunication {
 
     private String remoteNodeId; // Unknown until introduction
     private volatile long currentIndex;
+    // TODO: In addition to the `currentIndex`, the `term` is likely important to track here too...?
+    //       Are we able to make sense of the `term` coming out of each message and keep track of it here
+    //       to help indicate what term the remote node is in? This can be used to announce cluster topology.
 
     public NodeCommunication(RaftNode owner,
                              ChannelMiddleware.ChannelSide channel) {

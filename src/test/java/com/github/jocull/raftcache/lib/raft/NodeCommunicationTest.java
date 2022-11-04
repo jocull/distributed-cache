@@ -10,9 +10,13 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -231,28 +235,38 @@ public class NodeCommunicationTest {
             });
 
             nodes.followers().forEach(r -> {
-                assertThrows(IllegalStateException.class, () -> r.getOperations().submitNewLog("hello"));
+                assertThrows(IllegalStateException.class, () -> r.getOperations().submit("hello"));
             });
 
-            final RaftLog<String> log1 = nodes.leader().getOperations().submitNewLog("hello");
-            assertWithinTimeout("Followers didn't get log 1", 1, TimeUnit.SECONDS, () ->
-                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log1.getTerm(), log1.getIndex())));
+            final RaftLog<String> log1 = assertDoesNotThrow(
+                    () -> nodes.leader().getOperations().submit("hello").get(1, TimeUnit.SECONDS),
+                    "Expected followers to get log 1");
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log1.getTerm(), log1.getIndex())),
+                    "Followers didn't get log 1");
 
-            final RaftLog<String> log2 = nodes.leader().getOperations().submitNewLog("hello again");
-            assertWithinTimeout("Followers didn't get log 2", 1, TimeUnit.SECONDS, () ->
-                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log2.getTerm(), log2.getIndex())));
+            final RaftLog<String> log2 = assertDoesNotThrow(
+                    () -> nodes.leader().getOperations().submit("hello again").get(1, TimeUnit.SECONDS),
+                    "Expected followers to get log 2");
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log2.getTerm(), log2.getIndex())),
+                    "Followers didn't get log 2");
 
-            final RaftLog<String> log3 = nodes.leader().getOperations().submitNewLog("hello one last time");
-            assertWithinTimeout("Followers didn't get log 3", 1, TimeUnit.SECONDS, () ->
-                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTerm(), log3.getIndex())));
+            final RaftLog<String> log3 = assertDoesNotThrow(
+                    () -> nodes.leader().getOperations().submit("hello one last time").get(1, TimeUnit.SECONDS),
+                    "Expected followers to get log 2");
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTerm(), log3.getIndex())),
+                    "Followers didn't get log 3");
 
-            final List<RaftLog<Integer>> logList = IntStream.range(0, 1000)
-                    .mapToObj(i -> nodes.leader().getOperations().submitNewLog(i))
+            final List<CompletableFuture<RaftLog<Integer>>> futures = IntStream.range(0, 1000)
+                    .mapToObj(i -> nodes.leader().getOperations().submit(i))
                     .collect(Collectors.toList());
 
-            final RaftLog<Integer> logLast = logList.get(logList.size() - 1);
-            assertWithinTimeout("Followers didn't get final log", 5, TimeUnit.SECONDS, () ->
-                    nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())));
+            final List<RaftLog<Integer>> results = futures.stream()
+                    .map(CompletableFuture::join)
+                    .collect(Collectors.toList());
+
+            final RaftLog<Integer> logLast = results.get(futures.size() - 1);
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())),
+                    "Followers didn't get final log");
         }
     }
 
@@ -284,14 +298,59 @@ public class NodeCommunicationTest {
             });
 
             nodes1.followers().forEach(r -> {
-                assertThrows(IllegalStateException.class, () -> r.getOperations().submitNewLog("hello"));
+                assertThrows(IllegalStateException.class, () -> r.getOperations().submit("hello"));
             });
 
-            final List<RaftLog<Integer>> logList = IntStream.range(0, 1000)
-                    .mapToObj(i -> nodes1.leader().getOperations().submitNewLog(i))
-                    .collect(Collectors.toList());
+            final AtomicBoolean producerStopped = new AtomicBoolean();
+            final List<CompletableFuture<RaftLog<Integer>>> futuresOk = new ArrayList<>();
+            final List<Integer> futuresRejected = new ArrayList<>();
+            final Set<RaftNode> seenLeaderNodes = new HashSet<>();
+            final Thread producer = new Thread(() -> {
+                try {
+                    int counter = 0;
+                    while (!producerStopped.get()) {
+                        final RaftNode currentLeader = getRaftLeader(middleware);
+                        if (currentLeader == null) {
+                            LOGGER.warn("No current leader!");
+                            Thread.sleep(25);
+                            continue;
+                        }
+                        synchronized (seenLeaderNodes) {
+                            seenLeaderNodes.add(currentLeader);
+                        }
 
-            Thread.sleep(125);
+                        final int thisCount = counter++;
+                        try {
+                            final CompletableFuture<RaftLog<Integer>> future = currentLeader.getOperations().submit(thisCount);
+                            synchronized (futuresOk) {
+                                LOGGER.debug("Added {} to current leader {}", thisCount, currentLeader.getId());
+                                futuresOk.add(future);
+                            }
+                        } catch (Exception ex) {
+                            synchronized (futuresRejected) {
+                                LOGGER.debug("Failed to add {} to current leader {}", thisCount, currentLeader.getId(), ex);
+                                futuresRejected.add(thisCount);
+                            }
+                        }
+                        Thread.sleep(5);
+                    }
+                } catch (InterruptedException ex) {
+                    LOGGER.info("Interrupted - exiting", ex);
+                }
+            });
+            producer.setName("producer-thread");
+            producer.setDaemon(true);
+            producer.start();
+
+            final int logStartPoint = assertResultWithinTimeout("Starting logs did not populate", 5, TimeUnit.SECONDS, () -> {
+                synchronized (futuresOk) {
+                    if (futuresOk.size() >= 100) {
+                        return futuresOk.size();
+                    }
+                    return null;
+                }
+            });
+
             LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
             middleware.interrupt(nodes1.leader().getNodeAddress());
             final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
@@ -302,8 +361,18 @@ public class NodeCommunicationTest {
                 return null;
             });
 
-            // Stay interrupted for a while
-            Thread.sleep(2000);
+            // Stay interrupted for a while, expect that we collect more logs and see more nodes
+            assertWithinTimeout("Did not get more logs and new leader during interrupt", 5, TimeUnit.SECONDS, () -> {
+                boolean logsPassed = false;
+                boolean leadersPassed = false;
+                synchronized (futuresOk) {
+                    logsPassed = futuresOk.size() >= (logStartPoint + 200);
+                }
+                synchronized (seenLeaderNodes) {
+                    leadersPassed = seenLeaderNodes.size() >= 2;
+                }
+                return logsPassed && leadersPassed;
+            });
 
             LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
             middleware.restore(nodes1.leader().getNodeAddress());
@@ -315,9 +384,19 @@ public class NodeCommunicationTest {
                 return null;
             });
 
-            final RaftLog<Integer> logLast = logList.get(logList.size() - 1);
-            assertWithinTimeout("Followers didn't get final log", 5, TimeUnit.SECONDS, () ->
-                    nodes1.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())));
+            producerStopped.set(true);
+            assertWithinTimeout("Producer didn't stop!", 1, TimeUnit.SECONDS, () -> !producer.isAlive());
+
+            RaftLog<Integer> integerRaftLog = assertDoesNotThrow(() -> futuresOk.get(futuresOk.size() - 1).get(5, TimeUnit.SECONDS));
+            if (integerRaftLog != null) {
+                LOGGER.info("Yay!");
+            }
+
+//            final RaftLog<Integer> logLast = assertDoesNotThrow(
+//                    () -> futuresOk.get(futuresOk.size() - 1).get(5, TimeUnit.SECONDS),
+//                    "Followers didn't get final log");
+//            assertTrue(nodes1.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())),
+//                    "Followers didn't get final log");
         }
     }
 
@@ -330,10 +409,12 @@ public class NodeCommunicationTest {
             public RaftNode leader() {
                 return leader;
             }
+
             @Override
             public List<RaftNode> candidates() {
                 return candidates;
             }
+
             @Override
             public List<RaftNode> followers() {
                 return followers;
@@ -362,7 +443,9 @@ public class NodeCommunicationTest {
 
     private interface ClusterNodes {
         RaftNode leader();
+
         List<RaftNode> candidates();
+
         List<RaftNode> followers();
     }
 

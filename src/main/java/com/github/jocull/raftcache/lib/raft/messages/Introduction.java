@@ -6,6 +6,7 @@ public class Introduction {
     private final String id;
     private final NodeAddress nodeAddress;
     private final long lastReceivedIndex;
+    // TODO: It is probably worth announcing the term as well - the index alone is generally not enough information.
 
     public Introduction(String id, NodeAddress nodeAddress, long lastReceivedIndex) {
         this.id = id;

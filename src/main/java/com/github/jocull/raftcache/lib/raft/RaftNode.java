@@ -246,12 +246,9 @@ public class RaftNode {
 
     private class LocalRaftOperations implements RaftOperations {
         @Override
-        public <T> RaftLog<T> submitNewLog(T entry) {
-            if (getState() != NodeStates.LEADER) {
-                throw new IllegalStateException("Not currently a leader! Instead " + getState());
-            }
-
-            return logs.appendLog(getCurrentTerm(), entry);
+        public AnnounceClusterTopology requestTopology() {
+            // TODO: We need to be able to request the topology from any node as a method of finding the leaders.
+            throw new UnsupportedOperationException("Not implemented yet!");
         }
 
         @Override
