@@ -5,10 +5,11 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ForkJoinPool;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
-public class RaftLogs {
+class RaftLogs {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftLogs.class);
 
     private long currentIndex = 0L;
@@ -38,11 +39,11 @@ public class RaftLogs {
         return commitIndex;
     }
 
-    public synchronized  <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, T entry) {
+    public synchronized <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, T entry) {
         return appendLogInternal(currentTerm, entry).getFuture();
     }
 
-    public synchronized  <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, long index, T entry) {
+    public synchronized <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, long index, T entry) {
         return appendLogInternal(currentTerm, index, entry).getFuture();
     }
 
@@ -50,7 +51,7 @@ public class RaftLogs {
         return appendLogInternal(term, rawLog);
     }
 
-    public synchronized  <T> RaftLog<T> appendLog(int term, long index, T rawLog) {
+    public synchronized <T> RaftLog<T> appendLog(int term, long index, T rawLog) {
         return appendLogInternal(term, index, rawLog);
     }
 
@@ -160,16 +161,12 @@ public class RaftLogs {
             return future;
         }
 
-        // TODO: These commits and rollbacks will happen synchronously when these methods are called,
-        //       impacting an unknown number of chained futures downstream from here. Should these
-        //       operations be offloaded to a thread pool so that we can release any locks on the logs earlier?
-
         public void rollback() {
-            future.cancel(false);
+            ForkJoinPool.commonPool().execute(() -> future.cancel(false));
         }
 
         public void commit() {
-            future.complete(this);
+            future.completeAsync(() -> this, ForkJoinPool.commonPool());
         }
     }
 }

@@ -4,10 +4,9 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -80,17 +79,19 @@ public class RaftLogsTest {
     }
 
     @Test
-    void testFutureRaftLogsCommit() {
+    void testFutureRaftLogsCommit() throws ExecutionException, InterruptedException, TimeoutException {
         final RaftLogs raftLogs = new RaftLogs();
         assertEquals(0L, raftLogs.getCurrentIndex());
         assertEquals(0L, raftLogs.getCommitIndex());
 
+        final AtomicReference<Thread> futureThread = new AtomicReference<>();
         final AtomicBoolean futureRan = new AtomicBoolean(false);
         final CompletableFuture<Void> log1 = raftLogs.appendFutureLog(1, 1, "hello")
                 .thenAccept(log -> {
                     assertEquals(1L, log.getIndex());
                     assertEquals("hello", log.getEntry());
                     assertEquals(String.class, log.getLogClass());
+                    futureThread.set(Thread.currentThread());
                     futureRan.set(true);
                 });
 
@@ -99,10 +100,15 @@ public class RaftLogsTest {
         assertFalse(log1.isCancelled());
         assertFalse(log1.isDone());
         assertFalse(log1.isCompletedExceptionally());
+        assertNull(futureThread.get());
+        assertFalse(futureRan.get());
 
         final List<RaftLog<?>> commit = raftLogs.commit(1);
         assertEquals(1, commit.size());
+        log1.get(100, TimeUnit.MILLISECONDS);
         assertTrue(futureRan.get());
+        assertNotNull(futureThread.get());
+        assertNotEquals(Thread.currentThread(), futureThread.get());
         assertFalse(log1.isCancelled());
         assertTrue(log1.isDone());
         assertFalse(log1.isCompletedExceptionally());
@@ -114,14 +120,19 @@ public class RaftLogsTest {
         assertEquals(0L, raftLogs.getCurrentIndex());
         assertEquals(0L, raftLogs.getCommitIndex());
 
-        final AtomicBoolean futureRan = new AtomicBoolean(false);
+        final AtomicReference<Thread> futureThread = new AtomicReference<>();
+        final AtomicBoolean futureAcceptRan = new AtomicBoolean(false);
+        final AtomicBoolean futureExceptionallyRan = new AtomicBoolean(false);
         final CompletableFuture<Void> log1 = raftLogs.appendFutureLog(1, 1, "hello")
                 .thenAccept(log -> {
-                    assertEquals(1L, log.getIndex());
-                    assertEquals("hello", log.getEntry());
-                    assertEquals(String.class, log.getLogClass());
-                    futureRan.set(true);
+                    futureAcceptRan.set(true);
                 });
+
+        log1.exceptionally(throwable -> {
+            futureThread.set(Thread.currentThread());
+            futureExceptionallyRan.set(true);
+            return null;
+        });
 
         assertEquals(1L, raftLogs.getCurrentIndex());
         assertEquals(0L, raftLogs.getCommitIndex());
@@ -131,13 +142,16 @@ public class RaftLogsTest {
 
         final List<RaftLog<?>> rollback = raftLogs.rollback();
         assertEquals(1, rollback.size());
-        assertFalse(futureRan.get());
+
+        final ExecutionException ex = assertThrows(ExecutionException.class, () -> log1.get(100, TimeUnit.MILLISECONDS));
+        assertNotNull(ex.getCause());
+        assertEquals(CancellationException.class, ex.getCause().getClass());
+
         assertFalse(log1.isCancelled()); // confusingly, this future is not cancelled - the parent of it was!
         assertTrue(log1.isDone());
         assertTrue(log1.isCompletedExceptionally()); // Because CancellationException
-
-        final ExecutionException ex = assertThrows(ExecutionException.class, log1::get);
-        assertNotNull(ex.getCause());
-        assertEquals(CancellationException.class, ex.getCause().getClass());
+        assertFalse(futureAcceptRan.get());
+        assertNotEquals(Thread.currentThread(), futureThread.get());
+        assertTrue(futureExceptionallyRan.get());
     }
 }
