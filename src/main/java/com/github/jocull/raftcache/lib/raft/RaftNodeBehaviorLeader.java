@@ -95,7 +95,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
         if (voteRequest.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
-            self.convertToFollower(voteRequest.getTerm())
+            return self.convertToFollower(voteRequest.getTerm())
                     .onVoteRequest(remote, voteRequest);
         }
 
