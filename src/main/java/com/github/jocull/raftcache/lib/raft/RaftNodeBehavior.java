@@ -59,6 +59,7 @@ abstract class RaftNodeBehavior {
 
     StateResponse onStateRequest(StateRequest stateRequest) {
         return new StateResponse(
+                stateRequest,
                 self.getId(),
                 self.getNodeAddress(),
                 getState(),

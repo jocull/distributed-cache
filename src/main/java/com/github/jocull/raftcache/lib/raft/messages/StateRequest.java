@@ -1,8 +1,8 @@
 package com.github.jocull.raftcache.lib.raft.messages;
 
-public class StateRequest {
+public class StateRequest extends Request {
     @Override
     public String toString() {
-        return "StateRequest{}";
+        return "StateRequest{} " + super.toString();
     }
 }

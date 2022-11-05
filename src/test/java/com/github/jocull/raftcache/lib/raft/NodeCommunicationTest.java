@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.raft.messages.StateResponse;
 import com.github.jocull.raftcache.lib.raft.middleware.PassThruMiddleware;
 import com.github.jocull.raftcache.lib.topology.InMemoryTopologyDiscovery;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
@@ -95,15 +96,28 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            assertWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
-                final long leaderCount = (int) middleware.getAddressRaftNodeMap().values().stream()
-                        .filter(r -> r.getState().equals(NodeStates.LEADER))
-                        .count();
-                final long followerCount = (int) middleware.getAddressRaftNodeMap().values().stream()
-                        .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
-                        .count();
-                return leaderCount == 1 && followerCount == 2;
+            final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
             });
+
+            final List<StateResponse> clusterNodeStates = nodeA.getOperations().getClusterNodeStates();
+            assertNotNull(clusterNodeStates);
+            assertEquals(3, clusterNodeStates.size());
+            assertEquals(Set.of("nodeA", "nodeB", "nodeC"), clusterNodeStates.stream().map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
+            assertEquals(Stream.of("addressA", "addressB", "addressC").map(NodeAddress::new).collect(Collectors.toSet()),
+                    clusterNodeStates.stream().map(x -> x.getIdentifier().getNodeAddress()).collect(Collectors.toSet()));
+            assertEquals(Set.of("nodeA", "nodeB", "nodeC"), clusterNodeStates.stream().map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
+            assertEquals(nodes1.leader().getId(), clusterNodeStates.stream().filter(c -> c.getState().equals(NodeStates.LEADER)).findFirst().orElseThrow().getIdentifier().getId());
+            assertEquals(nodes1.followers().stream().map(RaftNode::getId).collect(Collectors.toSet()),
+                    clusterNodeStates.stream().filter(c -> c.getState().equals(NodeStates.FOLLOWER)).map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
+
+            final StateResponse leaderState = nodeA.getOperations().getLeader().orElseThrow();
+            assertEquals(nodes1.leader().getId(), leaderState.getIdentifier().getId());
+            assertEquals(nodes1.leader().getCurrentTerm(), leaderState.getTerm());
         }
     }
 
