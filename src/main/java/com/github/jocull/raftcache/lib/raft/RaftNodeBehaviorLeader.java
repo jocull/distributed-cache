@@ -47,7 +47,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                 final List<AppendEntries.RaftLog> entries = self.getLogs().getLogRange(c.getCurrentIndex(), 25, this::transformLog);
                 if (!entries.isEmpty()) {
                     final long newEndIndex = entries.get(entries.size() - 1).getIndex();
-                    LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries", self.getId(), c.getRemoteNodeId(), c.getCurrentIndex(), newEndIndex, entries.size());
+                    LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries @ term {}", self.getId(), c.getRemoteNodeId(), c.getCurrentIndex(), newEndIndex, entries.size(), self.getCurrentTerm());
                 } else {
                     LOGGER.debug("{} Sending heartbeat to {}", self.getId(), c.getRemoteNodeId());
                 }
@@ -134,11 +134,11 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             return;
         }
         if (!acknowledgeEntries.isSuccess()) {
-            LOGGER.warn("{} received AcknowledgeEntries without success from {}: {}, {}", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), acknowledgeEntries.getCurrentIndex());
+            LOGGER.warn("{} received AcknowledgeEntries without success from {}: {}, {} @ term {}", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), acknowledgeEntries.getCurrentIndex(), acknowledgeEntries.getTerm());
             return;
         }
 
-        LOGGER.debug("{} received AcknowledgeEntries from {} moving index {} -> {}", self.getId(), remote.getRemoteNodeId(), remote.getCurrentIndex(), acknowledgeEntries.getCurrentIndex());
+        LOGGER.debug("{} received AcknowledgeEntries from {} moving index {} -> {} @ term {}", self.getId(), remote.getRemoteNodeId(), remote.getCurrentIndex(), acknowledgeEntries.getCurrentIndex(), acknowledgeEntries.getTerm());
         remote.setCurrentIndex(acknowledgeEntries.getCurrentIndex());
         updateCommittedIndex();
     }

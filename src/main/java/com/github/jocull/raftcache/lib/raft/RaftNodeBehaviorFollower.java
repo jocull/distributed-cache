@@ -136,9 +136,9 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         // Append the logs
         if (!appendEntries.getEntries().isEmpty()) {
             final long newEndIndex = appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
-            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries", self.getId(), remote.getRemoteNodeId(), self.getLogs().getCurrentIndex(), newEndIndex, appendEntries.getEntries().size());
+            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries @ term {}", self.getId(), remote.getRemoteNodeId(), self.getLogs().getCurrentIndex(), newEndIndex, appendEntries.getEntries().size(), appendEntries.getTerm());
         } else {
-            LOGGER.debug("{} Received heartbeat from {}", self.getId(), remote.getRemoteNodeId());
+            LOGGER.debug("{} Received heartbeat from {} @ term {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm());
         }
         appendEntries.getEntries().forEach(r -> self.getLogs().appendLog(appendEntries.getTerm(), r.getIndex(), r.getEntry()));
 
