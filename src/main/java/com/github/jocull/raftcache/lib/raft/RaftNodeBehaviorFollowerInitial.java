@@ -19,21 +19,21 @@ class RaftNodeBehaviorFollowerInitial extends RaftNodeBehavior {
 
     @Override
     Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
-        throw new IllegalStateException("Initial follower is not yet started.");
+        throw new IllegalStateException(self.getId() + ": Initial follower is not yet started.");
     }
 
     @Override
     void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
-        throw new IllegalStateException("Initial follower is not yet started.");
+        throw new IllegalStateException(self.getId() + ": Initial follower is not yet started.");
     }
 
     @Override
     AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
-        throw new IllegalStateException("Initial follower is not yet started.");
+        throw new IllegalStateException(self.getId() + ": Initial follower is not yet started.");
     }
 
     @Override
     void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
-        throw new IllegalStateException("Initial follower is not yet started.");
+        throw new IllegalStateException(self.getId() + ": Initial follower is not yet started.");
     }
 }
