@@ -348,17 +348,19 @@ public class NodeCommunicationTest {
                     int counter = 0;
                     while (!producerStopped.get()) {
                         final int thisCount = counter++;
-                        CompletableFuture<RaftLog<Integer>> future = fnSubmitLogFuture.apply(thisCount);
+                        CompletableFuture<RaftLog<Integer>> result = new CompletableFuture<>();
+                        CompletableFuture<RaftLog<Integer>> retryChain = fnSubmitLogFuture.apply(thisCount);
                         for (int retry = 0; retry < 10; retry++) {
                             // See explanation of retry logic
                             // https://stackoverflow.com/a/40487376/97964
-                            future = future
+                            retryChain = retryChain
                                     .thenApply(x -> (Throwable) null)
                                     .exceptionally(ex -> ex)
                                     .thenApplyAsync(ex -> fnSubmitLogFuture.apply(thisCount), delayedExecutor)
                                     .thenCompose(Function.identity());
                         }
-                        logFutures.add(future);
+                        retryChain.thenAccept(result::complete);
+                        logFutures.add(result);
                         Thread.sleep(5);
                     }
                 } catch (InterruptedException ex) {
