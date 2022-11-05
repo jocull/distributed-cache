@@ -3,7 +3,7 @@ package com.github.jocull.raftcache.lib.raft;
 import com.github.jocull.raftcache.lib.raft.middleware.PassThruMiddleware;
 import com.github.jocull.raftcache.lib.topology.InMemoryTopologyDiscovery;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
-import com.github.jocull.raftcache.lib.topology.NodeIdentifierState;
+import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -47,10 +47,10 @@ public class NodeCommunicationTest {
             middleware.addNode(nodeA).addNode(nodeB);
 
             assertEquals(Set.of(), nodeA.getClusterTopology().getTopology().stream()
-                    .map(NodeIdentifierState::getId)
+                    .map(NodeIdentifier::getId)
                     .collect(Collectors.toSet()));
             assertEquals(Set.of(), nodeB.getClusterTopology().getTopology().stream()
-                    .map(NodeIdentifierState::getId)
+                    .map(NodeIdentifier::getId)
                     .collect(Collectors.toSet()));
 
             nodeA.connectTo(nodeB.getNodeAddress());
@@ -58,13 +58,13 @@ public class NodeCommunicationTest {
             // nodeA self registers, and contacts nodeB
             assertWithinTimeout("nodeA's topology did not settle with nodeA, nodeB", 1000, TimeUnit.MILLISECONDS, () -> {
                 final Set<String> nodeTopology = nodeA.getClusterTopology().getTopology().stream()
-                        .map(NodeIdentifierState::getId)
+                        .map(NodeIdentifier::getId)
                         .collect(Collectors.toSet());
                 return Set.of("nodeA", "nodeB").equals(nodeTopology);
             });
             assertWithinTimeout("nodeB's topology did not settle with nodeA, nodeB", 1000, TimeUnit.MILLISECONDS, () -> {
                 final Set<String> nodeTopology = nodeB.getClusterTopology().getTopology().stream()
-                        .map(NodeIdentifierState::getId)
+                        .map(NodeIdentifier::getId)
                         .collect(Collectors.toSet());
                 return Set.of("nodeA", "nodeB").equals(nodeTopology);
             });

@@ -226,6 +226,10 @@ public class RaftNode {
         behavior.onAnnounceClusterTopology(announceClusterTopology);
     }
 
+    synchronized StateResponse onStateRequest(StateRequest stateRequest) {
+        return behavior.onStateRequest(stateRequest);
+    }
+
     synchronized Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
         return behavior.onVoteRequest(remote, voteRequest);
     }

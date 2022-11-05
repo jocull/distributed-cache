@@ -3,31 +3,31 @@ package com.github.jocull.raftcache.lib.topology;
 import java.util.*;
 
 public class ClusterTopology {
-    private final Map<String, NodeIdentifierState> identifiers;
+    private final Map<String, NodeIdentifier> identifiers;
 
     public ClusterTopology() {
         this.identifiers = new HashMap<>();
     }
 
-    public synchronized Optional<NodeIdentifierState> locate(NodeAddress nodeAddress) {
+    public synchronized Optional<NodeIdentifier> locate(NodeAddress nodeAddress) {
         return identifiers.values().stream()
                 .filter(i -> i.getNodeAddress().getAddress().equals(nodeAddress.getAddress()))
                 .findFirst();
     }
 
-    public synchronized void register(NodeIdentifierState identifier) {
+    public synchronized void register(NodeIdentifier identifier) {
         identifiers.put(identifier.getId(), identifier);
     }
 
-    public synchronized void register(Collection<NodeIdentifierState> identifiers) {
+    public synchronized void register(Collection<NodeIdentifier> identifiers) {
         identifiers.forEach(i -> this.identifiers.put(i.getId(), i));
     }
 
-    public synchronized NodeIdentifierState unregister(String nodeId) {
+    public synchronized NodeIdentifier unregister(String nodeId) {
         return identifiers.remove(nodeId);
     }
 
-    public synchronized List<NodeIdentifierState> getTopology() {
+    public synchronized List<NodeIdentifier> getTopology() {
         return List.copyOf(identifiers.values());
     }
 

@@ -2,8 +2,8 @@ package com.github.jocull.raftcache.lib.raft;
 
 import com.github.jocull.raftcache.lib.raft.middleware.ChannelMiddleware;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
-import com.github.jocull.raftcache.lib.topology.NodeIdentifierState;
 import com.github.jocull.raftcache.lib.raft.messages.*;
+import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,7 +27,7 @@ public class NodeCommunication {
         this.channel = channel;
 
         // Register yourself into this view
-        this.owner.getClusterTopology().register(new NodeIdentifierState(owner.getId(), owner.getNodeAddress()));
+        this.owner.getClusterTopology().register(new NodeIdentifier(owner.getId(), owner.getNodeAddress()));
 
         this.channel.setReceiver(this::receive);
     }
@@ -63,6 +63,10 @@ public class NodeCommunication {
             onAnnounceClusterTopology((AnnounceClusterTopology) message);
             return;
         }
+        if (message instanceof StateRequest) {
+            onStateRequest((StateRequest) message);
+            return;
+        }
         if (remoteNodeId == null) {
             throw new IllegalStateException("Cannot process " + message.getClass().getSimpleName()
                     + " before introduction! remoteNodeId is null");
@@ -90,7 +94,7 @@ public class NodeCommunication {
 
     private synchronized void onIntroduction(Introduction introduction) {
         // We register data about the node that has introduced itself
-        owner.getClusterTopology().register(new NodeIdentifierState(
+        owner.getClusterTopology().register(new NodeIdentifier(
                 introduction.getId(),
                 introduction.getNodeAddress()
         ));
@@ -99,10 +103,9 @@ public class NodeCommunication {
         // And reply with the cluster topology as we know it
         send(new AnnounceClusterTopology(
                 owner.getClusterTopology().getTopology().stream()
-                        .map(i -> new AnnounceClusterTopology.NodeIdentifierState(
+                        .map(i -> new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier(
                                 i.getId(),
-                                i.getNodeAddress(),
-                                i.getState()
+                                i.getNodeAddress()
                         ))
                         .collect(Collectors.toList())
         ));
@@ -111,18 +114,21 @@ public class NodeCommunication {
     private void onAnnounceClusterTopology(AnnounceClusterTopology announceClusterTopology) {
         // When the topology has been received we can update our local view of the world
         owner.getClusterTopology().register(announceClusterTopology.getNodeIdentifierStates().stream()
-                .map(i -> new NodeIdentifierState(
+                .map(i -> new NodeIdentifier(
                         i.getId(),
-                        i.getNodeAddress(),
-                        i.getState()
+                        i.getNodeAddress()
                 ))
                 .collect(Collectors.toList()));
 
         if (remoteNodeId == null) {
             remoteNodeId = owner.getClusterTopology().locate(channel.getAddress())
-                    .map(NodeIdentifierState::getId)
+                    .map(com.github.jocull.raftcache.lib.topology.NodeIdentifier::getId)
                     .orElseThrow(() -> new IllegalStateException("Remote address " + channel.getAddress() + " not found in cluster toplogy: {}" + owner.getClusterTopology().getTopology()));
         }
+    }
+
+    private void onStateRequest(StateRequest stateRequest) {
+        send(owner.onStateRequest(stateRequest));
     }
 
     public void requestVote(VoteRequest voteRequest) {
