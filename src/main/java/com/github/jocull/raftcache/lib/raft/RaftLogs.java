@@ -31,6 +31,10 @@ class RaftLogs {
         return logs.stream()
                 .dropWhile(log -> log.getIndex() < index)
                 .findFirst()
+                // TODO: Raft spec states:
+                //         > Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+                //       This currently only looks at existing log term vs incoming term, which will diverge from previous during elections.
+                //       How do we safely fix this? Is `>= (term - 1)` safe in all cases, including lost leaders?
                 .filter(log -> log.getTerm() == term)
                 .isPresent();
     }

@@ -136,15 +136,29 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         // Append the logs
         if (!appendEntries.getEntries().isEmpty()) {
             final long newEndIndex = appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
-            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries @ term {}", self.getId(), remote.getRemoteNodeId(), self.getLogs().getCurrentIndex(), newEndIndex, appendEntries.getEntries().size(), appendEntries.getTerm());
+            LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries @ term {}, commit {}, {}",
+                    self.getId(),
+                    remote.getRemoteNodeId(),
+                    self.getLogs().getCurrentIndex(),
+                    newEndIndex,
+                    appendEntries.getEntries().size(),
+                    appendEntries.getTerm(),
+                    self.getLogs().getCommitIndex(),
+                    appendEntries.getLeaderCommitIndex());
         } else {
             LOGGER.debug("{} Received heartbeat from {} @ term {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm());
         }
+
+        // TODO: Probably not efficient - pass entire set of new logs and insert them in sequence instead?
         appendEntries.getEntries().forEach(r -> self.getLogs().appendLog(appendEntries.getTerm(), r.getIndex(), r.getEntry()));
 
         // Align the commit index with the leader
-        final List<RaftLog<?>> committedLogs = self.getLogs().commit(appendEntries.getLeaderCommitIndex());
-        self.getManager().getEventBus().publish(new LogsCommitted(committedLogs));
+        final long previousCommitIndex = self.getLogs().getCommitIndex();
+        if (appendEntries.getLeaderCommitIndex() > previousCommitIndex) {
+            final List<RaftLog<?>> committedLogs = self.getLogs().commit(appendEntries.getLeaderCommitIndex());
+            self.getManager().getEventBus().publish(new LogsCommitted(committedLogs));
+            LOGGER.debug("{} Move commit index forward {} -> {} @ term {}", self.getId(), previousCommitIndex, appendEntries.getLeaderCommitIndex(), appendEntries.getTerm());
+        }
 
         // Clear the current timeout and register the next one
         scheduleNextElectionTimeout();
