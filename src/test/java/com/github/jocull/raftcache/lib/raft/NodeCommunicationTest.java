@@ -254,19 +254,19 @@ public class NodeCommunicationTest {
             final RaftLog<String> log1 = assertDoesNotThrow(
                     () -> nodes.leader().getOperations().submit("hello").get(1, TimeUnit.SECONDS),
                     "Expected followers to get log 1");
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log1.getTerm(), log1.getIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log1.getTermIndex())),
                     "Followers didn't get log 1");
 
             final RaftLog<String> log2 = assertDoesNotThrow(
                     () -> nodes.leader().getOperations().submit("hello again").get(1, TimeUnit.SECONDS),
                     "Expected followers to get log 2");
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log2.getTerm(), log2.getIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log2.getTermIndex())),
                     "Followers didn't get log 2");
 
             final RaftLog<String> log3 = assertDoesNotThrow(
                     () -> nodes.leader().getOperations().submit("hello one last time").get(1, TimeUnit.SECONDS),
                     "Expected followers to get log 2");
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTerm(), log3.getIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTermIndex())),
                     "Followers didn't get log 3");
 
             final List<CompletableFuture<RaftLog<Integer>>> futures = IntStream.range(0, 1000)
@@ -278,7 +278,7 @@ public class NodeCommunicationTest {
                     .collect(Collectors.toList());
 
             final RaftLog<Integer> logLast = results.get(futures.size() - 1);
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTerm(), logLast.getIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTermIndex())),
                     "Followers didn't get final log");
         }
     }

@@ -11,72 +11,68 @@ import java.util.stream.Collectors;
 
 class RaftLogs {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftLogs.class);
+    private static final CompletableRaftLog<?> EPOCH_LOG = new CompletableRaftLog<>(TermIndex.EPOCH, RaftLogs.class);
 
-    private long currentIndex = 0L;
-    private long commitIndex = 0L;
+    private TermIndex currentTermIndex = TermIndex.EPOCH;
+    private TermIndex committedTermIndex = TermIndex.EPOCH;
     private final Deque<CompletableRaftLog<?>> logs = new ArrayDeque<>(); // TODO: Is this the right data structure?
 
-    public synchronized long getCurrentIndex() {
-        return currentIndex;
+    public RaftLogs() {
+        // Adding the epoch log as a start point simplifies operations checking indexes against a start point
+        logs.add(EPOCH_LOG);
     }
 
-    public synchronized boolean containsStartPoint(int term, long index) {
-        if (logs.isEmpty()) {
-            return currentIndex == index;
-        }
+    public synchronized TermIndex getCurrentTermIndex() {
+        return currentTermIndex;
+    }
 
+    public synchronized TermIndex getCommittedTermIndex() {
+        return committedTermIndex;
+    }
+
+    public synchronized boolean containsStartPoint(TermIndex index) {
         // TODO: Could probably be optimized by using actual offsets.
         //       Could track the "offset of offsets" to keep things
         //       consistent even after a snapshot.
-        return logs.stream()
-                .dropWhile(log -> log.getIndex() < index)
-                .findFirst()
-                // TODO: Raft spec states:
-                //         > Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-                //       This currently only looks at existing log term vs incoming term, which will diverge from previous during elections.
-                //       How do we safely fix this? Is `>= (term - 1)` safe in all cases, including lost leaders?
-                .filter(log -> log.getTerm() == term)
-                .isPresent();
-    }
-
-    public synchronized long getCommitIndex() {
-        return commitIndex;
+        //
+        // TODO: It would probably be faster to walk this backwards and check from the end?
+        return logs.stream().anyMatch(log -> log.getTermIndex().equals(index));
     }
 
     public synchronized <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, T entry) {
         return appendLogInternal(currentTerm, entry).getFuture();
     }
 
-    public synchronized <T> CompletableFuture<RaftLog<T>> appendFutureLog(int currentTerm, long index, T entry) {
-        return appendLogInternal(currentTerm, index, entry).getFuture();
+    public synchronized <T> CompletableFuture<RaftLog<T>> appendFutureLog(TermIndex termIndex, T entry) {
+        return appendLogInternal(termIndex, entry).getFuture();
     }
 
     public synchronized <T> RaftLog<T> appendLog(int term, T rawLog) {
         return appendLogInternal(term, rawLog);
     }
 
-    public synchronized <T> RaftLog<T> appendLog(int term, long index, T rawLog) {
-        return appendLogInternal(term, index, rawLog);
+    public synchronized <T> RaftLog<T> appendLog(TermIndex termIndex, T rawLog) {
+        return appendLogInternal(termIndex, rawLog);
     }
 
     private <T> CompletableRaftLog<T> appendLogInternal(int term, T rawLog) {
-        return appendLogInternal(term, currentIndex + 1, rawLog);
+        return appendLogInternal(new TermIndex(term, currentTermIndex.getIndex() + 1), rawLog);
     }
 
-    private <T> CompletableRaftLog<T> appendLogInternal(int term, long index, T rawLog) {
+    private <T> CompletableRaftLog<T> appendLogInternal(TermIndex termIndex, T rawLog) {
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
             final CompletableRaftLog<?> next = iterator.next();
-            if (next.getIndex() < index) {
+            if (next.getTermIndex().compareTo(termIndex) < 0) {
                 continue;
             }
-            if (next.getIndex() != index) {
+            if (!next.getTermIndex().equals(termIndex)) {
                 // Shouldn't ever happen?
-                throw new IllegalStateException("Unexpected log gap! " + next.getIndex() + " vs " + index);
+                throw new IllegalStateException("Unexpected log gap! " + next.getTermIndex() + " vs " + termIndex);
             }
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it.
-            if (next.getTerm() < term) {
+            if (termIndex.isReplacementOf(next.getTermIndex())) {
                 int count = 1;
                 iterator.remove();
                 while (iterator.hasNext()) {
@@ -84,33 +80,32 @@ class RaftLogs {
                     iterator.remove();
                     count++;
                 }
-                LOGGER.debug("Removed {} logs from term {} (instead of {})", count, next.getTerm(), term);
+                LOGGER.debug("Removed {} logs from term {} (instead of {})", count, next.getTermIndex().getTerm(), termIndex);
                 break;
             }
-            if (next.getIndex() == index) {
-                LOGGER.trace("Existing log found from term {}, index {}", next.getTerm(), next.getIndex());
+            if (next.getTermIndex().equals(termIndex)) {
+                LOGGER.trace("Existing log found from @ {}", next.getTermIndex());
                 //noinspection unchecked
                 return (CompletableRaftLog<T>) next;
             }
         }
 
-        LOGGER.trace("Added new log with term {}, index {}", term, index);
-        final CompletableRaftLog<T> raftLog = new CompletableRaftLog<>(term, index, rawLog);
+        LOGGER.trace("Added new log @ {}", termIndex);
+        final CompletableRaftLog<T> raftLog = new CompletableRaftLog<>(termIndex, rawLog);
         logs.add(raftLog);
-        if (index > currentIndex) {
-            currentIndex = index;
+        if (termIndex.compareTo(currentTermIndex) > 0) {
+            currentTermIndex = termIndex;
         }
-
         return raftLog;
     }
 
-    public synchronized List<RaftLog<?>> getLogRange(long startIndex, int limit) {
-        return getLogRange(startIndex, limit, Function.identity());
+    public synchronized List<RaftLog<?>> getLogRange(TermIndex startTermIndex, int limit) {
+        return getLogRange(startTermIndex, limit, Function.identity());
     }
 
-    public synchronized <TOut> List<TOut> getLogRange(long startIndex, int limit, Function<RaftLog<?>, TOut> fnTransform) {
+    public synchronized <TOut> List<TOut> getLogRange(TermIndex startTermIndex, int limit, Function<RaftLog<?>, TOut> fnTransform) {
         return logs.stream()
-                .filter(r -> r.getIndex() > startIndex)
+                .filter(r -> r.getTermIndex().compareTo(startTermIndex) > 0)
                 .map(fnTransform)
                 .limit(limit)
                 .collect(Collectors.toList());
@@ -121,13 +116,13 @@ class RaftLogs {
      */
     public synchronized List<RaftLog<?>> rollback() {
         // Reset the current index back to the committed point
-        currentIndex = commitIndex;
+        currentTermIndex = committedTermIndex;
 
         final List<RaftLog<?>> removed = new ArrayList<>();
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
             final CompletableRaftLog<?> log = iterator.next();
-            if (log.getIndex() > commitIndex) {
+            if (log.getTermIndex().compareTo(committedTermIndex) > 0) {
                 removed.add(log);
                 log.rollback();
                 iterator.remove();
@@ -136,19 +131,20 @@ class RaftLogs {
         return removed;
     }
 
-    public synchronized List<RaftLog<?>> commit(long index) {
-        if (currentIndex < index) {
-            throw new IllegalArgumentException("Cannot commit " + index + " when current is " + currentIndex);
+    public synchronized List<RaftLog<?>> commit(TermIndex termIndex) {
+        if (currentTermIndex.compareTo(termIndex) < 0) {
+            throw new IllegalArgumentException("Cannot commit " + termIndex + " when current is " + currentTermIndex);
         }
-        if (index < commitIndex) {
-            throw new IllegalArgumentException("Cannot commit " + index + " when committed is " + commitIndex);
+        if (termIndex.compareTo(committedTermIndex) < 0) {
+            throw new IllegalArgumentException("Cannot commit " + termIndex + " when committed is " + committedTermIndex);
         }
 
         // Move the commit index forwards and return the committed logs
-        final long previousCommitIndex = commitIndex;
-        commitIndex = index;
+        final TermIndex previousCommitIndex = committedTermIndex;
+        committedTermIndex = termIndex;
         return logs.stream()
-                .filter(r -> r.getIndex() > previousCommitIndex && r.getIndex() <= index)
+                .filter(r -> r.getTermIndex().compareTo(previousCommitIndex) > 0
+                        && r.getTermIndex().compareTo(termIndex) <= 0)
                 .peek(CompletableRaftLog::commit)
                 .collect(Collectors.toList());
     }
@@ -156,8 +152,8 @@ class RaftLogs {
     private static class CompletableRaftLog<T> extends RaftLog<T> {
         private final CompletableFuture<RaftLog<T>> future;
 
-        public CompletableRaftLog(int term, long index, T entry) {
-            super(term, index, entry);
+        public CompletableRaftLog(TermIndex termIndex, T entry) {
+            super(termIndex, entry);
             this.future = new CompletableFuture<>();
         }
 

@@ -17,6 +17,15 @@ class TermIndexTest {
     }
 
     @Test
+    void testIncrement() {
+        final TermIndex a = new TermIndex(1, 1);
+        final TermIndex b = a.incrementIndex();
+
+        assertEquals(1, b.getTerm());
+        assertEquals(2L, b.getIndex());
+    }
+
+    @Test
     void testEquals() {
         final TermIndex a = new TermIndex(1, 1);
         final TermIndex b = new TermIndex(1, 1);

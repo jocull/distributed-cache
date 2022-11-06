@@ -1,9 +1,9 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.raft.messages.*;
 import com.github.jocull.raftcache.lib.raft.middleware.ChannelMiddleware;
 import com.github.jocull.raftcache.lib.topology.ClusterTopology;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
-import com.github.jocull.raftcache.lib.raft.messages.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -70,8 +70,8 @@ public class RaftNode {
         return behavior.getState();
     }
 
-    public long getLastReceivedIndex() {
-        return logs.getCurrentIndex();
+    public TermIndex getLastReceivedIndex() {
+        return logs.getCurrentTermIndex();
     }
 
     /* package-private-for-test */ RaftLogs getLogs() {
@@ -165,9 +165,9 @@ public class RaftNode {
     }
 
     private void rollback(int oldTerm, int newTerm) {
-        final long previousIndex = logs.getCurrentIndex();
+        final TermIndex previousIndex = logs.getCurrentTermIndex();
         final List<RaftLog<?>> rollback = logs.rollback();
-        final long newIndex = logs.getCurrentIndex();
+        final TermIndex newIndex = logs.getCurrentTermIndex();
         LOGGER.info("{} Rolling back {} logs from term {} -> {}, index {} -> {}",
                 id, rollback.size(), oldTerm, newTerm, previousIndex, newIndex);
     }

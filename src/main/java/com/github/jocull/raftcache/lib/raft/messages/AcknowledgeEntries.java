@@ -6,12 +6,12 @@ public class AcknowledgeEntries {
     // True if follower contained entry matching previous log entry and term
     private final boolean success;
     // Contains the current index after acknowledging
-    private final long currentIndex;
+    private final TermIndex currentTermIndex;
 
-    public AcknowledgeEntries(int term, boolean success, long currentIndex) {
+    public AcknowledgeEntries(int term, boolean success, TermIndex currentTermIndex) {
         this.term = term;
         this.success = success;
-        this.currentIndex = currentIndex;
+        this.currentTermIndex = currentTermIndex;
     }
 
     public int getTerm() {
@@ -22,7 +22,16 @@ public class AcknowledgeEntries {
         return success;
     }
 
-    public long getCurrentIndex() {
-        return currentIndex;
+    public TermIndex getCurrentTermIndex() {
+        return currentTermIndex;
+    }
+
+    @Override
+    public String toString() {
+        return "AcknowledgeEntries{" +
+                "term=" + term +
+                ", success=" + success +
+                ", currentTermIndex=" + currentTermIndex +
+                '}';
     }
 }

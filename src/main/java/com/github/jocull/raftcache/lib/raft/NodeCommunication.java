@@ -24,10 +24,7 @@ public class NodeCommunication {
     private final ChannelMiddleware.ChannelSide channel;
 
     private String remoteNodeId; // Unknown until introduction
-    private volatile long currentIndex;
-    // TODO: In addition to the `currentIndex`, the `term` is likely important to track here too...?
-    //       Are we able to make sense of the `term` coming out of each message and keep track of it here
-    //       to help indicate what term the remote node is in? This can be used to announce cluster topology.
+    private volatile TermIndex currentTermIndex = new TermIndex(0, 0L);
 
     private final Map<UUID, CompletableFuture<Response>> pendingRequests = new HashMap<>();
 
@@ -50,12 +47,12 @@ public class NodeCommunication {
         return channel.getAddress();
     }
 
-    public long getCurrentIndex() {
-        return currentIndex;
+    public TermIndex getCurrentTermIndex() {
+        return currentTermIndex;
     }
 
-    public void setCurrentIndex(long currentIndex) {
-        this.currentIndex = currentIndex;
+    public void setCurrentTermIndex(TermIndex currentTermIndex) {
+        this.currentTermIndex = currentTermIndex;
     }
 
     private void send(Object message) {
@@ -134,10 +131,11 @@ public class NodeCommunication {
     }
 
     public void introduce() {
+        final TermIndex lastReceivedIndex = owner.getLastReceivedIndex();
         send(new Introduction(
                 owner.getId(),
                 owner.getNodeAddress(),
-                owner.getLastReceivedIndex()
+                new com.github.jocull.raftcache.lib.raft.messages.TermIndex(lastReceivedIndex.getTerm(), lastReceivedIndex.getIndex())
         ));
     }
 

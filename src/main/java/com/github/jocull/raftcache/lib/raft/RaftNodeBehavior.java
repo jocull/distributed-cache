@@ -58,14 +58,20 @@ abstract class RaftNodeBehavior {
     }
 
     StateResponse onStateRequest(StateRequest stateRequest) {
+        final TermIndex current = self.getLogs().getCurrentTermIndex();
+        final TermIndex committed = self.getLogs().getCommittedTermIndex();
         return new StateResponse(
                 stateRequest,
                 self.getId(),
                 self.getNodeAddress(),
                 getState(),
                 getTerm(),
-                self.getLogs().getCurrentIndex(),
-                self.getLogs().getCurrentIndex());
+                new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
+                        current.getTerm(),
+                        current.getIndex()),
+                new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
+                        committed.getTerm(),
+                        committed.getIndex()));
     }
 
     abstract Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest);

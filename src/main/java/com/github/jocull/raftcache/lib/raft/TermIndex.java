@@ -3,6 +3,8 @@ package com.github.jocull.raftcache.lib.raft;
 import java.util.Objects;
 
 public class TermIndex implements Comparable<TermIndex> {
+    static final TermIndex EPOCH = new TermIndex(0, 0L);
+
     private final int term;
     private final long index;
 
@@ -24,6 +26,10 @@ public class TermIndex implements Comparable<TermIndex> {
 
     public long getIndex() {
         return index;
+    }
+
+    public TermIndex incrementIndex() {
+        return new TermIndex(term, index + 1L);
     }
 
     /**

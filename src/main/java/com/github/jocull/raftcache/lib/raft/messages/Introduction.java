@@ -5,13 +5,13 @@ import com.github.jocull.raftcache.lib.topology.NodeAddress;
 public class Introduction {
     private final String id;
     private final NodeAddress nodeAddress;
-    private final long lastReceivedIndex;
+    private final TermIndex lastReceivedTermIndex;
     // TODO: It is probably worth announcing the term as well - the index alone is generally not enough information.
 
-    public Introduction(String id, NodeAddress nodeAddress, long lastReceivedIndex) {
+    public Introduction(String id, NodeAddress nodeAddress, TermIndex lastReceivedTermIndex) {
         this.id = id;
         this.nodeAddress = nodeAddress;
-        this.lastReceivedIndex = lastReceivedIndex;
+        this.lastReceivedTermIndex = lastReceivedTermIndex;
     }
 
     public String getId() {
@@ -22,7 +22,7 @@ public class Introduction {
         return nodeAddress;
     }
 
-    public long getLastReceivedIndex() {
-        return lastReceivedIndex;
+    public TermIndex getLastReceivedTermIndex() {
+        return lastReceivedTermIndex;
     }
 }

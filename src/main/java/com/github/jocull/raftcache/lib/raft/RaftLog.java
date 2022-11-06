@@ -3,24 +3,19 @@ package com.github.jocull.raftcache.lib.raft;
 import java.util.Objects;
 
 public class RaftLog<T> {
-    private final int term;
-    private final long index;
+    private final TermIndex termIndex;
     private final T entry;
 
-    public RaftLog(int term, long index, T entry) {
+    public RaftLog(TermIndex termIndex, T entry) {
+        Objects.requireNonNull(termIndex);
         Objects.requireNonNull(entry);
 
-        this.term = term;
-        this.index = index;
+        this.termIndex = termIndex;
         this.entry = entry;
     }
 
-    public int getTerm() {
-        return term;
-    }
-
-    public long getIndex() {
-        return index;
+    public TermIndex getTermIndex() {
+        return termIndex;
     }
 
     public Class<?> getLogClass() {
@@ -34,8 +29,7 @@ public class RaftLog<T> {
     @Override
     public String toString() {
         return "RaftLog{" +
-                "term=" + term +
-                ", index=" + index +
+                "index=" + termIndex +
                 ", entry=" + entry +
                 '}';
     }

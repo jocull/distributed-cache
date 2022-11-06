@@ -18,4 +18,12 @@ public class NodeIdentifier {
     public NodeAddress getNodeAddress() {
         return nodeAddress;
     }
+
+    @Override
+    public String toString() {
+        return "NodeIdentifier{" +
+                "id='" + id + '\'' +
+                ", nodeAddress=" + nodeAddress +
+                '}';
+    }
 }

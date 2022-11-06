@@ -22,8 +22,10 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
         // After the election timeout the follower becomes a candidate and starts a new election term...
         // ...and sends out Request Vote messages to other nodes.
         final int previousTerm = term - 1;
-        final long lastCommittedLogIndex = self.getLogs().getCommitIndex();
-        final VoteRequest voteRequest = new VoteRequest(term, self.getId(), lastCommittedLogIndex, previousTerm);
+        final TermIndex lastCommittedLogIndex = self.getLogs().getCommittedTermIndex();
+        final VoteRequest voteRequest = new VoteRequest(term, self.getId(), new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
+                lastCommittedLogIndex.getTerm(),
+                lastCommittedLogIndex.getIndex()));
 
         LOGGER.info("{} Candidate starting a new election at term {}", self.getId(), term);
         votes.add(self.getId()); // ...votes for itself...
@@ -107,7 +109,10 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
         }
 
         LOGGER.info("{} Received append entries from {} for term {} but won't succeed as candidate of term {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
-        return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
+        final TermIndex current = self.getLogs().getCurrentTermIndex();
+        return new AcknowledgeEntries(term, false, new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
+                current.getTerm(),
+                current.getIndex()));
     }
 
     @Override

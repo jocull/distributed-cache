@@ -8,16 +8,16 @@ public class StateResponse extends Response {
     private final NodeIdentifier identifier;
     private final NodeStates state;
     private final int term;
-    private final long currentIndex;
-    private final long committedIndex;
+    private final TermIndex currentTermIndex;
+    private final TermIndex committedTermIndex;
 
-    public StateResponse(Request request, String nodeId, NodeAddress nodeAddress, NodeStates state, int term, long currentIndex, long committedIndex) {
+    public StateResponse(Request request, String nodeId, NodeAddress nodeAddress, NodeStates state, int term, TermIndex currentTermIndex, TermIndex committedTermIndex) {
         super(request);
         this.identifier = new NodeIdentifier(nodeId, nodeAddress);
         this.state = state;
         this.term = term;
-        this.currentIndex = currentIndex;
-        this.committedIndex = committedIndex;
+        this.currentTermIndex = currentTermIndex;
+        this.committedTermIndex = committedTermIndex;
     }
 
     public NodeIdentifier getIdentifier() {
@@ -32,12 +32,12 @@ public class StateResponse extends Response {
         return term;
     }
 
-    public long getCurrentIndex() {
-        return currentIndex;
+    public TermIndex getCurrentTermIndex() {
+        return currentTermIndex;
     }
 
-    public long getCommittedIndex() {
-        return committedIndex;
+    public TermIndex getCommittedTermIndex() {
+        return committedTermIndex;
     }
 
     @Override
@@ -46,8 +46,8 @@ public class StateResponse extends Response {
                 "identifier=" + identifier +
                 ", state=" + state +
                 ", term=" + term +
-                ", currentIndex=" + currentIndex +
-                ", committedIndex=" + committedIndex +
+                ", currentTermIndex=" + currentTermIndex +
+                ", committedTermIndex=" + committedTermIndex +
                 "} " + super.toString();
     }
 }

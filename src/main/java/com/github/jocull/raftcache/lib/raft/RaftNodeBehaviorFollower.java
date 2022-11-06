@@ -83,14 +83,20 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             leaderId = null; // Remove the current leader
         }
 
-        final long lastReceivedIndex = self.getLastReceivedIndex();
-        final boolean grantVote = voteRequest.getLastLogIndex() >= lastReceivedIndex;
+        final TermIndex lastReceivedIndex = self.getLastReceivedIndex();
+        final TermIndex committedIndex = self.getLogs().getCommittedTermIndex();
+        final TermIndex incomingTermIndex = new TermIndex(
+                voteRequest.getLastLogTermIndex().getTerm(), voteRequest.getLastLogTermIndex().getIndex());
+        final boolean grantVote = incomingTermIndex.compareTo(lastReceivedIndex) >= 0;
         votedForNodeId = grantVote ? remote.getRemoteNodeId() : self.getId(); // Vote for self instead
         LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", self.getId(), term,
-                votedForNodeId, grantVote, voteRequest.getLastLogIndex(), lastReceivedIndex);
+                votedForNodeId, grantVote, voteRequest.getLastLogTermIndex(), lastReceivedIndex);
         // Voting resets the election timeout to let the voting process settle
         scheduleNextElectionTimeout();
-        return Optional.of(new VoteResponse(voteRequest.getTerm(), grantVote));
+        return Optional.of(new VoteResponse(
+                voteRequest.getTerm(),
+                new com.github.jocull.raftcache.lib.raft.messages.TermIndex(committedIndex.getTerm(), committedIndex.getIndex()),
+                grantVote));
     }
 
     @Override
@@ -111,20 +117,26 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             return self.convertToFollowerForNewLeader(remote.getRemoteNodeId(), appendEntries)
                     .onAppendEntries(remote, appendEntries);
         }
+
+        final TermIndex currentTermIndex = self.getLogs().getCurrentTermIndex();
+        final com.github.jocull.raftcache.lib.raft.messages.TermIndex currentTermIndexMessage = new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
+                currentTermIndex.getTerm(), currentTermIndex.getIndex());
         if (appendEntries.getTerm() < term) {
             LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term);
-            return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
+            return new AcknowledgeEntries(term, false, currentTermIndexMessage);
         }
-        if (!self.getLogs().containsStartPoint(appendEntries.getTerm(), appendEntries.getPreviousLogIndex())) {
+
+        final TermIndex incomingTermIndex = new TermIndex(appendEntries.getPreviousLogTermIndex().getTerm(), appendEntries.getPreviousLogTermIndex().getIndex());
+        if (!self.getLogs().containsStartPoint(incomingTermIndex)) {
             // TODO: A chance to get stuck here? What happens if indexes get out of sync?
             //       How should we reset? Will the election timeout take care of it?
-            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), appendEntries.getPreviousLogIndex(), self.getLogs().getCurrentIndex());
-            return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
+            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), appendEntries.getPreviousLogTermIndex(), self.getLogs().getCurrentTermIndex());
+            return new AcknowledgeEntries(term, false, currentTermIndexMessage);
         }
         if (leaderId != null && !leaderId.equals(remote.getRemoteNodeId())) {
             // TODO: Does this matter...?
             LOGGER.warn("{} Append entries request from {} who is not known leader {}", self.getId(), remote.getRemoteNodeId(), leaderId);
-            return new AcknowledgeEntries(term, false, self.getLogs().getCurrentIndex());
+            return new AcknowledgeEntries(term, false, currentTermIndexMessage);
         }
 
         // TODO: Move this code to self.convertToFollowerForNewLeader ?
@@ -135,34 +147,41 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
         // Append the logs
         if (!appendEntries.getEntries().isEmpty()) {
-            final long newEndIndex = appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getIndex();
+            final com.github.jocull.raftcache.lib.raft.messages.TermIndex newEndTermIndexMessage = appendEntries.getEntries().get(appendEntries.getEntries().size() - 1).getTermIndex();
+            final TermIndex newEndTermIndex = new TermIndex(newEndTermIndexMessage.getTerm(), newEndTermIndexMessage.getIndex());
             LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries @ term {}, commit {}, {}",
                     self.getId(),
                     remote.getRemoteNodeId(),
-                    self.getLogs().getCurrentIndex(),
-                    newEndIndex,
+                    currentTermIndexMessage,
+                    newEndTermIndex,
                     appendEntries.getEntries().size(),
                     appendEntries.getTerm(),
-                    self.getLogs().getCommitIndex(),
-                    appendEntries.getLeaderCommitIndex());
+                    self.getLogs().getCommittedTermIndex(),
+                    appendEntries.getLeaderCommitTermIndex());
         } else {
             LOGGER.debug("{} Received heartbeat from {} @ term {}", self.getId(), remote.getRemoteNodeId(), appendEntries.getTerm());
         }
 
         // TODO: Probably not efficient - pass entire set of new logs and insert them in sequence instead?
-        appendEntries.getEntries().forEach(r -> self.getLogs().appendLog(appendEntries.getTerm(), r.getIndex(), r.getEntry()));
+        appendEntries.getEntries().forEach(r -> {
+            final TermIndex newTermIndex = new TermIndex(r.getTermIndex().getTerm(), r.getTermIndex().getIndex());
+            self.getLogs().appendLog(newTermIndex, r.getEntry());
+        });
 
         // Align the commit index with the leader
-        final long previousCommitIndex = self.getLogs().getCommitIndex();
-        if (appendEntries.getLeaderCommitIndex() > previousCommitIndex) {
-            final List<RaftLog<?>> committedLogs = self.getLogs().commit(appendEntries.getLeaderCommitIndex());
+        final TermIndex previousCommitIndex = self.getLogs().getCommittedTermIndex();
+        final TermIndex leaderCommitIndex = new TermIndex(
+                appendEntries.getLeaderCommitTermIndex().getTerm(),
+                appendEntries.getLeaderCommitTermIndex().getIndex());
+        if (leaderCommitIndex.compareTo(previousCommitIndex) > 0) {
+            final List<RaftLog<?>> committedLogs = self.getLogs().commit(leaderCommitIndex);
             self.getManager().getEventBus().publish(new LogsCommitted(committedLogs));
-            LOGGER.debug("{} Move commit index forward {} -> {} @ term {}", self.getId(), previousCommitIndex, appendEntries.getLeaderCommitIndex(), appendEntries.getTerm());
+            LOGGER.debug("{} Move commit index forward {} -> {} @ term {}", self.getId(), previousCommitIndex, appendEntries.getLeaderCommitTermIndex(), appendEntries.getTerm());
         }
 
         // Clear the current timeout and register the next one
         scheduleNextElectionTimeout();
-        return new AcknowledgeEntries(term, true, self.getLogs().getCurrentIndex());
+        return new AcknowledgeEntries(term, true, currentTermIndexMessage);
     }
 
     @Override
