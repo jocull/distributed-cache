@@ -196,7 +196,7 @@ public class NodeCommunicationTest {
                 return null;
             });
 
-            LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
+            LOGGER.info("===== INTERRUPTING NETWORK: {}, {} =====", nodes1.leader().getId(), nodes1.followers().get(0).getId());
             middleware.interrupt(nodes1.leader().getNodeAddress());
             middleware.interrupt(nodes1.followers().get(0).getNodeAddress());
             final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and candidates", 5, TimeUnit.SECONDS, () -> {
@@ -207,7 +207,7 @@ public class NodeCommunicationTest {
                 return null;
             });
 
-            LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
+            LOGGER.info("===== RESTORING NETWORK: {}, {} =====", nodes1.leader().getId(), nodes1.followers().get(0).getId());
             middleware.restore(nodes1.leader().getNodeAddress());
             middleware.restore(nodes1.followers().get(0).getNodeAddress());
             final ClusterNodes nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
