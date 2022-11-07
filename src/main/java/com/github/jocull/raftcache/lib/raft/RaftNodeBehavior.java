@@ -9,12 +9,12 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 abstract class RaftNodeBehavior {
-    protected final Logger LOGGER = LoggerFactory.getLogger(this.getClass());
+    final Logger LOGGER = LoggerFactory.getLogger(this.getClass());
 
-    protected final RaftNode self;
-    protected final NodeStates state;
-    protected final int term;
-    protected volatile boolean terminated = false;
+    private final RaftNode self;
+    private final NodeStates state;
+    private final int term;
+    private volatile boolean terminated = false;
 
     public RaftNodeBehavior(RaftNode self, NodeStates state, int term) {
         this.self = self;
@@ -22,12 +22,20 @@ abstract class RaftNodeBehavior {
         this.term = term;
     }
 
-    public NodeStates getState() {
+    RaftNode self() {
+        return self;
+    }
+
+    NodeStates state() {
         return state;
     }
 
-    public int getTerm() {
+    int term() {
         return term;
+    }
+
+    boolean isTerminated() {
+        return terminated;
     }
 
     void close() {
@@ -39,13 +47,13 @@ abstract class RaftNodeBehavior {
 
     AnnounceClusterTopology onIntroduction(Introduction introduction) {
         // We register data about the node that has introduced itself
-        self.getClusterTopology().register(new NodeIdentifier(
+        self().getClusterTopology().register(new NodeIdentifier(
                 introduction.getId(),
                 introduction.getNodeAddress()));
 
         // And reply with the cluster topology as we know it
         return new AnnounceClusterTopology(
-                self.getClusterTopology().getTopology().stream()
+                self().getClusterTopology().getTopology().stream()
                         .map(i -> new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier(
                                 i.getId(),
                                 i.getNodeAddress()
@@ -55,7 +63,7 @@ abstract class RaftNodeBehavior {
 
     void onAnnounceClusterTopology(AnnounceClusterTopology announceClusterTopology) {
         // When the topology has been received we can update our local view of the world
-        self.getClusterTopology().register(announceClusterTopology.getNodeIdentifierStates().stream()
+        self().getClusterTopology().register(announceClusterTopology.getNodeIdentifierStates().stream()
                 .map(i -> new NodeIdentifier(
                         i.getId(),
                         i.getNodeAddress()
@@ -64,14 +72,14 @@ abstract class RaftNodeBehavior {
     }
 
     StateResponse onStateRequest(StateRequest stateRequest) {
-        final TermIndex current = self.getLogs().getCurrentTermIndex();
-        final TermIndex committed = self.getLogs().getCommittedTermIndex();
+        final TermIndex current = self().getLogs().getCurrentTermIndex();
+        final TermIndex committed = self().getLogs().getCommittedTermIndex();
         return new StateResponse(
                 stateRequest,
-                self.getId(),
-                self.getNodeAddress(),
-                getState(),
-                getTerm(),
+                self().getId(),
+                self().getNodeAddress(),
+                state(),
+                term(),
                 new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
                         current.getTerm(),
                         current.getIndex()),

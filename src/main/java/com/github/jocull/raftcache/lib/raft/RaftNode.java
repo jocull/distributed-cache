@@ -68,7 +68,7 @@ public class RaftNode {
     }
 
     public synchronized NodeStates getState() {
-        return behavior.getState();
+        return behavior.state();
     }
 
     public TermIndex getLastReceivedIndex() {
@@ -113,7 +113,7 @@ public class RaftNode {
     }
 
     public synchronized int getCurrentTerm() {
-        return behavior.getTerm();
+        return behavior.term();
     }
 
     public ClusterTopology getClusterTopology() {
@@ -177,7 +177,7 @@ public class RaftNode {
 
     synchronized <TOut> TOut convertToFollower(int newTerm, Function<RaftNodeBehaviorFollower, TOut> fnActionWithLock) {
         behavior.close();
-        final int oldTerm = behavior.getTerm();
+        final int oldTerm = behavior.term();
         rollback(oldTerm, newTerm);
 
         behavior = new RaftNodeBehaviorFollower(this, newTerm);
@@ -186,7 +186,7 @@ public class RaftNode {
 
     synchronized RaftNodeBehaviorFollower convertToFollowerForNewLeader(String remoteNodeId, AppendEntries appendEntries) {
         behavior.close();
-        final int oldTerm = behavior.getTerm();
+        final int oldTerm = behavior.term();
         rollback(oldTerm, appendEntries.getTerm());
 
         behavior = new RaftNodeBehaviorFollower(this, appendEntries.getTerm());
@@ -209,7 +209,7 @@ public class RaftNode {
     synchronized RaftNodeBehaviorLeader convertToLeader() {
         behavior.close();
 
-        final int term = behavior.getTerm();
+        final int term = behavior.term();
         behavior = new RaftNodeBehaviorLeader(this, term);
         return (RaftNodeBehaviorLeader) behavior;
     }
