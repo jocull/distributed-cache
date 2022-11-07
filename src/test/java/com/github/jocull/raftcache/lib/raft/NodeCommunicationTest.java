@@ -16,6 +16,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -73,7 +74,7 @@ public class NodeCommunicationTest {
 
     @ParameterizedTest
     @MethodSource("provideIterationsLong")
-    void testElection(int iteration) {
+    void testElection(int iteration) throws Throwable {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
@@ -95,7 +96,7 @@ public class NodeCommunicationTest {
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
             middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
 
-            final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+            assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -103,20 +104,38 @@ public class NodeCommunicationTest {
                 return null;
             });
 
-            final List<StateResponse> clusterNodeStates = nodeA.getOperations().getClusterNodeStates();
-            assertNotNull(clusterNodeStates);
-            assertEquals(3, clusterNodeStates.size());
-            assertEquals(Set.of("nodeA", "nodeB", "nodeC"), clusterNodeStates.stream().map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
-            assertEquals(Stream.of("addressA", "addressB", "addressC").map(NodeAddress::new).collect(Collectors.toSet()),
-                    clusterNodeStates.stream().map(x -> x.getIdentifier().getNodeAddress()).collect(Collectors.toSet()));
-            assertEquals(Set.of("nodeA", "nodeB", "nodeC"), clusterNodeStates.stream().map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
-            assertEquals(nodes1.leader().getId(), clusterNodeStates.stream().filter(c -> c.getState().equals(NodeStates.LEADER)).findFirst().orElseThrow().getIdentifier().getId());
-            assertEquals(nodes1.followers().stream().map(RaftNode::getId).collect(Collectors.toSet()),
-                    clusterNodeStates.stream().filter(c -> c.getState().equals(NodeStates.FOLLOWER)).map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
+            // Some super hacks to deal with eventual consistency of in-memory leader/followers vs query state
+            final AtomicReference<Throwable> lastThrowable = new AtomicReference<>();
+            try {
+                assertWithinTimeout("Queried cluster state did not align with node states", 5, TimeUnit.SECONDS, () -> {
+                    final ClusterNodes nodes = getRaftLeaderAndFollowers(middleware);
+                    final List<StateResponse> clusterNodeStates = nodeA.getOperations().getClusterNodeStates();
+                    try {
+                        assertNotNull(clusterNodeStates);
+                        assertEquals(3, clusterNodeStates.size());
+                        assertEquals(Set.of("nodeA", "nodeB", "nodeC"), clusterNodeStates.stream().map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
+                        assertEquals(Stream.of("addressA", "addressB", "addressC").map(NodeAddress::new).collect(Collectors.toSet()),
+                                clusterNodeStates.stream().map(x -> x.getIdentifier().getNodeAddress()).collect(Collectors.toSet()));
+                        assertEquals(Set.of("nodeA", "nodeB", "nodeC"), clusterNodeStates.stream().map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
+                        assertEquals(nodes.leader().getId(), clusterNodeStates.stream().filter(c -> c.getState().equals(NodeStates.LEADER)).findFirst().orElseThrow().getIdentifier().getId());
+                        assertEquals(nodes.followers().stream().map(RaftNode::getId).collect(Collectors.toSet()),
+                                clusterNodeStates.stream().filter(c -> c.getState().equals(NodeStates.FOLLOWER)).map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
 
-            final StateResponse leaderState = nodeA.getOperations().getLeader().orElseThrow();
-            assertEquals(nodes1.leader().getId(), leaderState.getIdentifier().getId());
-            assertEquals(nodes1.leader().getCurrentTerm(), leaderState.getTerm());
+                        final StateResponse leaderState = nodeA.getOperations().getLeader().orElseThrow();
+                        assertEquals(nodes.leader().getId(), leaderState.getIdentifier().getId());
+                        assertEquals(nodes.leader().getCurrentTerm(), leaderState.getTerm());
+                    } catch (Throwable error) {
+                        lastThrowable.set(error);
+                        return false;
+                    }
+                    return true;
+                });
+            } catch (Throwable error) {
+                if (lastThrowable.get() == null) {
+                    throw error;
+                }
+                throw lastThrowable.get();
+            }
         }
     }
 
