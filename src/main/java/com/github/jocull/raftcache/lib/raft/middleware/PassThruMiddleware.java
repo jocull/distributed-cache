@@ -51,7 +51,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
 
     private void addAndCleanFuture(CompletableFuture<?> future) {
         synchronized (futures) {
-            futures.removeIf(next -> next.isDone() || next.isCancelled());
+            futures.removeIf(CompletableFuture::isDone);
             futures.add(future);
         }
     }
@@ -156,9 +156,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
                             LOGGER.error("Send failed", throwable);
                             return null;
                         });
-                synchronized (futures) {
-                    futures.add(future);
-                }
+                addAndCleanFuture(future);
             }
         }
 
@@ -173,9 +171,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
                             LOGGER.error("Receive failed", throwable);
                             return null;
                         });
-                synchronized (futures) {
-                    futures.add(future);
-                }
+                addAndCleanFuture(future);
             }
         }
     }
