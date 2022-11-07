@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public class RaftNode {
@@ -174,13 +175,13 @@ public class RaftNode {
 
     // region Node type conversions
 
-    synchronized RaftNodeBehaviorFollower convertToFollower(int newTerm) {
+    synchronized <TOut> TOut convertToFollower(int newTerm, Function<RaftNodeBehaviorFollower, TOut> fnActionWithLock) {
         behavior.close();
         final int oldTerm = behavior.getTerm();
         rollback(oldTerm, newTerm);
 
         behavior = new RaftNodeBehaviorFollower(this, newTerm);
-        return (RaftNodeBehaviorFollower) behavior;
+        return fnActionWithLock.apply((RaftNodeBehaviorFollower) behavior); // Do this action while the lock is held!
     }
 
     synchronized RaftNodeBehaviorFollower convertToFollowerForNewLeader(String remoteNodeId, AppendEntries appendEntries) {

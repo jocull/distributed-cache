@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 class RaftNodeBehaviorLeader extends RaftNodeBehavior {
@@ -24,7 +25,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     }
 
     @Override
-    void close() {
+    void closeInternal() {
         if (heartbeatTimeout != null) {
             heartbeatTimeout.cancel(false);
             heartbeatTimeout = null;
@@ -38,39 +39,47 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     }
 
     private void onHeartbeatTimeout(boolean initial) {
-        if (initial) {
-            LOGGER.debug("{} Initial heartbeat", self.getId());
-        } else {
-            LOGGER.debug("{} Heartbeat interval fired", self.getId());
-        }
+        // By synchronizing the timeout threads on the same instance as the exterior behavior delegates we can avoid
+        // timer threads racing with internal actions that would otherwise be serialized.
+        // See election timeouts in follow behavior for a stronger example of the problems this can cause.
+        synchronized (self) {
+            if (terminated) {
+                return;
+            }
 
-        synchronized (self.getActiveConnections()) {
-            final TermIndex committedTermIndex = self.getLogs().getCommittedTermIndex();
-            final com.github.jocull.raftcache.lib.raft.messages.TermIndex committedTermIndexMessage =
-                    new com.github.jocull.raftcache.lib.raft.messages.TermIndex(committedTermIndex.getTerm(), committedTermIndex.getIndex());
-            self.getActiveConnections().forEach(c -> {
-                final List<AppendEntries.RaftLog> entries = self.getLogs().getLogRange(c.getCurrentTermIndex(), 25, this::transformLog);
-                if (!entries.isEmpty()) {
-                    final com.github.jocull.raftcache.lib.raft.messages.TermIndex newEndTermIndex = entries.get(entries.size() - 1).getTermIndex();
-                    LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries @ term {}", self.getId(), c.getRemoteNodeId(), c.getCurrentTermIndex(), newEndTermIndex, entries.size(), self.getCurrentTerm());
-                } else {
-                    LOGGER.debug("{} Sending heartbeat to {}", self.getId(), c.getRemoteNodeId());
+            if (initial) {
+                LOGGER.debug("{} Initial heartbeat", self.getId());
+            } else {
+                LOGGER.debug("{} Heartbeat interval fired", self.getId());
+            }
+            synchronized (self.getActiveConnections()) {
+                final TermIndex committedTermIndex = self.getLogs().getCommittedTermIndex();
+                final com.github.jocull.raftcache.lib.raft.messages.TermIndex committedTermIndexMessage =
+                        new com.github.jocull.raftcache.lib.raft.messages.TermIndex(committedTermIndex.getTerm(), committedTermIndex.getIndex());
+                self.getActiveConnections().forEach(c -> {
+                    final List<AppendEntries.RaftLog> entries = self.getLogs().getLogRange(c.getCurrentTermIndex(), 25, this::transformLog);
+                    if (!entries.isEmpty()) {
+                        final com.github.jocull.raftcache.lib.raft.messages.TermIndex newEndTermIndex = entries.get(entries.size() - 1).getTermIndex();
+                        LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries @ term {}", self.getId(), c.getRemoteNodeId(), c.getCurrentTermIndex(), newEndTermIndex, entries.size(), self.getCurrentTerm());
+                    } else {
+                        LOGGER.debug("{} Sending heartbeat to {}", self.getId(), c.getRemoteNodeId());
+                    }
+                    c.appendEntries(new AppendEntries(
+                            self.getCurrentTerm(),
+                            new com.github.jocull.raftcache.lib.raft.messages.TermIndex(c.getCurrentTermIndex().getTerm(), c.getCurrentTermIndex().getIndex()),
+                            committedTermIndexMessage,
+                            entries));
+                });
+            }
+
+            // Chain to the next heartbeat
+            try {
+                heartbeatTimeout = self.getManager().schedule(() -> this.onHeartbeatTimeout(false), 50, TimeUnit.MILLISECONDS);
+                LOGGER.trace("{} Scheduled next heartbeat", self.getId());
+            } catch (RejectedExecutionException ex) {
+                if (!self.getManager().isShutdown()) {
+                    throw ex;
                 }
-                c.appendEntries(new AppendEntries(
-                        self.getCurrentTerm(),
-                        new com.github.jocull.raftcache.lib.raft.messages.TermIndex(c.getCurrentTermIndex().getTerm(), c.getCurrentTermIndex().getIndex()),
-                        committedTermIndexMessage,
-                        entries));
-            });
-        }
-
-        // Chain to the next heartbeat
-        try {
-            heartbeatTimeout = self.getManager().schedule(() -> this.onHeartbeatTimeout(false), 50, TimeUnit.MILLISECONDS);
-            LOGGER.trace("{} Scheduled next heartbeat", self.getId());
-        } catch (RejectedExecutionException ex) {
-            if (!self.getManager().isShutdown()) {
-                throw ex;
             }
         }
     }
@@ -103,8 +112,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
         if (voteRequest.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm());
-            return self.convertToFollower(voteRequest.getTerm())
-                    .onVoteRequest(remote, voteRequest);
+            return self.convertToFollower(voteRequest.getTerm(), f -> f.onVoteRequest(remote, voteRequest));
         }
 
         LOGGER.info("{} Received a vote request from {} for term {} but won't vote as leader of term {}", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term);
@@ -115,7 +123,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
         if (voteResponse.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
-            self.convertToFollower(voteResponse.getTerm());
+            self.convertToFollower(voteResponse.getTerm(), Function.identity());
             return;
         }
 
@@ -141,7 +149,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
         if (acknowledgeEntries.getTerm() > term) {
             LOGGER.info("{} Received acknowledge entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
-            self.convertToFollower(acknowledgeEntries.getTerm());
+            self.convertToFollower(acknowledgeEntries.getTerm(), Function.identity());
             return;
         }
         if (!acknowledgeEntries.isSuccess()) {

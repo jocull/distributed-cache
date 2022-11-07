@@ -11,6 +11,7 @@ import java.util.Optional;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     private volatile ScheduledFuture<?> electionTimeout;
@@ -23,7 +24,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     }
 
     @Override
-    void close() {
+    void closeInternal() {
         if (electionTimeout != null) {
             electionTimeout.cancel(false);
             electionTimeout = null;
@@ -57,7 +58,27 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     }
 
     private void onElectionTimeout() {
-        self.convertToCandidate(term + 1);
+        // If we hit the election timeout at the exact same instant as a vote going out, we can end up
+        // with two candidates happening under the same term, even though the node _just_ voted for another candidate.
+        //
+        // Example:
+        // 1. nodeA (remote) sends vote request for term 2
+        // 2. nodeB (this) responds to vote, voting for nodeA in term 2 and converting to follower.
+        //    At the same time, nodeB's election timeout fires, and it converts to a candidate for term 2.
+        // 3. nodeA becomes leader, because nodeB voted, but nodeB is also requesting votes for the same term.
+        // 4. nodeC votes for nodeB, and it becomes a leader also.
+        // 5. nodeA and nodeB send heartbeats down to nodeC, while nodeC only responds to nodeB.
+        //    No nodes will start a new election, because none of them think there is a problem.
+        //    Logs should not be able to commit in nodeA because of lack of acks, but the cluster is impaired.
+        //
+        // By synchronizing the timeout threads on the same instance as the exterior behavior delegates we can avoid
+        // timer threads racing with internal actions that would otherwise be serialized.
+        synchronized (self) {
+            if (terminated) {
+                return;
+            }
+            self.convertToCandidate(term + 1);
+        }
     }
 
     @Override
@@ -72,8 +93,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         }
         if (voteRequest.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} and will convert to follower (from term {})", self.getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term);
-            return self.convertToFollower(voteRequest.getTerm())
-                    .onVoteRequest(remote, voteRequest);
+            return self.convertToFollower(voteRequest.getTerm(), f -> f.onVoteRequest(remote, voteRequest));
         }
 
         // If the receiving node hasn't voted yet in this term then it votes for the candidate...
@@ -103,7 +123,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
         if (voteResponse.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term);
-            self.convertToFollower(voteResponse.getTerm());
+            self.convertToFollower(voteResponse.getTerm(), Function.identity());
             return;
         }
 
@@ -188,7 +208,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
         if (acknowledgeEntries.getTerm() > term) {
             LOGGER.info("{} Received acknowledge entries from {} for term {} will move from term {} as follower", self.getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
-            self.convertToFollower(acknowledgeEntries.getTerm());
+            self.convertToFollower(acknowledgeEntries.getTerm(), Function.identity());
             return;
         }
 

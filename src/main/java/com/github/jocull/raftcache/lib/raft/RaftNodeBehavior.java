@@ -14,6 +14,7 @@ abstract class RaftNodeBehavior {
     protected final RaftNode self;
     protected final NodeStates state;
     protected final int term;
+    protected volatile boolean terminated = false;
 
     public RaftNodeBehavior(RaftNode self, NodeStates state, int term) {
         this.self = self;
@@ -29,7 +30,12 @@ abstract class RaftNodeBehavior {
         return term;
     }
 
-    abstract void close();
+    void close() {
+        terminated = true;
+        closeInternal();
+    }
+
+    abstract void closeInternal();
 
     AnnounceClusterTopology onIntroduction(Introduction introduction) {
         // We register data about the node that has introduced itself

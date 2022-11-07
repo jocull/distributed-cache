@@ -13,7 +13,7 @@ class RaftNodeBehaviorFollowerInitial extends RaftNodeBehavior {
     }
 
     @Override
-    void close() {
+    void closeInternal() {
         // no-op
     }
 
