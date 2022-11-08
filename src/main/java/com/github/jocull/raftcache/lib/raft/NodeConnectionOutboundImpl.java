@@ -12,12 +12,12 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     private String remoteNodeId;
     private TermIndex currentTermIndex = new TermIndex(0, 0L);
 
-    private final NodeCommunicationReceiver receiver;
+    private final NodeCommunicationReceiverProvider receiverProvider;
     private final ChannelMiddleware.ChannelSide channel;
 
-    public NodeConnectionOutboundImpl(NodeCommunicationReceiver receiver,
+    public NodeConnectionOutboundImpl(NodeCommunicationReceiverProvider receiverProvider,
                                       ChannelMiddleware.ChannelSide channel) {
-        this.receiver = receiver;
+        this.receiverProvider = receiverProvider;
         this.channel = channel;
 
         this.channel.setReceiver(this::receive);
@@ -52,19 +52,19 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     private void receive(Object message) {
         // Introductions must be completed first to establish node IDs
         if (message instanceof Introduction) {
-            receiver.onIntroduction(this, (Introduction) message);
+            receiverProvider.getProvider().onIntroduction(this, (Introduction) message);
             return;
         }
         if (message instanceof AnnounceClusterTopology) {
-            receiver.onAnnounceClusterTopology(this, (AnnounceClusterTopology) message);
+            receiverProvider.getProvider().onAnnounceClusterTopology(this, (AnnounceClusterTopology) message);
             return;
         }
         if (message instanceof StateRequest) {
-            receiver.onStateRequest(this, (StateRequest) message);
+            receiverProvider.getProvider().onStateRequest(this, (StateRequest) message);
             return;
         }
         if (message instanceof StateResponse) {
-            receiver.
+            receiverProvider.getProvider().
                     onStateResponse(this, (StateResponse) message);
             return;
         }
@@ -75,19 +75,19 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
 
         // After introductions, any message can process
         if (message instanceof VoteRequest) {
-            receiver.onVoteRequest(this, (VoteRequest) message);
+            receiverProvider.getProvider().onVoteRequest(this, (VoteRequest) message);
             return;
         }
         if (message instanceof VoteResponse) {
-            receiver.onVoteResponse(this, (VoteResponse) message);
+            receiverProvider.getProvider().onVoteResponse(this, (VoteResponse) message);
             return;
         }
         if (message instanceof AppendEntries) {
-            receiver.onAppendEntries(this, (AppendEntries) message);
+            receiverProvider.getProvider().onAppendEntries(this, (AppendEntries) message);
             return;
         }
         if (message instanceof AcknowledgeEntries) {
-            receiver.onAcknowledgeEntries(this, (AcknowledgeEntries) message);
+            receiverProvider.getProvider().onAcknowledgeEntries(this, (AcknowledgeEntries) message);
             return;
         }
 
@@ -96,6 +96,11 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
 
     private void send(Object message) {
         channel.send(message);
+    }
+
+    @Override
+    public void sendIntroduction(Introduction introduction) {
+        send(introduction);
     }
 
     @Override
@@ -109,8 +114,18 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     }
 
     @Override
+    public void sendVoteRequest(VoteRequest voteRequest) {
+        send(voteRequest);
+    }
+
+    @Override
     public void sendVoteResponse(VoteResponse voteResponse) {
         send(voteResponse);
+    }
+
+    @Override
+    public void sendAppendEntries(AppendEntries appendEntries) {
+        send(appendEntries);
     }
 
     @Override

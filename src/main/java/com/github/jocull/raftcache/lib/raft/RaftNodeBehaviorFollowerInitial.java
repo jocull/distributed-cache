@@ -5,8 +5,6 @@ import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 
-import java.util.Optional;
-
 class RaftNodeBehaviorFollowerInitial extends RaftNodeBehavior {
     public RaftNodeBehaviorFollowerInitial(RaftNode self) {
         super(self, NodeStates.FOLLOWER, 0);
@@ -18,22 +16,22 @@ class RaftNodeBehaviorFollowerInitial extends RaftNodeBehavior {
     }
 
     @Override
-    Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
+    public void onVoteRequest(NodeConnectionOutbound sender, VoteRequest voteRequest) {
         throw new IllegalStateException(self().getId() + ": Initial follower is not yet started.");
     }
 
     @Override
-    void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
+    public void onVoteResponse(NodeConnectionOutbound sender, VoteResponse voteResponse) {
         throw new IllegalStateException(self().getId() + ": Initial follower is not yet started.");
     }
 
     @Override
-    AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
+    public void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries) {
         throw new IllegalStateException(self().getId() + ": Initial follower is not yet started.");
     }
 
     @Override
-    void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
+    public void onAcknowledgeEntries(NodeConnectionOutbound sender, AcknowledgeEntries acknowledgeEntries) {
         throw new IllegalStateException(self().getId() + ": Initial follower is not yet started.");
     }
 }

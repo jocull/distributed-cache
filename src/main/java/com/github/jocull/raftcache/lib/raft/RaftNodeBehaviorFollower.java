@@ -7,7 +7,6 @@ import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -82,18 +81,22 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     }
 
     @Override
-    Optional<VoteResponse> onVoteRequest(NodeCommunication remote, VoteRequest voteRequest) {
+    public void onVoteRequest(NodeConnectionOutbound sender, VoteRequest voteRequest) {
         if (voteRequest.getTerm() < term()) {
-            LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", self().getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term());
-            return Optional.empty();
+            LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", self().getId(), sender.getRemoteNodeId(), voteRequest.getTerm(), term());
+            return;
         }
         if (voteRequest.getTerm() == term() && votedForNodeId != null) {
-            LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", self().getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), votedForNodeId);
-            return Optional.empty();
+            LOGGER.warn("{} Received a vote request from {} for term {} but already voted for {}", self().getId(), sender.getRemoteNodeId(), voteRequest.getTerm(), votedForNodeId);
+            return;
         }
         if (voteRequest.getTerm() > term()) {
-            LOGGER.info("{} Received a vote request from {} for term {} and will convert to follower (from term {})", self().getId(), remote.getRemoteNodeId(), voteRequest.getTerm(), term());
-            return self().convertToFollower(voteRequest.getTerm(), f -> f.onVoteRequest(remote, voteRequest));
+            LOGGER.info("{} Received a vote request from {} for term {} and will convert to follower (from term {})", self().getId(), sender.getRemoteNodeId(), voteRequest.getTerm(), term());
+            self().convertToFollower(voteRequest.getTerm(), f -> {
+                f.onVoteRequest(sender, voteRequest);
+                return null;
+            });
+            return;
         }
 
         // If the receiving node hasn't voted yet in this term then it votes for the candidate...
@@ -108,61 +111,68 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         final TermIndex incomingTermIndex = new TermIndex(
                 voteRequest.getLastLogTermIndex().getTerm(), voteRequest.getLastLogTermIndex().getIndex());
         final boolean grantVote = incomingTermIndex.compareTo(lastReceivedIndex) >= 0;
-        votedForNodeId = grantVote ? remote.getRemoteNodeId() : self().getId(); // Vote for self instead
+        votedForNodeId = grantVote ? sender.getRemoteNodeId() : self().getId(); // Vote for self instead
         LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", self().getId(), term(),
                 votedForNodeId, grantVote, voteRequest.getLastLogTermIndex(), lastReceivedIndex);
         // Voting resets the election timeout to let the voting process settle
         scheduleNextElectionTimeout();
-        return Optional.of(new VoteResponse(
+
+        final VoteResponse response = new VoteResponse(
                 voteRequest.getTerm(),
                 new com.github.jocull.raftcache.lib.raft.messages.TermIndex(committedIndex.getTerm(), committedIndex.getIndex()),
-                grantVote));
+                grantVote);
+
+        sender.sendVoteResponse(response);
     }
 
     @Override
-    void onVoteResponse(NodeCommunication remote, VoteResponse voteResponse) {
+    public void onVoteResponse(NodeConnectionOutbound sender, VoteResponse voteResponse) {
         if (voteResponse.getTerm() > term()) {
-            LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self().getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term());
+            LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self().getId(), sender.getRemoteNodeId(), voteResponse.getTerm(), term());
             self().convertToFollower(voteResponse.getTerm(), Function.identity());
             return;
         }
 
-        LOGGER.info("{} Received a vote request from {} for term {} but will stay follower of term {}", self().getId(), remote.getRemoteNodeId(), voteResponse.getTerm(), term());
+        LOGGER.info("{} Received a vote request from {} for term {} but will stay follower of term {}", self().getId(), sender.getRemoteNodeId(), voteResponse.getTerm(), term());
     }
 
     @Override
-    AcknowledgeEntries onAppendEntries(NodeCommunication remote, AppendEntries appendEntries) {
+    public void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries) {
         if (appendEntries.getTerm() > term()) {
-            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self().getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term());
-            return self().convertToFollowerForNewLeader(remote.getRemoteNodeId(), appendEntries)
-                    .onAppendEntries(remote, appendEntries);
+            LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self().getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term());
+            self().convertToFollowerForNewLeader(sender.getRemoteNodeId(), appendEntries)
+                    .onAppendEntries(sender, appendEntries);
+            return;
         }
 
         final TermIndex currentTermIndex = self().getLogs().getCurrentTermIndex();
         final com.github.jocull.raftcache.lib.raft.messages.TermIndex currentTermIndexMessage = new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
                 currentTermIndex.getTerm(), currentTermIndex.getIndex());
         if (appendEntries.getTerm() < term()) {
-            LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", self().getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), term());
-            return new AcknowledgeEntries(term(), false, currentTermIndexMessage);
+            LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", self().getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term());
+            sender.sendAcknowledgeEntries(new AcknowledgeEntries(term(), false, currentTermIndexMessage));
+            return;
         }
 
         final TermIndex incomingTermIndex = new TermIndex(appendEntries.getPreviousLogTermIndex().getTerm(), appendEntries.getPreviousLogTermIndex().getIndex());
         if (!self().getLogs().containsStartPoint(incomingTermIndex)) {
             // TODO: A chance to get stuck here? What happens if indexes get out of sync?
             //       How should we reset? Will the election timeout take care of it?
-            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", self().getId(), remote.getRemoteNodeId(), appendEntries.getTerm(), appendEntries.getPreviousLogTermIndex(), self().getLogs().getCurrentTermIndex());
-            return new AcknowledgeEntries(term(), false, currentTermIndexMessage);
+            LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", self().getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), appendEntries.getPreviousLogTermIndex(), self().getLogs().getCurrentTermIndex());
+            sender.sendAcknowledgeEntries(new AcknowledgeEntries(term(), false, currentTermIndexMessage));
+            return;
         }
-        if (leaderId != null && !leaderId.equals(remote.getRemoteNodeId())) {
+        if (leaderId != null && !leaderId.equals(sender.getRemoteNodeId())) {
             // TODO: Does this matter...?
-            LOGGER.warn("{} Append entries request from {} who is not known leader {}", self().getId(), remote.getRemoteNodeId(), leaderId);
-            return new AcknowledgeEntries(term(), false, currentTermIndexMessage);
+            LOGGER.warn("{} Append entries request from {} who is not known leader {}", self().getId(), sender.getRemoteNodeId(), leaderId);
+            sender.sendAcknowledgeEntries(new AcknowledgeEntries(term(), false, currentTermIndexMessage));
+            return;
         }
 
         // TODO: Move this code to self.convertToFollowerForNewLeader ?
         if (leaderId == null) {
-            leaderId = remote.getRemoteNodeId();
-            LOGGER.info("{} Made follower of {}", self().getId(), remote.getRemoteNodeId());
+            leaderId = sender.getRemoteNodeId();
+            LOGGER.info("{} Made follower of {}", self().getId(), sender.getRemoteNodeId());
         }
 
         // Append the logs
@@ -171,7 +181,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             final TermIndex newEndTermIndex = new TermIndex(newEndTermIndexMessage.getTerm(), newEndTermIndexMessage.getIndex());
             LOGGER.debug("{} Received entries from {} for index {} -> {} with {} entries @ term {}, commit {}, {}",
                     self().getId(),
-                    remote.getRemoteNodeId(),
+                    sender.getRemoteNodeId(),
                     currentTermIndexMessage,
                     newEndTermIndex,
                     appendEntries.getEntries().size(),
@@ -179,7 +189,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
                     self().getLogs().getCommittedTermIndex(),
                     appendEntries.getLeaderCommitTermIndex());
         } else {
-            LOGGER.debug("{} Received heartbeat from {} @ term {}", self().getId(), remote.getRemoteNodeId(), appendEntries.getTerm());
+            LOGGER.debug("{} Received heartbeat from {} @ term {}", self().getId(), sender.getRemoteNodeId(), appendEntries.getTerm());
         }
 
         // TODO: Probably not efficient - pass entire set of new logs and insert them in sequence instead?
@@ -201,17 +211,17 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
         // Clear the current timeout and register the next one
         scheduleNextElectionTimeout();
-        return new AcknowledgeEntries(term(), true, currentTermIndexMessage);
+        sender.sendAcknowledgeEntries(new AcknowledgeEntries(term(), true, currentTermIndexMessage));
     }
 
     @Override
-    void onAcknowledgeEntries(NodeCommunication remote, AcknowledgeEntries acknowledgeEntries) {
+    public void onAcknowledgeEntries(NodeConnectionOutbound sender, AcknowledgeEntries acknowledgeEntries) {
         if (acknowledgeEntries.getTerm() > term()) {
-            LOGGER.info("{} Received acknowledge entries from {} for term {} will move from term {} as follower", self().getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term());
+            LOGGER.info("{} Received acknowledge entries from {} for term {} will move from term {} as follower", self().getId(), sender.getRemoteNodeId(), acknowledgeEntries.getTerm(), term());
             self().convertToFollower(acknowledgeEntries.getTerm(), Function.identity());
             return;
         }
 
-        LOGGER.warn("{} Received acknowledge entries from {} for term {} but doesn't make sense as follower of term {}", self().getId(), remote.getRemoteNodeId(), acknowledgeEntries.getTerm(), term());
+        LOGGER.warn("{} Received acknowledge entries from {} for term {} but doesn't make sense as follower of term {}", self().getId(), sender.getRemoteNodeId(), acknowledgeEntries.getTerm(), term());
     }
 }

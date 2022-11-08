@@ -25,8 +25,8 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-public class NodeCommunicationTest {
-    private static final Logger LOGGER = LoggerFactory.getLogger(NodeCommunicationTest.class);
+public class RaftNodeTest {
+    private static final Logger LOGGER = LoggerFactory.getLogger(RaftNodeTest.class);
 
     private static Stream<Arguments> provideIterationsLong() {
         return IntStream.range(1, 31)
@@ -47,10 +47,10 @@ public class NodeCommunicationTest {
             final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
             middleware.addNode(nodeA).addNode(nodeB);
 
-            assertEquals(Set.of(), nodeA.getClusterTopology().getTopology().stream()
+            assertEquals(Set.of("nodeA"), nodeA.getClusterTopology().getTopology().stream()
                     .map(NodeIdentifier::getId)
                     .collect(Collectors.toSet()));
-            assertEquals(Set.of(), nodeB.getClusterTopology().getTopology().stream()
+            assertEquals(Set.of("nodeB"), nodeB.getClusterTopology().getTopology().stream()
                     .map(NodeIdentifier::getId)
                     .collect(Collectors.toSet()));
 
