@@ -71,6 +71,11 @@ public class RaftNode {
         return behavior.state();
     }
 
+    public NodeCommunicationReceiver getNodeCommunicationReceiver() {
+        // TODO: return behavior;
+        throw new UnsupportedOperationException("Not yet implemented");
+    }
+
     public TermIndex getLastReceivedIndex() {
         return logs.getCurrentTermIndex();
     }
