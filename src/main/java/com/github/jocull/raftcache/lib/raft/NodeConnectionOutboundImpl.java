@@ -52,20 +52,19 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     private void receive(Object message) {
         // Introductions must be completed first to establish node IDs
         if (message instanceof Introduction) {
-            receiverProvider.getProvider().onIntroduction(this, (Introduction) message);
+            receiverProvider.run(receiver -> receiver.onIntroduction(this, (Introduction) message));
             return;
         }
         if (message instanceof AnnounceClusterTopology) {
-            receiverProvider.getProvider().onAnnounceClusterTopology(this, (AnnounceClusterTopology) message);
+            receiverProvider.run(receiver -> receiver.onAnnounceClusterTopology(this, (AnnounceClusterTopology) message));
             return;
         }
         if (message instanceof StateRequest) {
-            receiverProvider.getProvider().onStateRequest(this, (StateRequest) message);
+            receiverProvider.run(receiver -> receiver.onStateRequest(this, (StateRequest) message));
             return;
         }
         if (message instanceof StateResponse) {
-            receiverProvider.getProvider().
-                    onStateResponse(this, (StateResponse) message);
+            receiverProvider.run(receiver -> receiver.onStateResponse(this, (StateResponse) message));
             return;
         }
         if (remoteNodeId == null) {
@@ -75,19 +74,19 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
 
         // After introductions, any message can process
         if (message instanceof VoteRequest) {
-            receiverProvider.getProvider().onVoteRequest(this, (VoteRequest) message);
+            receiverProvider.run(receiver -> receiver.onVoteRequest(this, (VoteRequest) message));
             return;
         }
         if (message instanceof VoteResponse) {
-            receiverProvider.getProvider().onVoteResponse(this, (VoteResponse) message);
+            receiverProvider.run(receiver -> receiver.onVoteResponse(this, (VoteResponse) message));
             return;
         }
         if (message instanceof AppendEntries) {
-            receiverProvider.getProvider().onAppendEntries(this, (AppendEntries) message);
+            receiverProvider.run(receiver -> receiver.onAppendEntries(this, (AppendEntries) message));
             return;
         }
         if (message instanceof AcknowledgeEntries) {
-            receiverProvider.getProvider().onAcknowledgeEntries(this, (AcknowledgeEntries) message);
+            receiverProvider.run(receiver -> receiver.onAcknowledgeEntries(this, (AcknowledgeEntries) message));
             return;
         }
 

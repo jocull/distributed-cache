@@ -9,33 +9,33 @@ public class ClusterTopology {
         this.identifiers = new HashMap<>();
     }
 
-    public synchronized Optional<NodeIdentifier> locate(NodeAddress nodeAddress) {
+    public Optional<NodeIdentifier> locate(NodeAddress nodeAddress) {
         return identifiers.values().stream()
                 .filter(i -> i.getNodeAddress().getAddress().equals(nodeAddress.getAddress()))
                 .findFirst();
     }
 
-    public synchronized void register(NodeIdentifier identifier) {
+    public void register(NodeIdentifier identifier) {
         identifiers.put(identifier.getId(), identifier);
     }
 
-    public synchronized void register(Collection<NodeIdentifier> identifiers) {
+    public void register(Collection<NodeIdentifier> identifiers) {
         identifiers.forEach(i -> this.identifiers.put(i.getId(), i));
     }
 
-    public synchronized NodeIdentifier unregister(String nodeId) {
+    public NodeIdentifier unregister(String nodeId) {
         return identifiers.remove(nodeId);
     }
 
-    public synchronized List<NodeIdentifier> getTopology() {
+    public List<NodeIdentifier> getTopology() {
         return List.copyOf(identifiers.values());
     }
 
-    public synchronized int getMajorityCount() {
+    public int getMajorityCount() {
         return (identifiers.size() / 2) + 1;
     }
 
-    public synchronized int getClusterCount() {
+    public int getClusterCount() {
         return identifiers.size();
     }
 }

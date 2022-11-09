@@ -83,7 +83,8 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
             throw new IllegalStateException("Target node " + targetAddress.getAddress() + " was not registered!");
         }
         final PassThruPair pair = new PassThruPair(source, target);
-        target.onConnection(pair.getRight());
+
+        target.acceptConnection(pair.getRight());
         synchronized (connections) {
             connections.add(pair);
         }

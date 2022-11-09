@@ -13,27 +13,15 @@ import java.util.stream.Collectors;
 abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     final Logger LOGGER = LoggerFactory.getLogger(this.getClass());
 
-    private final RaftNode self;
-    private final NodeStates state;
-    private final int term;
-    private volatile boolean terminated = false;
+    final RaftNodeImpl self;
+    final NodeStates state;
+    final int term;
+    private boolean terminated = false;
 
-    public RaftNodeBehavior(RaftNode self, NodeStates state, int term) {
+    public RaftNodeBehavior(RaftNodeImpl self, NodeStates state, int term) {
         this.self = self;
         this.state = state;
         this.term = term;
-    }
-
-    RaftNode self() {
-        return self;
-    }
-
-    NodeStates state() {
-        return state;
-    }
-
-    int term() {
-        return term;
     }
 
     boolean isTerminated() {
@@ -53,13 +41,13 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
         sender.setRemoteNodeId(introduction.getId());
 
         // We register data about the node that has introduced itself
-        self().getClusterTopology().register(new NodeIdentifier(
+        self.clusterTopology.register(new NodeIdentifier(
                 introduction.getId(),
                 introduction.getNodeAddress()));
 
         // And reply with the cluster topology as we know it
         final AnnounceClusterTopology response = new AnnounceClusterTopology(
-                self().getClusterTopology().getTopology().stream()
+                self.clusterTopology.getTopology().stream()
                         .map(i -> new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier(
                                 i.getId(),
                                 i.getNodeAddress()
@@ -72,7 +60,7 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     @Override
     public void onAnnounceClusterTopology(NodeConnectionOutbound sender, AnnounceClusterTopology announceClusterTopology) {
         // When the topology has been received we can update our local view of the world
-        self().getClusterTopology().register(announceClusterTopology.getNodeIdentifierStates().stream()
+        self.clusterTopology.register(announceClusterTopology.getNodeIdentifierStates().stream()
                 .map(i -> new NodeIdentifier(
                         i.getId(),
                         i.getNodeAddress()
@@ -80,23 +68,23 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
                 .collect(Collectors.toList()));
 
         if (sender.getRemoteNodeId() == null) {
-            final String remoteNodeId = self().getClusterTopology().locate(sender.getRemoteNodeAddress())
+            final String remoteNodeId = self.clusterTopology.locate(sender.getRemoteNodeAddress())
                     .map(com.github.jocull.raftcache.lib.topology.NodeIdentifier::getId)
-                    .orElseThrow(() -> new IllegalStateException("Remote address " + sender.getRemoteNodeAddress() + " not found in cluster topology: {}" + self().getClusterTopology().getTopology()));
+                    .orElseThrow(() -> new IllegalStateException("Remote address " + sender.getRemoteNodeAddress() + " not found in cluster topology: {}" + self.clusterTopology.getTopology()));
             sender.setRemoteNodeId(remoteNodeId);
         }
     }
 
     @Override
     public void onStateRequest(NodeConnectionOutbound sender, StateRequest stateRequest) {
-        final TermIndex current = self().getLogs().getCurrentTermIndex();
-        final TermIndex committed = self().getLogs().getCommittedTermIndex();
+        final TermIndex current = self.logs.getCurrentTermIndex();
+        final TermIndex committed = self.logs.getCommittedTermIndex();
         final StateResponse response = new StateResponse(
                 stateRequest,
-                self().getId(),
-                self().getNodeAddress(),
-                state(),
-                term(),
+                self.getId(),
+                self.getNodeAddress(),
+                state,
+                term,
                 new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
                         current.getTerm(),
                         current.getIndex()),

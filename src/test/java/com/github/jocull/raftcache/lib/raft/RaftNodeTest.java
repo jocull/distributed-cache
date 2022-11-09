@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -43,14 +44,14 @@ public class RaftNodeTest {
     void testNodeIntroductions(int iteration) {
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
-            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
-            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
             middleware.addNode(nodeA).addNode(nodeB);
 
-            assertEquals(Set.of("nodeA"), nodeA.getClusterTopology().getTopology().stream()
+            assertEquals(Set.of("nodeA"), nodeA.getKnownNodes().join().stream()
                     .map(NodeIdentifier::getId)
                     .collect(Collectors.toSet()));
-            assertEquals(Set.of("nodeB"), nodeB.getClusterTopology().getTopology().stream()
+            assertEquals(Set.of("nodeB"), nodeB.getKnownNodes().join().stream()
                     .map(NodeIdentifier::getId)
                     .collect(Collectors.toSet()));
 
@@ -58,13 +59,13 @@ public class RaftNodeTest {
 
             // nodeA self registers, and contacts nodeB
             assertWithinTimeout("nodeA's topology did not settle with nodeA, nodeB", 1000, TimeUnit.MILLISECONDS, () -> {
-                final Set<String> nodeTopology = nodeA.getClusterTopology().getTopology().stream()
+                final Set<String> nodeTopology = nodeA.getKnownNodes().join().stream()
                         .map(NodeIdentifier::getId)
                         .collect(Collectors.toSet());
                 return Set.of("nodeA", "nodeB").equals(nodeTopology);
             });
             assertWithinTimeout("nodeB's topology did not settle with nodeA, nodeB", 1000, TimeUnit.MILLISECONDS, () -> {
-                final Set<String> nodeTopology = nodeB.getClusterTopology().getTopology().stream()
+                final Set<String> nodeTopology = nodeB.getKnownNodes().join().stream()
                         .map(NodeIdentifier::getId)
                         .collect(Collectors.toSet());
                 return Set.of("nodeA", "nodeB").equals(nodeTopology);
@@ -78,9 +79,9 @@ public class RaftNodeTest {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
-            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
-            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
-            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
             inMemoryTopologyDiscovery
                     .addKnownNode(nodeA.getNodeAddress())
                     .addKnownNode(nodeB.getNodeAddress())
@@ -88,13 +89,13 @@ public class RaftNodeTest {
             middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
 
             // No node should be a leader right now
-            assertFalse(NodeStates.LEADER.equals(nodeA.getState())
-                    || NodeStates.LEADER.equals(nodeB.getState())
-                    || NodeStates.LEADER.equals(nodeC.getState()), "No leader should have been found!");
+            assertFalse(NodeStates.LEADER.equals(nodeA.getNodeState().join())
+                    || NodeStates.LEADER.equals(nodeB.getNodeState().join())
+                    || NodeStates.LEADER.equals(nodeC.getNodeState().join()), "No leader should have been found!");
 
             // Starting the nodes will begin election timeouts
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
@@ -109,7 +110,7 @@ public class RaftNodeTest {
             try {
                 assertWithinTimeout("Queried cluster state did not align with node states", 5, TimeUnit.SECONDS, () -> {
                     final ClusterNodes nodes = getRaftLeaderAndFollowers(middleware);
-                    final List<StateResponse> clusterNodeStates = nodeA.getOperations().getClusterNodeStates();
+                    final List<StateResponse> clusterNodeStates = nodeA.getClusterNodeStates().join();
                     try {
                         assertNotNull(clusterNodeStates);
                         assertEquals(3, clusterNodeStates.size());
@@ -121,9 +122,9 @@ public class RaftNodeTest {
                         assertEquals(nodes.followers().stream().map(RaftNode::getId).collect(Collectors.toSet()),
                                 clusterNodeStates.stream().filter(c -> c.getState().equals(NodeStates.FOLLOWER)).map(x -> x.getIdentifier().getId()).collect(Collectors.toSet()));
 
-                        final StateResponse leaderState = nodeA.getOperations().getLeader().orElseThrow();
+                        final StateResponse leaderState = nodeA.getLeader().join().orElseThrow();
                         assertEquals(nodes.leader().getId(), leaderState.getIdentifier().getId());
-                        assertEquals(nodes.leader().getCurrentTerm(), leaderState.getTerm());
+                        assertEquals(nodes.leader().getCurrentTermIndex().join().getTerm(), leaderState.getTerm());
                     } catch (Throwable error) {
                         lastThrowable.set(error);
                         return false;
@@ -145,9 +146,9 @@ public class RaftNodeTest {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
-            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
-            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
-            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
             inMemoryTopologyDiscovery
                     .addKnownNode(nodeA.getNodeAddress())
                     .addKnownNode(nodeB.getNodeAddress())
@@ -155,8 +156,8 @@ public class RaftNodeTest {
             middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
 
             // Starting the nodes will begin election timeouts
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
@@ -194,9 +195,9 @@ public class RaftNodeTest {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
-            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
-            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
-            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
             inMemoryTopologyDiscovery
                     .addKnownNode(nodeA.getNodeAddress())
                     .addKnownNode(nodeB.getNodeAddress())
@@ -204,8 +205,8 @@ public class RaftNodeTest {
             middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
 
             // Starting the nodes will begin election timeouts
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
@@ -245,9 +246,9 @@ public class RaftNodeTest {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
-            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
-            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
-            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
             inMemoryTopologyDiscovery
                     .addKnownNode(nodeA.getNodeAddress())
                     .addKnownNode(nodeB.getNodeAddress())
@@ -255,8 +256,8 @@ public class RaftNodeTest {
             middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
 
             // Starting the nodes will begin election timeouts
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             final ClusterNodes nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
@@ -267,29 +268,30 @@ public class RaftNodeTest {
             });
 
             nodes.followers().forEach(r -> {
-                assertThrows(IllegalStateException.class, () -> r.getOperations().submit("hello"));
+                final ExecutionException exception = assertThrows(ExecutionException.class, () -> r.submit("hello").get(1, TimeUnit.SECONDS));
+                assertEquals(IllegalStateException.class, exception.getCause().getClass());
             });
 
             final RaftLog<String> log1 = assertDoesNotThrow(
-                    () -> nodes.leader().getOperations().submit("hello").get(1, TimeUnit.SECONDS),
+                    () -> nodes.leader().submit("hello").get(1, TimeUnit.SECONDS),
                     "Expected followers to get log 1");
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log1.getTermIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> log1.getTermIndex().compareTo(r.getCurrentTermIndex().join()) >= 0),
                     "Followers didn't get log 1");
 
             final RaftLog<String> log2 = assertDoesNotThrow(
-                    () -> nodes.leader().getOperations().submit("hello again").get(1, TimeUnit.SECONDS),
+                    () -> nodes.leader().submit("hello again").get(1, TimeUnit.SECONDS),
                     "Expected followers to get log 2");
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log2.getTermIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> log2.getTermIndex().compareTo(r.getCurrentTermIndex().join()) >= 0),
                     "Followers didn't get log 2");
 
             final RaftLog<String> log3 = assertDoesNotThrow(
-                    () -> nodes.leader().getOperations().submit("hello one last time").get(1, TimeUnit.SECONDS),
+                    () -> nodes.leader().submit("hello one last time").get(1, TimeUnit.SECONDS),
                     "Expected followers to get log 2");
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(log3.getTermIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> log3.getTermIndex().compareTo(r.getCurrentTermIndex().join()) >= 0),
                     "Followers didn't get log 3");
 
             final List<CompletableFuture<RaftLog<Integer>>> futures = IntStream.range(0, 1000)
-                    .mapToObj(i -> nodes.leader().getOperations().submit(i))
+                    .mapToObj(i -> nodes.leader().submit(i))
                     .collect(Collectors.toList());
 
             final List<RaftLog<Integer>> results = futures.stream()
@@ -297,7 +299,7 @@ public class RaftNodeTest {
                     .collect(Collectors.toList());
 
             final RaftLog<Integer> logLast = results.get(futures.size() - 1);
-            assertTrue(nodes.followers().stream().allMatch(r -> r.getLogs().containsStartPoint(logLast.getTermIndex())),
+            assertTrue(nodes.followers().stream().allMatch(r -> logLast.getTermIndex().compareTo(r.getCurrentTermIndex().join()) >= 0),
                     "Followers didn't get final log");
         }
     }
@@ -309,9 +311,9 @@ public class RaftNodeTest {
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
-            final RaftNode nodeA = new RaftNode("nodeA", new NodeAddress("addressA"), raftManager);
-            final RaftNode nodeB = new RaftNode("nodeB", new NodeAddress("addressB"), raftManager);
-            final RaftNode nodeC = new RaftNode("nodeC", new NodeAddress("addressC"), raftManager);
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
             inMemoryTopologyDiscovery
                     .addKnownNode(nodeA.getNodeAddress())
                     .addKnownNode(nodeB.getNodeAddress())
@@ -319,8 +321,8 @@ public class RaftNodeTest {
             middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
 
             // Starting the nodes will begin election timeouts
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::connectWithTopology);
-            middleware.getAddressRaftNodeMap().values().forEach(RaftNode::start);
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
@@ -331,7 +333,7 @@ public class RaftNodeTest {
             });
 
             nodes1.followers().forEach(r -> {
-                assertThrows(IllegalStateException.class, () -> r.getOperations().submit("hello"));
+                assertThrows(IllegalStateException.class, () -> r.submit("hello").get(1, TimeUnit.SECONDS));
             });
 
             final AtomicBoolean producerStopped = new AtomicBoolean();
@@ -349,7 +351,7 @@ public class RaftNodeTest {
                 }
 
                 try {
-                    final CompletableFuture<RaftLog<Integer>> future = currentLeader.getOperations().submit(count);
+                    final CompletableFuture<RaftLog<Integer>> future = currentLeader.submit(count);
                     LOGGER.debug("Added {} to current leader {}", count, currentLeader.getId());
                     return future;
                 } catch (Exception ex) {
@@ -468,20 +470,20 @@ public class RaftNodeTest {
 
     private static List<RaftNode> getRaftFollowers(PassThruMiddleware middleware) {
         return middleware.getAddressRaftNodeMap().values().stream()
-                .filter(r -> r.getState().equals(NodeStates.FOLLOWER))
+                .filter(r -> r.getNodeState().join().equals(NodeStates.FOLLOWER))
                 .collect(Collectors.toList());
     }
 
     private static List<RaftNode> getRaftCandidates(PassThruMiddleware middleware) {
         return middleware.getAddressRaftNodeMap().values().stream()
-                .filter(r -> r.getState().equals(NodeStates.CANDIDATE))
+                .filter(r -> r.getNodeState().join().equals(NodeStates.CANDIDATE))
                 .collect(Collectors.toList());
     }
 
     private static RaftNode getRaftLeader(PassThruMiddleware middleware) {
         return middleware.getAddressRaftNodeMap().values().stream()
-                .filter(r -> r.getState().equals(NodeStates.LEADER))
-                .max(Comparator.comparingInt(RaftNode::getCurrentTerm))
+                .filter(r -> r.getNodeState().join().equals(NodeStates.LEADER))
+                .max(Comparator.comparingInt(r -> r.getCurrentTermIndex().join().getTerm()))
                 .orElse(null);
     }
 
