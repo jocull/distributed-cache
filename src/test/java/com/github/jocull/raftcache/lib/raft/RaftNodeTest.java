@@ -5,18 +5,19 @@ import com.github.jocull.raftcache.lib.raft.middleware.PassThruMiddleware;
 import com.github.jocull.raftcache.lib.topology.InMemoryTopologyDiscovery;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -308,6 +309,7 @@ public class RaftNodeTest {
     @ParameterizedTest
     @MethodSource("provideIterationsShort")
     void testLogReplicationDuringTermChange(int iteration) throws InterruptedException {
+        final AtomicBoolean producerStopped = new AtomicBoolean();
         final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
@@ -337,9 +339,7 @@ public class RaftNodeTest {
                 assertEquals(IllegalStateException.class, exception.getCause().getClass());
             });
 
-            final AtomicBoolean producerStopped = new AtomicBoolean();
             final List<CompletableFuture<RaftLog<Integer>>> logFutures = new ArrayList<>();
-            final List<Integer> logsRejected = new ArrayList<>();
             final Set<RaftNode> seenLeaderNodes = new HashSet<>();
             final Function<Integer, CompletableFuture<RaftLog<Integer>>> fnSubmitLogFuture = (count) -> {
                 final RaftNode currentLeader = getRaftLeader(middleware);
@@ -356,32 +356,33 @@ public class RaftNodeTest {
                     LOGGER.debug("Added {} to current leader {}", count, currentLeader.getId());
                     return future;
                 } catch (Exception ex) {
-                    synchronized (logsRejected) {
-                        LOGGER.debug("Failed to add {} to current leader {}", count, currentLeader.getId(), ex);
-                        logsRejected.add(count);
-                        throw new RuntimeException("Rejected @ " + count, ex);
-                    }
+                    LOGGER.debug("Failed to add {} to current leader {}", count, currentLeader.getId(), ex);
+                    throw new RuntimeException("Rejected @ " + count, ex);
                 }
             };
 
+            final AtomicInteger produceCounter = new AtomicInteger();
+            final AtomicInteger retryCounter = new AtomicInteger();
             final Thread producer = new Thread(() -> {
-                final Executor delayedExecutor = CompletableFuture.delayedExecutor(1000, TimeUnit.MILLISECONDS);
                 try {
-                    int counter = 0;
+                    final Retry retry = Retry.of("producer-retry", RetryConfig.custom()
+                            .maxAttempts(10)
+                            .waitDuration(Duration.ofSeconds(1))
+                            .retryOnException(e -> {
+                                LOGGER.error("retrying for exception", e);
+                                retryCounter.incrementAndGet();
+                                return true;
+                            })
+                            .build());
+
+                    final ScheduledExecutorService executor = Executors.newScheduledThreadPool(4);
                     while (!producerStopped.get()) {
-                        final int thisCount = counter++;
-                        CompletableFuture<RaftLog<Integer>> result = new CompletableFuture<>();
-                        CompletableFuture<RaftLog<Integer>> retryChain = fnSubmitLogFuture.apply(thisCount);
-                        for (int retry = 0; retry < 10; retry++) {
-                            // See explanation of retry logic
-                            // https://stackoverflow.com/a/40487376/97964
-                            retryChain = retryChain
-                                    .thenApply(x -> (Throwable) null)
-                                    .exceptionally(ex -> ex)
-                                    .thenApplyAsync(ex -> fnSubmitLogFuture.apply(thisCount), delayedExecutor)
-                                    .thenCompose(Function.identity());
-                        }
-                        retryChain.thenAccept(result::complete);
+                        final int thisCount = produceCounter.incrementAndGet();
+                        final CompletableFuture<RaftLog<Integer>> result = retry.executeCompletionStage(
+                                        executor,
+                                        () -> fnSubmitLogFuture.apply(thisCount))
+                                .toCompletableFuture();
+
                         logFutures.add(result);
                         Thread.sleep(5);
                     }
@@ -413,16 +414,28 @@ public class RaftNodeTest {
             });
 
             // Stay interrupted for a while, expect that we collect more logs and see more nodes
-            assertWithinTimeout("Did not get more logs and new leader during interrupt", 5, TimeUnit.SECONDS, () -> {
-                boolean logsPassed = false;
-                boolean leadersPassed = false;
-                synchronized (logFutures) {
-                    logsPassed = logFutures.size() >= (logStartPoint + 200);
-                }
+            assertWithinTimeout("Did not see new leader during interrupt", 5, TimeUnit.SECONDS, () -> {
+                boolean leadersPassed;
                 synchronized (seenLeaderNodes) {
                     leadersPassed = seenLeaderNodes.size() >= 2;
                 }
-                return logsPassed && leadersPassed;
+                return leadersPassed;
+            });
+
+            final int logStartPoint2 = assertResultWithinTimeout("Starting logs did not populate", 5, TimeUnit.SECONDS, () -> {
+                synchronized (logFutures) {
+                    if (logFutures.size() >= 100) {
+                        return logFutures.size();
+                    }
+                    return null;
+                }
+            });
+            assertWithinTimeout("Did not get more logs with new leader during interrupt", 5, TimeUnit.SECONDS, () -> {
+                boolean logsPassed;
+                synchronized (logFutures) {
+                    logsPassed = logFutures.size() >= (logStartPoint2 + 200);
+                }
+                return logsPassed;
             });
 
             LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
@@ -435,15 +448,22 @@ public class RaftNodeTest {
                 return null;
             });
 
+            // Transactions sent to the previous leader are unable to hit a majority and will stall until the
+            // leader comes back online. When it does, it will rollback and cancel pending requests to it.
+            LOGGER.info("===== WAITING FOR TRANSACTIONS TO HIT RETRIES =====");
+            assertWithinTimeout("Did not see transactions previously sent to old leader revert and retry", 5, TimeUnit.SECONDS,
+                    () -> retryCounter.get() > 1);
+
+            LOGGER.info("===== WAITING FOR PRODUCER TO STOP =====");
             producerStopped.set(true);
             assertWithinTimeout("Producer didn't stop!", 1, TimeUnit.SECONDS, () -> !producer.isAlive());
 
-            RaftLog<Integer> integerRaftLog = assertDoesNotThrow(() -> logFutures.get(logFutures.size() - 1).get(5, TimeUnit.SECONDS));
-            if (integerRaftLog != null) {
-                LOGGER.info("Yay!");
-            }
-
-            // TODO: Validate that the complete set of logs arrived
+            LOGGER.info("===== WAITING FOR LAST LOG TO COMPLETE =====");
+            final RaftLog<Integer> raftLogLast = assertDoesNotThrow(() -> logFutures.get(logFutures.size() - 1).get(30, TimeUnit.SECONDS));
+            assertNotNull(raftLogLast);
+            assertEquals(produceCounter.get(), raftLogLast.getEntry());
+        } finally {
+            producerStopped.set(true);
         }
     }
 
