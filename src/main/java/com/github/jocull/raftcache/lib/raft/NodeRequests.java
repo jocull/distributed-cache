@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit;
 class NodeRequests {
     private final Map<UUID, CompletableFuture<Response>> pendingRequests = new HashMap<>();
 
-    private <TRequest extends Request, TResponse extends Response> CompletableFuture<TResponse> getRequestFuture(TRequest request, Class<TResponse> tResponseClass) {
+    public  <TRequest extends Request, TResponse extends Response> CompletableFuture<TResponse> getRequestFuture(TRequest request, Class<TResponse> tResponseClass) {
         // Prepare the request's timeout
         final Executor delayedExecutor = CompletableFuture.delayedExecutor(5, TimeUnit.SECONDS); // TODO: Is this timeout appropriate?
         final CompletableFuture<Void> requestCancellation = CompletableFuture.runAsync(() -> {

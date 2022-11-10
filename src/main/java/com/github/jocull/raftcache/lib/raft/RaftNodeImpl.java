@@ -1,8 +1,10 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.AsyncUtilities;
 import com.github.jocull.raftcache.lib.event.EventBus;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
 import com.github.jocull.raftcache.lib.raft.messages.Introduction;
+import com.github.jocull.raftcache.lib.raft.messages.StateRequest;
 import com.github.jocull.raftcache.lib.raft.messages.StateResponse;
 import com.github.jocull.raftcache.lib.raft.middleware.ChannelMiddleware;
 import com.github.jocull.raftcache.lib.topology.ClusterTopology;
@@ -284,37 +286,19 @@ class RaftNodeImpl implements RaftNode {
 
     @Override
     public CompletableFuture<List<StateResponse>> getClusterNodeStates() {
-        throw new UnsupportedOperationException("Needs refactor");
+        return CompletableFuture.completedFuture(null)
+                .thenComposeAsync(_void -> {
+                    final List<CompletableFuture<StateResponse>> futures = activeConnections.stream()
+                            .map(c -> c.sendStateRequest(new StateRequest()))
+                            .collect(Collectors.toList());
 
-//        return CompletableFuture.supplyAsync(() -> {
-//
-//        }, nodeExecutor);
-
-//        final List<CompletableFuture<StateResponse>> futures;
-//        synchronized (self.getActiveConnections()) {
-//            futures = self.getActiveConnections().stream()
-//                    .map(NodeConnectionOutbound::requestState)
-//                    .collect(Collectors.toList());
-//        }
-//
-//        final List<StateResponse> results = futures.stream()
-//                .map(f -> {
-//                    try {
-//                        return f.join();
-//                    } catch (Exception ex) {
-//                        LOGGER.error("{} State response failed", self.getId(), ex);
-//                        return null;
-//                    }
-//                })
-//                .filter(Objects::nonNull)
-//                .collect(Collectors.toCollection(ArrayList::new));
-//
-//        // Add self
-//        synchronized (self) {
-//            results.add(self.behavior.onStateRequest(new StateRequest()));
-//        }
-//
-//        return results;
+                    return AsyncUtilities.sequence(futures)
+                            .thenApplyAsync(stateResponses -> {
+                                // Add self into the response list
+                                stateResponses.add(behavior.getStateResponse(new StateRequest()));
+                                return stateResponses;
+                            }, nodeExecutor);
+                }, nodeExecutor);
     }
 
     @Override

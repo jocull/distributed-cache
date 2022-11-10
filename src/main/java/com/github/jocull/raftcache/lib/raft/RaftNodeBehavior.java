@@ -1,9 +1,6 @@
 package com.github.jocull.raftcache.lib.raft;
 
-import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
-import com.github.jocull.raftcache.lib.raft.messages.Introduction;
-import com.github.jocull.raftcache.lib.raft.messages.StateRequest;
-import com.github.jocull.raftcache.lib.raft.messages.StateResponse;
+import com.github.jocull.raftcache.lib.raft.messages.*;
 import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,12 +72,11 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
         }
     }
 
-    @Override
-    public void onStateRequest(NodeConnectionOutbound sender, StateRequest stateRequest) {
+    StateResponse getStateResponse(StateRequest request) {
         final TermIndex current = self.logs.getCurrentTermIndex();
         final TermIndex committed = self.logs.getCommittedTermIndex();
-        final StateResponse response = new StateResponse(
-                stateRequest,
+        return new StateResponse(
+                request,
                 self.getId(),
                 self.getNodeAddress(),
                 state,
@@ -91,13 +87,11 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
                 new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
                         committed.getTerm(),
                         committed.getIndex()));
-
-        sender.sendStateResponse(response);
     }
 
     @Override
-    public void onStateResponse(NodeConnectionOutbound sender, StateResponse stateResponse) {
-        // TODO: Migrate request completion to here? Does this belong here at all?
-        throw new UnsupportedOperationException("Not yet finished");
+    public void onStateRequest(NodeConnectionOutbound sender, StateRequest stateRequest) {
+        final StateResponse response =getStateResponse(stateRequest);
+        sender.sendStateResponse(response);
     }
 }

@@ -9,8 +9,6 @@ public interface NodeCommunicationReceiver {
 
     void onStateRequest(NodeConnectionOutbound sender, StateRequest stateRequest);
 
-    void onStateResponse(NodeConnectionOutbound sender, StateResponse stateResponse);
-
     void onVoteRequest(NodeConnectionOutbound sender, VoteRequest voteRequest);
 
     void onVoteResponse(NodeConnectionOutbound sender, VoteResponse voteResponse);

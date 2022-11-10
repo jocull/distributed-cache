@@ -6,6 +6,8 @@ import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.CompletableFuture;
+
 class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     private static final Logger LOGGER = LoggerFactory.getLogger(NodeConnectionOutboundImpl.class);
 
@@ -14,6 +16,7 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
 
     private final NodeCommunicationReceiverProvider receiverProvider;
     private final ChannelMiddleware.ChannelSide channel;
+    private final NodeRequests requests = new NodeRequests();
 
     public NodeConnectionOutboundImpl(NodeCommunicationReceiverProvider receiverProvider,
                                       ChannelMiddleware.ChannelSide channel) {
@@ -64,7 +67,7 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
             return;
         }
         if (message instanceof StateResponse) {
-            receiverProvider.run(receiver -> receiver.onStateResponse(this, (StateResponse) message));
+            receiverProvider.run(receiver -> requests.completeRequest((StateResponse) message));
             return;
         }
         if (remoteNodeId == null) {
@@ -105,6 +108,13 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     @Override
     public void sendAnnounceClusterTopology(AnnounceClusterTopology announceClusterTopology) {
         send(announceClusterTopology);
+    }
+
+    @Override
+    public CompletableFuture<StateResponse> sendStateRequest(StateRequest stateRequest) {
+        final CompletableFuture<StateResponse> response = requests.getRequestFuture(stateRequest, StateResponse.class);
+        send(stateRequest);
+        return response;
     }
 
     @Override
