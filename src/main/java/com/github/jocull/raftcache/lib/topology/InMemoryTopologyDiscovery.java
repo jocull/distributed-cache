@@ -17,7 +17,7 @@ public class InMemoryTopologyDiscovery implements TopologyDiscovery {
     }
 
     @Override
-    public List<NodeAddress> getNodes() {
+    public List<NodeAddress> discoverNodes() {
         return List.copyOf(knownNodes);
     }
 }
