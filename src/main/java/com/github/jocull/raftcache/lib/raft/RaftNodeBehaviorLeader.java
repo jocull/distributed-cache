@@ -52,7 +52,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             final com.github.jocull.raftcache.lib.raft.messages.TermIndex committedTermIndexMessage =
                     new com.github.jocull.raftcache.lib.raft.messages.TermIndex(committedTermIndex.getTerm(), committedTermIndex.getIndex());
             self.getActiveConnections().forEach(c -> {
-                final List<AppendEntries.RaftLog> entries = self.logs.getLogRange(c.getTermIndex(), 25, this::transformLog);
+                final List<AppendEntries.RaftLog> entries = self.logs.getLogRange(c.getTermIndex(), 200, this::transformLog);
                 if (!entries.isEmpty()) {
                     final com.github.jocull.raftcache.lib.raft.messages.TermIndex newEndTermIndex = entries.get(entries.size() - 1).getTermIndex();
                     LOGGER.debug("{} Appending entries to {} setting index {} -> {} with {} entries @ term {}", self.getId(), c.getRemoteNodeId(), c.getTermIndex(), newEndTermIndex, entries.size(), term);
