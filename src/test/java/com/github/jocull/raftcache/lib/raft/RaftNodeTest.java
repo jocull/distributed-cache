@@ -333,7 +333,8 @@ public class RaftNodeTest {
             });
 
             nodes1.followers().forEach(r -> {
-                assertThrows(IllegalStateException.class, () -> r.submit("hello").get(1, TimeUnit.SECONDS));
+                final ExecutionException exception = assertThrows(ExecutionException.class, () -> r.submit("hello").get(1, TimeUnit.SECONDS));
+                assertEquals(IllegalStateException.class, exception.getCause().getClass());
             });
 
             final AtomicBoolean producerStopped = new AtomicBoolean();
