@@ -1,6 +1,6 @@
 package com.github.jocull.raftcache.lib.raft.messages;
 
-public class AcknowledgeEntries {
+public class AcknowledgeEntries extends Response {
     // Current term, for the leader to update itself
     private final int term;
     // True if follower contained entry matching previous log entry and term
@@ -8,7 +8,8 @@ public class AcknowledgeEntries {
     // Contains the current index after acknowledging
     private final TermIndex currentTermIndex;
 
-    public AcknowledgeEntries(int term, boolean success, TermIndex currentTermIndex) {
+    public AcknowledgeEntries(AppendEntries request, int term, boolean success, TermIndex currentTermIndex) {
+        super(request);
         this.term = term;
         this.success = success;
         this.currentTermIndex = currentTermIndex;

@@ -17,7 +17,7 @@ public interface NodeCommunicationSender {
 
     void sendVoteResponse(VoteResponse voteResponse);
 
-    void sendAppendEntries(AppendEntries appendEntries);
+    CompletableFuture<AcknowledgeEntries> sendAppendEntries(AppendEntries appendEntries);
 
     void sendAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries);
 }
