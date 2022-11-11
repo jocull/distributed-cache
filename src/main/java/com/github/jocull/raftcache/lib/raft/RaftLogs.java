@@ -1,5 +1,7 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.event.EventBus;
+import com.github.jocull.raftcache.lib.raft.events.AppendLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,11 +15,15 @@ class RaftLogs {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftLogs.class);
     private static final CompletableRaftLog<?> EPOCH_LOG = new CompletableRaftLog<>(TermIndex.EPOCH, RaftLogs.class);
 
-    private TermIndex currentTermIndex = TermIndex.EPOCH;
-    private TermIndex committedTermIndex = TermIndex.EPOCH;
+    private final EventBus eventBus;
     private final Deque<CompletableRaftLog<?>> logs = new ArrayDeque<>(); // TODO: Is this the right data structure?
 
-    public RaftLogs() {
+    private TermIndex currentTermIndex = TermIndex.EPOCH;
+    private TermIndex committedTermIndex = TermIndex.EPOCH;
+
+    public RaftLogs(EventBus eventBus) {
+        this.eventBus = eventBus;
+
         // Adding the epoch log as a start point simplifies operations checking indexes against a start point
         logs.add(EPOCH_LOG);
     }
@@ -94,6 +100,7 @@ class RaftLogs {
         if (termIndex.compareTo(currentTermIndex) > 0) {
             currentTermIndex = termIndex;
         }
+        eventBus.publish(new AppendLog(raftLog));
         return raftLog;
     }
 

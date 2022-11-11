@@ -44,7 +44,7 @@ class RaftNodeImpl implements RaftNode {
     final List<NodeConnectionOutbound> activeConnections = new ArrayList<>();
 
     // Log management
-    final RaftLogs logs = new RaftLogs();
+    final RaftLogs logs;
 
     RaftNodeImpl(String id,
                  NodeAddress nodeAddress,
@@ -56,6 +56,7 @@ class RaftNodeImpl implements RaftNode {
         this.topologyDiscovery = topologyDiscovery;
         this.channelMiddleware = channelMiddleware;
         this.eventBus = eventBus;
+        this.logs = new RaftLogs(eventBus);
 
         // Each node maintains a scheduled executor to serialize operations and run timers
         {

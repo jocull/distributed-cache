@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.event.EventBus;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
@@ -9,11 +10,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
 
 public class RaftLogsTest {
     @Test
     void testRaftLogs() {
-        final RaftLogs raftLogs = new RaftLogs();
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
         assertEquals(0, raftLogs.getCurrentTermIndex().getTerm());
         assertEquals(0L, raftLogs.getCurrentTermIndex().getIndex());
         assertEquals(0, raftLogs.getCommittedTermIndex().getTerm());
@@ -61,7 +63,7 @@ public class RaftLogsTest {
 
     @Test
     void testAppendTermChange() {
-        final RaftLogs raftLogs = new RaftLogs();
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
 
         final RaftLog<String> log1 = raftLogs.appendLog(new TermIndex(1, 1), "hello");
         final RaftLog<String> log2 = raftLogs.appendLog(new TermIndex(1, 1), "hello");
@@ -69,18 +71,18 @@ public class RaftLogsTest {
 
         final RaftLog<String> log3 = raftLogs.appendLog(new TermIndex(1, 2), "world");
         final RaftLog<String> log4 = raftLogs.appendLog(new TermIndex(1, 3), "universe");
-        final List<RaftLog<?>> range1 = raftLogs.getLogRange(new TermIndex(0, 0), 25);
+        final List<RaftLog<?>> range1 = raftLogs.getLogRange(TermIndex.EPOCH, 25);
         assertEquals(List.of(log1, log3, log4), range1);
 
         final RaftLog<String> log5 = raftLogs.appendLog(new TermIndex(2, 2), "world");
         final RaftLog<String> log6 = raftLogs.appendLog(new TermIndex(2, 3), "universe");
-        final List<RaftLog<?>> range2 = raftLogs.getLogRange(new TermIndex(0, 0), 25);
+        final List<RaftLog<?>> range2 = raftLogs.getLogRange(TermIndex.EPOCH, 25);
         assertEquals(List.of(log1, log5, log6), range2);
     }
 
     @Test
     void testAppendLogGap() {
-        final RaftLogs raftLogs = new RaftLogs();
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
 
         raftLogs.appendLog(new TermIndex(1, 1), "hello");
         raftLogs.appendLog(new TermIndex(1, 3), "universe");
@@ -89,7 +91,7 @@ public class RaftLogsTest {
 
     @Test
     void testFutureRaftLogsCommit() throws ExecutionException, InterruptedException, TimeoutException {
-        final RaftLogs raftLogs = new RaftLogs();
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
         assertEquals(0, raftLogs.getCurrentTermIndex().getTerm());
         assertEquals(0L, raftLogs.getCurrentTermIndex().getIndex());
         assertEquals(0, raftLogs.getCommittedTermIndex().getTerm());
@@ -127,7 +129,7 @@ public class RaftLogsTest {
 
     @Test
     void testFutureRaftLogsRollback() {
-        final RaftLogs raftLogs = new RaftLogs();
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
         assertEquals(0L, raftLogs.getCurrentTermIndex().getIndex());
         assertEquals(0L, raftLogs.getCommittedTermIndex().getIndex());
 
