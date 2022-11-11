@@ -84,7 +84,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
         }
         final PassThruPair pair = new PassThruPair(source, target);
 
-        target.acceptConnection(pair.getRight());
+        target.acceptConnection(pair.getRight()).join(); // Let the connection establish first
         synchronized (connections) {
             connections.add(pair);
         }
