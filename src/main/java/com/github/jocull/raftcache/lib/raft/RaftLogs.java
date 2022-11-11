@@ -63,13 +63,6 @@ class RaftLogs {
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
             final CompletableRaftLog<?> next = iterator.next();
-            if (next.getTermIndex().compareTo(termIndex) < 0) {
-                continue;
-            }
-            if (!next.getTermIndex().equals(termIndex)) {
-                // Shouldn't ever happen?
-                throw new IllegalStateException("Unexpected log gap! " + next.getTermIndex() + " vs " + termIndex);
-            }
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it.
             if (termIndex.isReplacementOf(next.getTermIndex())) {
@@ -83,11 +76,16 @@ class RaftLogs {
                 LOGGER.debug("Removed {} logs from term {} (instead of {})", count, next.getTermIndex().getTerm(), termIndex);
                 break;
             }
-            if (next.getTermIndex().equals(termIndex)) {
-                LOGGER.trace("Existing log found from @ {}", next.getTermIndex());
-                //noinspection unchecked
-                return (CompletableRaftLog<T>) next;
+            if (next.getTermIndex().compareTo(termIndex) < 0) {
+                continue;
             }
+            if (!next.getTermIndex().equals(termIndex)) {
+                // Shouldn't ever happen?
+                throw new IllegalStateException("Unexpected log gap! " + next.getTermIndex() + " vs " + termIndex);
+            }
+            LOGGER.trace("Existing log found from @ {}", next.getTermIndex());
+            //noinspection unchecked
+            return (CompletableRaftLog<T>) next;
         }
 
         LOGGER.trace("Added new log @ {}", termIndex);
