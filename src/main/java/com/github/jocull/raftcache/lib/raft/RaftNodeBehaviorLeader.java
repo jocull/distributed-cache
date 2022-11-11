@@ -203,7 +203,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
 
         LOGGER.info("{} Received append entries from {} for term {} but won't succeed as leader of term {}", self.getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term);
         final TermIndex currentTermIndex = self.logs.getCurrentTermIndex();
-        final AcknowledgeEntries response = new AcknowledgeEntries(appendEntries, term, false, new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
+        final AcknowledgeEntries response = new AcknowledgeEntries(term, false, new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
                 currentTermIndex.getTerm(),
                 currentTermIndex.getIndex()));
 

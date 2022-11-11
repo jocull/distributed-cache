@@ -112,10 +112,7 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
             return;
         }
         if (message instanceof AcknowledgeEntries) {
-            receiverProvider.run(receiver -> {
-                requests.completeRequest((AcknowledgeEntries) message);
-                receiver.onAcknowledgeEntries(this, (AcknowledgeEntries) message);
-            });
+            receiverProvider.run(receiver -> receiver.onAcknowledgeEntries(this, (AcknowledgeEntries) message));
             return;
         }
 
@@ -159,10 +156,8 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     }
 
     @Override
-    public CompletableFuture<AcknowledgeEntries> sendAppendEntries(AppendEntries appendEntries) {
-        final CompletableFuture<AcknowledgeEntries> response = requests.getRequestFuture(appendEntries, AcknowledgeEntries.class);
+    public void sendAppendEntries(AppendEntries appendEntries) {
         send(appendEntries);
-        return response;
     }
 
     @Override

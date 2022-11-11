@@ -127,7 +127,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
                 currentTermIndex.getTerm(), currentTermIndex.getIndex());
         if (appendEntries.getTerm() < term) {
             LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", self.getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term);
-            sender.sendAcknowledgeEntries(new AcknowledgeEntries(appendEntries, term, false, currentTermIndexMessage));
+            sender.sendAcknowledgeEntries(new AcknowledgeEntries(term, false, currentTermIndexMessage));
             return;
         }
 
@@ -136,13 +136,13 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             // TODO: A chance to get stuck here? What happens if indexes get out of sync?
             //       How should we reset? Will the election timeout take care of it?
             LOGGER.warn("{} Received append entries from {} term {} with invalid index: {} vs {}", self.getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), appendEntries.getPreviousLogTermIndex(), self.logs.getCurrentTermIndex());
-            sender.sendAcknowledgeEntries(new AcknowledgeEntries(appendEntries, term, false, currentTermIndexMessage));
+            sender.sendAcknowledgeEntries(new AcknowledgeEntries(term, false, currentTermIndexMessage));
             return;
         }
         if (leaderId != null && !leaderId.equals(sender.getRemoteNodeId())) {
             // TODO: Does this matter...?
             LOGGER.warn("{} Append entries request from {} who is not known leader {}", self.getId(), sender.getRemoteNodeId(), leaderId);
-            sender.sendAcknowledgeEntries(new AcknowledgeEntries(appendEntries, term, false, currentTermIndexMessage));
+            sender.sendAcknowledgeEntries(new AcknowledgeEntries(term, false, currentTermIndexMessage));
             return;
         }
 
@@ -188,7 +188,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
         // Clear the current timeout and register the next one
         scheduleNextElectionTimeout();
-        sender.sendAcknowledgeEntries(new AcknowledgeEntries(appendEntries, term, true, currentTermIndexMessage));
+        sender.sendAcknowledgeEntries(new AcknowledgeEntries(term, true, currentTermIndexMessage));
     }
 
     @Override

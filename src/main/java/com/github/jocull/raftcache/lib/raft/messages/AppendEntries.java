@@ -4,7 +4,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
-public class AppendEntries extends Request {
+public class AppendEntries {
     // Leader's term
     private final int term;
     // Index of log immediately preceding new ones
