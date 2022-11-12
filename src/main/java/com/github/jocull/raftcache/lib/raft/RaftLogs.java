@@ -65,6 +65,8 @@ class RaftLogs {
         return appendLogInternal(new TermIndex(term, currentTermIndex.getIndex() + 1), rawLog);
     }
 
+    // TODO: Profiling shows bad performance in this section.
+    //       Needs to be optimized as it gets much worse as log size grows.
     private <T> CompletableRaftLog<T> appendLogInternal(TermIndex termIndex, T rawLog) {
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
