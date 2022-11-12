@@ -85,6 +85,7 @@ class RaftNodeImpl implements RaftNode {
         // Stopping the node stops any timers and resets the term back to a beginning state
         behavior.close();
         behavior = new RaftNodeBehaviorFollowerInitial(this);
+        nodeExecutor.shutdownNow(); // TODO: MEGA WEIRD!!!
     }
 
     /* package-private-for-test */ List<NodeConnectionOutbound> getActiveConnections() {
