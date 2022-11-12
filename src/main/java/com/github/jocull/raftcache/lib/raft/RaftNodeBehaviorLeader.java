@@ -218,7 +218,13 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             return;
         }
         if (!acknowledgeEntries.isSuccess()) {
-            LOGGER.warn("{} received AcknowledgeEntries without success from {}: {}, {} @ term {}", self.getId(), sender.getRemoteNodeId(), acknowledgeEntries.getTerm(), acknowledgeEntries.getCurrentTermIndex(), acknowledgeEntries.getTerm());
+            LOGGER.warn("{} Received AcknowledgeEntries without success from {}: {}, {} @ term {}", self.getId(), sender.getRemoteNodeId(), acknowledgeEntries.getTerm(), acknowledgeEntries.getCurrentTermIndex(), acknowledgeEntries.getTerm());
+            final TermIndex previous = sender.getTermIndex();
+            sender.setTermIndex(new TermIndex(
+                    acknowledgeEntries.getCurrentTermIndex().getTerm(),
+                    acknowledgeEntries.getCurrentTermIndex().getIndex()
+            ));
+            LOGGER.warn("{} Rewound {}: {} -> {}", self.id, sender.getRemoteNodeId(), previous, sender.getTermIndex());
             return;
         }
 
