@@ -1,5 +1,7 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.event.EventBus;
+import com.github.jocull.raftcache.lib.raft.events.AppendLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,11 +15,15 @@ class RaftLogs {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftLogs.class);
     private static final CompletableRaftLog<?> EPOCH_LOG = new CompletableRaftLog<>(TermIndex.EPOCH, RaftLogs.class);
 
-    private TermIndex currentTermIndex = TermIndex.EPOCH;
-    private TermIndex committedTermIndex = TermIndex.EPOCH;
+    private final EventBus eventBus;
     private final Deque<CompletableRaftLog<?>> logs = new ArrayDeque<>(); // TODO: Is this the right data structure?
 
-    public RaftLogs() {
+    private TermIndex currentTermIndex = TermIndex.EPOCH;
+    private TermIndex committedTermIndex = TermIndex.EPOCH;
+
+    public RaftLogs(EventBus eventBus) {
+        this.eventBus = eventBus;
+
         // Adding the epoch log as a start point simplifies operations checking indexes against a start point
         logs.add(EPOCH_LOG);
     }
@@ -59,17 +65,12 @@ class RaftLogs {
         return appendLogInternal(new TermIndex(term, currentTermIndex.getIndex() + 1), rawLog);
     }
 
+    // TODO: Profiling shows bad performance in this section.
+    //       Needs to be optimized as it gets much worse as log size grows.
     private <T> CompletableRaftLog<T> appendLogInternal(TermIndex termIndex, T rawLog) {
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
             final CompletableRaftLog<?> next = iterator.next();
-            if (next.getTermIndex().compareTo(termIndex) < 0) {
-                continue;
-            }
-            if (!next.getTermIndex().equals(termIndex)) {
-                // Shouldn't ever happen?
-                throw new IllegalStateException("Unexpected log gap! " + next.getTermIndex() + " vs " + termIndex);
-            }
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it.
             if (termIndex.isReplacementOf(next.getTermIndex())) {
@@ -83,11 +84,16 @@ class RaftLogs {
                 LOGGER.debug("Removed {} logs from term {} (instead of {})", count, next.getTermIndex().getTerm(), termIndex);
                 break;
             }
-            if (next.getTermIndex().equals(termIndex)) {
-                LOGGER.trace("Existing log found from @ {}", next.getTermIndex());
-                //noinspection unchecked
-                return (CompletableRaftLog<T>) next;
+            if (next.getTermIndex().compareTo(termIndex) < 0) {
+                continue;
             }
+            if (!next.getTermIndex().equals(termIndex)) {
+                // Shouldn't ever happen?
+                throw new IllegalStateException("Unexpected log gap! " + next.getTermIndex() + " vs " + termIndex);
+            }
+            LOGGER.trace("Existing log found from @ {}", next.getTermIndex());
+            //noinspection unchecked
+            return (CompletableRaftLog<T>) next;
         }
 
         LOGGER.trace("Added new log @ {}", termIndex);
@@ -96,6 +102,7 @@ class RaftLogs {
         if (termIndex.compareTo(currentTermIndex) > 0) {
             currentTermIndex = termIndex;
         }
+        eventBus.publish(new AppendLog(raftLog));
         return raftLog;
     }
 

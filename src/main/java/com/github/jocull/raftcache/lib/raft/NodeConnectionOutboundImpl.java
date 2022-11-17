@@ -6,6 +6,7 @@ import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 
 class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
@@ -13,6 +14,8 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
 
     private String remoteNodeId;
     private TermIndex currentTermIndex = new TermIndex(0, 0L);
+    private Instant lastEntriesSent = Instant.EPOCH;
+    private Instant lastEntriesAcknowledged = Instant.EPOCH;
 
     private final NodeCommunicationReceiverProvider receiverProvider;
     private final ChannelMiddleware.ChannelSide channel;
@@ -49,6 +52,26 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     @Override
     public void setTermIndex(TermIndex termIndex) {
         currentTermIndex = termIndex;
+    }
+
+    @Override
+    public Instant getLastEntriesSent() {
+        return lastEntriesSent;
+    }
+
+    @Override
+    public void setLastEntriesSent(Instant lastEntriesSent) {
+        this.lastEntriesSent = lastEntriesSent;
+    }
+
+    @Override
+    public Instant getLastEntriesAcknowledged() {
+        return lastEntriesAcknowledged;
+    }
+
+    @Override
+    public void setLastEntriesAcknowledged(Instant lastEntriesAcknowledged) {
+        this.lastEntriesAcknowledged = lastEntriesAcknowledged;
     }
 
     // TODO: Initial lazy version, not very maintainable with growing number of message types

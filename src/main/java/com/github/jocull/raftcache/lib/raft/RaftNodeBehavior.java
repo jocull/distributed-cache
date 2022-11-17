@@ -13,7 +13,7 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     final RaftNodeImpl self;
     final NodeStates state;
     final int term;
-    private boolean terminated = false;
+    private volatile boolean terminated = false;
 
     public RaftNodeBehavior(RaftNodeImpl self, NodeStates state, int term) {
         this.self = self;
