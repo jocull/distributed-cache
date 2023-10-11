@@ -9,6 +9,7 @@ package com.github.jocull.raftcache.proto.raft;
  *      - Asking for votes
  *      - Sending out a vote
  * - Needs to understand messages
+ *      - The cluster topology, current term, and index
  *      - Heartbeats, with any new logs
  *      - Vote requests, for a new term
  * - Behavior dictates the messages sent, understood, and dropped
