@@ -196,6 +196,16 @@ public class RaftNodeTest {
                 }
                 return null;
             });
+
+            // The old leader must not survive the partition as a stale leader. After the network is
+            // restored it has heard of the higher term and converted to follower -- or won a fresh
+            // election at a higher term, in which case it again IS the current leader. Staying
+            // LEADER at an overtaken term while another node holds leadership is the bug this
+            // guards against; the previous test could not see it at all.
+            final RaftNode oldLeader = nodes1.leader();
+            assertWithinTimeout("Old leader " + oldLeader.getId() + " never stepped down after network restore -- it must be a follower, or have won a fresh election at a higher term",
+                    5, TimeUnit.SECONDS,
+                    () -> oldLeader.getNodeState().join() != NodeStates.LEADER || getRaftLeader(middleware) == oldLeader);
         }
     }
 
@@ -250,6 +260,13 @@ public class RaftNodeTest {
                 }
                 return null;
             });
+
+            // The old leader must not survive the partition as a stale leader (see the matching
+            // assertion in testElectionWithFailure_oneNode).
+            final RaftNode oldLeader = nodes1.leader();
+            assertWithinTimeout("Old leader " + oldLeader.getId() + " never stepped down after network restore -- it must be a follower, or have won a fresh election at a higher term",
+                    5, TimeUnit.SECONDS,
+                    () -> oldLeader.getNodeState().join() != NodeStates.LEADER || getRaftLeader(middleware) == oldLeader);
         }
     }
 
@@ -639,6 +656,13 @@ public class RaftNodeTest {
                 }
                 return null;
             });
+
+            // The old leader must not survive the partition as a stale leader (see the matching
+            // assertion in testElectionWithFailure_oneNode).
+            final RaftNode oldLeader = nodes1.leader();
+            assertWithinTimeout("Old leader " + oldLeader.getId() + " never stepped down after network restore -- it must be a follower, or have won a fresh election at a higher term",
+                    5, TimeUnit.SECONDS,
+                    () -> oldLeader.getNodeState().join() != NodeStates.LEADER || getRaftLeader(middleware) == oldLeader);
 
             // Transactions sent to the previous leader are unable to hit a majority and will stall until the
             // leader comes back online. When it does, it will rollback and cancel pending requests to it.
