@@ -376,7 +376,7 @@ public class RaftNodeTest {
                     .orElseThrow(() -> new AssertionError("Expected state-machine-key to be present after the bridge caught up"));
             assertEquals("state-machine-key", output.getKey());
             assertEquals("second write", new String(output.getData().get("value"), StandardCharsets.UTF_8), "Applied entry should be the latest committed write");
-            assertTrue(output.getVersion() > 0, "Applied entries should carry a state machine version");
+            assertEquals(2L, output.getVersion(), "Both committed writes should be applied exactly once (no duplicate delivery on the shared bus)");
 
             // Followers should have received the committed entries (their own commit emission
             // re-applied against the shared map without side effects)

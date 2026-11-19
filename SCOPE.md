@@ -146,8 +146,9 @@ Cut (documented here, intentionally **not** fixed by this branch):
 - Added: `lib/data/StateMachineBridgeTest` (6 unit tests: apply, non-data acknowledgment,
   duplicate-delivery skip, out-of-order skip, unrelated events, close/unsubscribe) and
   `RaftNodeTest.testStateMachineApply` (5 integration iterations: 3-node cluster, committed
-  `KeyDataInput` visible in the map, non-data entry acknowledged without blocking later
-  entries, bridge applied index >= last committed index, followers' logs caught up).
+  `KeyDataInput` visible in the map with the latest write and a state-machine version of exactly
+  2 -- both writes applied exactly once on the shared bus, non-data entry acknowledged without
+  blocking later entries, bridge applied index >= last committed index, followers' logs caught up).
 - Result: **163 tests green** (`mvn -B test`), all 152 baseline tests still passing.
   Note: the integration test polls the bridge's applied index rather than asserting it
   immediately -- `RaftLogs.commit()` completes the client future via `completeAsync(commonPool)`
