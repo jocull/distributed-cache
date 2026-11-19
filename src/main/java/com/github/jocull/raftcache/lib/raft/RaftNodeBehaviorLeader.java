@@ -160,7 +160,12 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             if (majorityMinimumIndex.compareTo(self.logs.getCommittedTermIndex()) > 0) {
                 LOGGER.debug("{} Has minimum majority index {} to commit", self.getId(), majorityMinimumIndex);
                 final List<RaftLog<?>> committedLogs = self.logs.commit(majorityMinimumIndex);
+                // Apply-then-acknowledge: publish is synchronous (EventBus#publish), so by the
+                // time we acknowledge the clients below, every state machine subscriber has
+                // already applied these entries. A client therefore never sees its own write
+                // as committed before it has taken effect.
                 self.eventBus.publish(new LogsCommitted(committedLogs));
+                self.logs.notifyCommitted(committedLogs);
             }
         } else {
             LOGGER.debug("{} Not a majority to commit with {} (need {})", self.getId(), currentIndices, majorityCount);

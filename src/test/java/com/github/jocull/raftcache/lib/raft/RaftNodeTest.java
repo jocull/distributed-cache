@@ -360,18 +360,19 @@ public class RaftNodeTest {
                     () -> nodes.leader().submit(secondWrite).get(1, TimeUnit.SECONDS),
                     "Expected leader to commit the second KeyDataInput");
 
-            // The committed entries were published on the shared node bus, so the bridge must
-            // catch up to at least the last committed index. Poll (rather than asserting
-            // directly) because the client future -- completed via completeAsync on the common
-            // pool -- can wake the test thread before the publisher's commit emission reaches
-            // the bridge
-            assertResultWithinTimeout(
-                    "Bridge did not apply all committed logs",
-                    5, TimeUnit.SECONDS,
-                    () -> bridge.getLastAppliedIndex() >= logSecondWrite.getTermIndex().getIndex());
+            // The leader only acknowledges the client after the state machine has synchronously
+            // applied the entry (commit -> publish LogsCommitted -> notifyCommitted), so by the
+            // time the last submit's future returned, the bridge has already applied every entry
+            // up to the last committed index. This assert is deliberately immediate -- it is the
+            // test of the apply-then-acknowledge guarantee, and needing a timeout poll here would
+            // mean the ordering regressed
+            assertTrue(bridge.getLastAppliedIndex() >= logSecondWrite.getTermIndex().getIndex(),
+                    "Bridge applied index " + bridge.getLastAppliedIndex() + " is below the last committed index "
+                            + logSecondWrite.getTermIndex().getIndex()
+                            + " -- commit must only be acknowledged after it has been applied");
 
-            // The bridge has now passed through every committed entry (including the non-data
-            // one), so the latest committed write must be the one visible in the state machine
+            // The bridge has passed through every committed entry (including the non-data one),
+            // so the latest committed write must be the one visible in the state machine
             final KeyDataOutput output = partitionMap.getData("state-machine-key")
                     .orElseThrow(() -> new AssertionError("Expected state-machine-key to be present after the bridge caught up"));
             assertEquals("state-machine-key", output.getKey());

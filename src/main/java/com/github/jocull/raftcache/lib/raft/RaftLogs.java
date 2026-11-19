@@ -138,6 +138,14 @@ class RaftLogs {
         return removed;
     }
 
+    /**
+     * Move the commit index forward and return the newly-committed logs.
+     *
+     * <p>This deliberately does <em>not</em> acknowledge waiting clients: the caller must
+     * apply the entries to the state machine first (i.e. publish {@code LogsCommitted})
+     * and only then call {@link #notifyCommitted(List)}. That ordering is what guarantees
+     * a client cannot observe its own write as acknowledged before it has taken effect.
+     */
     public synchronized List<RaftLog<?>> commit(TermIndex termIndex) {
         if (currentTermIndex.compareTo(termIndex) < 0) {
             throw new IllegalArgumentException("Cannot commit " + termIndex + " when current is " + currentTermIndex);
@@ -152,8 +160,24 @@ class RaftLogs {
         return logs.stream()
                 .filter(r -> r.getTermIndex().compareTo(previousCommitIndex) > 0
                         && r.getTermIndex().compareTo(termIndex) <= 0)
-                .peek(CompletableRaftLog::commit)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Acknowledge the clients that have been waiting on the given committed logs: complete
+     * their futures (on the common pool, as before).
+     *
+     * <p>Must be called <em>after</em> the entries have been applied to the state machine
+     * (after {@code LogsCommitted} has been published), never at the same time as
+     * {@link #commit(TermIndex)}. Logs that have no waiting client (follower-replicated
+     * entries, rollback-cancelled ones) are passed through with no effect.
+     */
+    public synchronized void notifyCommitted(List<RaftLog<?>> committedLogs) {
+        for (RaftLog<?> committedLog : committedLogs) {
+            if (committedLog instanceof CompletableRaftLog) {
+                ((CompletableRaftLog<?>) committedLog).commit();
+            }
+        }
     }
 
     private static class CompletableRaftLog<T> extends RaftLog<T> {

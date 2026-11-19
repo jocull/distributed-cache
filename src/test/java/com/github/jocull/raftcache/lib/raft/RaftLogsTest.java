@@ -118,6 +118,14 @@ public class RaftLogsTest {
 
         final List<RaftLog<?>> commit = raftLogs.commit(new TermIndex(1, 1));
         assertEquals(1, commit.size());
+
+        // commit() alone must NOT acknowledge the client: the caller is expected to apply the
+        // entry to the state machine (publish LogsCommitted) before calling notifyCommitted,
+        // which is what keeps a client from ever observing a read older than its own write
+        assertFalse(log1.isDone(), "commit() moves the commit index but must not complete client futures");
+        assertFalse(futureRan.get(), "no client handler may run before notifyCommitted");
+
+        raftLogs.notifyCommitted(commit);
         log1.get(100, TimeUnit.MILLISECONDS);
         assertTrue(futureRan.get());
         assertNotNull(futureThread.get());

@@ -182,7 +182,11 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
                 appendEntries.getLeaderCommitTermIndex().getIndex());
         if (leaderCommitIndex.compareTo(previousCommitIndex) > 0) {
             final List<RaftLog<?>> committedLogs = self.logs.commit(leaderCommitIndex);
+            // Same apply-then-acknowledge order as the leader path. Follower-replicated
+            // entries carry no client futures today, but the ordering stays uniform so the
+            // guarantee does not depend on which role a node is in.
             self.eventBus.publish(new LogsCommitted(committedLogs));
+            self.logs.notifyCommitted(committedLogs);
             LOGGER.debug("{} Move commit index forward {} -> {} @ term {}", self.getId(), previousCommitIndex, appendEntries.getLeaderCommitTermIndex(), appendEntries.getTerm());
         }
 

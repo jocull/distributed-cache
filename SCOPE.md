@@ -102,6 +102,18 @@ No live shard add/remove; consistent-hash migration does not exist.
 - **Threading.** `EventBus.publish` is synchronous (`EventBus.java:17-19`), so apply runs on the
   publishing node's executor thread — no new threads or executors are introduced, per the
   single-threaded-per-node mailbox model.
+- **Apply-then-acknowledge (behavioral fix).** `RaftLogs.commit()` used to complete the client
+  futures itself (`.peek(CompletableRaftLog::commit)`), *before* the commit site published
+  `LogsCommitted` — so a client could wake from `submit().get()` and immediately read a value
+  older than its own write. `commit()` now only advances the commit index; both commit sites
+  (leader `RaftNodeBehaviorLeader:162-168`, follower `RaftNodeBehaviorFollower:184-190`) follow
+  the order: advance commit index → publish `LogsCommitted` (synchronous apply) →
+  `RaftLogs.notifyCommitted(list)`, which completes the futures. A client's `submit().get()`
+  therefore returns only *after* its entry is applied to the state machine — the standard
+  Raft "commit → apply → reply" ordering (etcd applies before responding as well).
+  `RaftLogsTest.testFutureRaftLogsCommit` locks in the contract (`commit()` alone must not
+  complete the future); `RaftNodeTest.testStateMachineApply` asserts the guarantee
+  deterministically (no timeout polls).
 - **Payload scope.** Only `KeyDataInput` entries are applied (via `PartitionMap.setData`). `RaftLog`
   is generic (`RaftLog.java:5`); any other entry type (e.g. plain strings used by existing tests) is
   skipped. Deletion over Raft is **undefined** in the current command vocabulary — see Decisions.
@@ -150,8 +162,9 @@ Cut (documented here, intentionally **not** fixed by this branch):
   2 -- both writes applied exactly once on the shared bus, non-data entry acknowledged without
   blocking later entries, bridge applied index >= last committed index, followers' logs caught up).
 - Result: **163 tests green** (`mvn -B test`), all 152 baseline tests still passing.
-  Note: the integration test polls the bridge's applied index rather than asserting it
-  immediately -- `RaftLogs.commit()` completes the client future via `completeAsync(commonPool)`
-  before the leader publishes `LogsCommitted`, so the test thread can wake before the bridge
-  has applied the final entry.
+  The apply-then-acknowledge ordering (above) is what lets `testStateMachineApply` assert the
+  bridge index and map state *immediately* after `submit().get()` returns; a flake found during
+  development (client future waking before the bridge applied the final entry) was the symptom
+  that exposed the pre-fix ordering.
+- `RaftLogsTest` is the regression guard for the two-phase commit/acknowledge contract.
 - Existing `testLogReplication*` remain the replication-regression guard.
