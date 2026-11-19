@@ -19,10 +19,20 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
 
         // After the election timeout the follower becomes a candidate and starts a new election term...
         // ...and sends out Request Vote messages to other nodes.
-        final TermIndex lastCommittedLogIndex = self.logs.getCommittedTermIndex();
+        //
+        // Per Raft §5.4.1 the candidate reports the term and index of its LAST log entry.
+        // §5.4.2 (up-to-date rule) says a voter grants its vote iff the candidate's last entry
+        // is at least as up-to-date as the voter's own (higher term, or equal term and higher
+        // or equal index). Report the last entry — NOT the committed index: the committed
+        // index is always at or below the last entry, so the committed-based report would be
+        // strictly more conservative and could refuse votes §5.4.1 permits to a candidate whose
+        // trailing uncommitted entries are all of an OLD term (a liveness deviation in the
+        // split-brain case; never a safety deviation, since committed entries only exist when
+        // a quorum held them, which bounds how far behind it can be).
+        final TermIndex lastLogTermIndex = self.logs.getCurrentTermIndex();
         final VoteRequest voteRequest = new VoteRequest(term, self.getId(), new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
-                lastCommittedLogIndex.getTerm(),
-                lastCommittedLogIndex.getIndex()));
+                lastLogTermIndex.getTerm(),
+                lastLogTermIndex.getIndex()));
 
         LOGGER.info("{} Candidate starting a new election at term {}", self.getId(), term);
         votes.add(self.getId()); // ...votes for itself...

@@ -77,7 +77,9 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         }
 
         // If the receiving node hasn't voted yet in this term then it votes for the candidate...
-        // ...and the node resets its election timeout.
+        // ...and the node resets its election timeout. Per Raft §5.4.2 (up-to-date rule) the
+        // vote is granted only if the candidate's last log entry is at least as up-to-date as
+        // the voter's own: higher or equal term, and on equal term, higher or equal index.
         if (leaderId != null) {
             LOGGER.info("{} Removing current leader {}", self.getId(), leaderId);
             leaderId = null; // Remove the current leader
