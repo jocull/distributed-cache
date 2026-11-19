@@ -159,9 +159,9 @@ Cut (documented here, intentionally **not** fixed by this branch):
    Changing vote behavior is an election-semantics change and was deferred pending an explicit
    decision rather than bundled with the apply loop.
 
-   (Superseded-in-part by the single-node self-election fix below: the candidate now converts to
-   leader as soon as its own vote reaches a majority — a condition that is only *reachable* in a 1-node
-   cluster — without waiting for a vote response.)
+   (In a 1-node cluster the single-node self-election fix above means the candidate converts to
+   leader on its own vote and this rule is never consulted there; it still governs 2+-node
+   elections and remains cut.)
 2. **Snapshots / log compaction** — `InstallSnapshotExample.java` and the `proto/raft/*` package
    (`src/main/java/.../proto/raft/`, including its own sketch test) are design sketches and remain
    as working notes. They are **not build targets** and must not be deleted without sign-off.
