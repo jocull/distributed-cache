@@ -15,8 +15,12 @@
     </parent>
 
     <properties>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
+        <!-- Java 17 is the floor: buildable on any 17+ JDK (17, 21, 22, 25, ...), and the
+             release=17 compiler setting enforces that the code depends only on APIs present
+             in 17, so the bytecode runs unchanged on a 17 runtime. The compiler itself may
+             be any newer JDK installed on the build machine. -->
+        <java.version>17</java.version>
+        <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 

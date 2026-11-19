@@ -4,6 +4,11 @@ Branch `finish` is cut from `rethink` @ `6219424` (identical to `origin/rethink`
 `master` is at `e99b869`, which predates the design-sketch additions in `rethink`.
 Baseline on `finish`: **152 tests green** (`mvn -B test`), including 130 in `RaftNodeTest` and 5 in `RaftLogsTest`.
 
+JVM (this branch): **Java 17 is the floor.** `pom.xml` uses `maven.compiler.release=17`, so the
+build works on any JDK 17 or newer (a newer compiler JDK is fine), but the code is enforced to
+use only APIs that exist in 17 — the produced bytecode (major 61) runs unchanged on a Java 17
+runtime. Previously: Java 11.
+
 This document maps the six development phases in `README.md` to the current state of the code,
 records the decisions taken while finishing phase 2 (the Raft → state-machine apply loop),
 and lists the remaining items as explicit **cut-vs-finish** decisions so nothing is silently dropped.
