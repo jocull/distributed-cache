@@ -218,9 +218,11 @@ which stay the detailed record.
    `DistributedCache` exposes just `put`/`get`. Realizing it needs an explicit delete entry type
    (or an op-tagged entry), a bridge apply path, and a facade `delete()`. As it stands, SET is
    the only write operation in the log; GET is served from local state and is not a log op.
-2. **EXPIRE / TTL** *(deferred; not started)* — README promises "expire data out of the map to a
-   consistent store (synchronously)". Nothing exists: no TTL on entries, no expiration sweeps,
-   no consistent-store sink.
+2. **Spill data out of memory to a consistent (durable) store** *(deferred by the user —
+   "skip it for now, it's for later"; not started)* — README promises "expire data out of the map
+   to a consistent store (synchronously)". **Interpretation clarified by the user**: this means
+   moving data *out of memory onto disk* / a durable consistent store, NOT per-entry TTLs.
+   Nothing exists: no spill/eviction path, no disk sink, no consistency guarantee to the store.
 3. **Fixed cluster topology** *(user-deferred)* — membership is fixed at startup; changing it
    today means taking the cluster down and rolling it over. No join/leave protocol, no joint
    consensus, no member transitions. This also keeps Decisions #3 (`disconnectFrom`) relevant
