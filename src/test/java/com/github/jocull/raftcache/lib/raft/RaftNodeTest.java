@@ -1,5 +1,10 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.communication.KeyDataInput;
+import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
+import com.github.jocull.raftcache.lib.data.PartitionMap;
+import com.github.jocull.raftcache.lib.data.StateMachineBridge;
+import com.github.jocull.raftcache.lib.event.EventBus;
 import com.github.jocull.raftcache.lib.raft.messages.StateResponse;
 import com.github.jocull.raftcache.lib.raft.middleware.PassThruMiddleware;
 import com.github.jocull.raftcache.lib.topology.InMemoryTopologyDiscovery;
@@ -13,6 +18,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -302,6 +308,80 @@ public class RaftNodeTest {
             final RaftLog<Integer> logLast = results.get(futures.size() - 1);
             assertTrue(nodes.followers().stream().allMatch(r -> logLast.getTermIndex().compareTo(r.getCurrentTermIndex().join()) >= 0),
                     "Followers didn't get final log");
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testStateMachineApply(int iteration) {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        final PartitionMap partitionMap = new PartitionMap(new EventBus(), 4);
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware);
+             // In production each node process has its own manager, bus, map, and bridge.
+             // This in-process harness shares one bus across all nodes, so one bridge
+             // (and one map) covers the whole cluster -- which is also what proves the
+             // bridge's idempotency, since every node emits the same committed entries.
+             final StateMachineBridge bridge = new StateMachineBridge(raftManager.getEventBus(), partitionMap)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final ClusterNodes nodes = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+
+            // Non-data log entries must not disturb the state machine, but must not
+            // block later entries either
+            assertDoesNotThrow(
+                    () -> nodes.leader().submit("a plain, non-data entry").get(1, TimeUnit.SECONDS),
+                    "Expected leader to commit the non-data entry");
+
+            final KeyDataInput firstWrite = new KeyDataInput("state-machine-key", Map.of("value", "first write".getBytes(StandardCharsets.UTF_8)));
+            assertDoesNotThrow(
+                    () -> nodes.leader().submit(firstWrite).get(1, TimeUnit.SECONDS),
+                    "Expected leader to commit the first KeyDataInput");
+
+            final KeyDataInput secondWrite = new KeyDataInput("state-machine-key", Map.of("value", "second write".getBytes(StandardCharsets.UTF_8)));
+            final RaftLog<KeyDataInput> logSecondWrite = assertDoesNotThrow(
+                    () -> nodes.leader().submit(secondWrite).get(1, TimeUnit.SECONDS),
+                    "Expected leader to commit the second KeyDataInput");
+
+            // The committed entries were published on the shared node bus, so the bridge must
+            // catch up to at least the last committed index. Poll (rather than asserting
+            // directly) because the client future -- completed via completeAsync on the common
+            // pool -- can wake the test thread before the publisher's commit emission reaches
+            // the bridge
+            assertResultWithinTimeout(
+                    "Bridge did not apply all committed logs",
+                    5, TimeUnit.SECONDS,
+                    () -> bridge.getLastAppliedIndex() >= logSecondWrite.getTermIndex().getIndex());
+
+            // The bridge has now passed through every committed entry (including the non-data
+            // one), so the latest committed write must be the one visible in the state machine
+            final KeyDataOutput output = partitionMap.getData("state-machine-key")
+                    .orElseThrow(() -> new AssertionError("Expected state-machine-key to be present after the bridge caught up"));
+            assertEquals("state-machine-key", output.getKey());
+            assertEquals("second write", new String(output.getData().get("value"), StandardCharsets.UTF_8), "Applied entry should be the latest committed write");
+            assertTrue(output.getVersion() > 0, "Applied entries should carry a state machine version");
+
+            // Followers should have received the committed entries (their own commit emission
+            // re-applied against the shared map without side effects)
+            assertTrue(nodes.followers().stream().allMatch(r -> logSecondWrite.getTermIndex().compareTo(r.getCurrentTermIndex().join()) >= 0),
+                    "Followers didn't receive the committed entries");
         }
     }
 
