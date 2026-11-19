@@ -26,6 +26,24 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
 
         LOGGER.info("{} Candidate starting a new election at term {}", self.getId(), term);
         votes.add(self.getId()); // ...votes for itself...
+
+        if (votes.size() >= self.clusterTopology.getMajorityCount()) {
+            // A node's own vote can only constitute a majority in a one-node cluster
+            // (1 >= 1, but 1 < 2 for any larger cluster). No peer will ever send a vote
+            // response, so without this check the node would loop candidate -> candidate
+            // forever and never serve. Defer the conversion to the mailbox so it runs
+            // after this construction finishes (convertToCandidate is in a nested call
+            // on the same thread when the timeout fires) instead of re-entering mid-construction.
+            LOGGER.info("{} Own vote is a majority ({} of {}) - electing self", self.getId(), votes.size(), self.clusterTopology.getMajorityCount());
+            CompletableFuture.runAsync(() -> {
+                if (isTerminated()) {
+                    return;
+                }
+                self.convertToLeader();
+            }, self.nodeExecutor);
+            return;
+        }
+
         synchronized (self.getActiveConnections()) {
             self.getActiveConnections().forEach(c -> c.sendVoteRequest(voteRequest));
         }

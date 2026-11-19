@@ -30,8 +30,9 @@ Flagged deviations / gaps (see Decisions below):
 | Item | Location |
 |---|---|
 | Candidate votes on committed term/index, not last-log up-to-date (Raft §5.4.2) | `RaftNodeBehaviorCandidate.java:22-25` |
-| Leader's `AppendLog` subscriber is created but **never subscribed** — log push rides the 50 ms heartbeat instead of the `NEW_LOG` event | `RaftNodeBehaviorLeader.java:40-47` (only refs: decl, ctor, `closeInternal:55`) |
-| A 2-node cluster can never commit: majority is computed as `size/2+1` but the leader only counts follower acks | `ClusterTopology.java:34-36`, `RaftNodeBehaviorLeader.updateCommittedIndex:146-168` |
+| ~~Leader's `AppendLog` subscriber was created but **never subscribed**~~ — **fixed in this branch**: subscribed in the leader ctor, so new entries push immediately via the `NEW_LOG` event instead of waiting up to one 50 ms heartbeat | `RaftNodeBehaviorLeader.java` ctor |
+| ~~A 2-node cluster can never commit: majority is computed as `size/2+1` but the leader only counted follower acks~~ — **fixed in this branch**: the leader's own log now counts toward the commit majority | `ClusterTopology.java:34-36`, `RaftNodeBehaviorLeader.updateCommittedIndex` |
+| ~~A 1-node cluster could never elect a leader (and therefore never commit or serve)~~ — **fixed in this branch**: the candidate recognizes its own vote as a majority when it is the only voter | `RaftNodeBehaviorCandidate.java` ctor |
 | No snapshot install / log compaction (Raft §7) | `InstallSnapshotExample.java` is a sketch only |
 | `disconnectFrom` throws `UnsupportedOperationException` | `RaftNodeImpl.java:166-169` |
 
@@ -120,6 +121,35 @@ No live shard add/remove; consistent-hash migration does not exist.
 - **Indices.** `TermIndex.EPOCH = (0, 0)` (`TermIndex.java:6`), so real log indices start at 1 and
   `lastAppliedIndex` starting at 0 is correct.
 
+## Behavior fixes committed in this branch
+
+These are behavioral (not merely additive) changes, made because they were required for
+"working distributed cache" — a one- or two-node cluster was unusable without them.
+
+- **Leader counts its own log toward the commit majority** — `RaftNodeBehaviorLeader.updateCommittedIndex`
+  now seeds the replica-index list with `self.logs.getCurrentTermIndex()` before taking the
+  majority element. Majority = `clusterCount/2 + 1` over the whole cluster (leader included), which
+  is the standard Raft definition. Previously only followers' acks counted, so a 2-node cluster
+  could replicate but never commit, and a 1-node cluster never committed at all. A fresh leader's
+  `INITIAL` call is a no-op: its own index = `EPOCH`, and `EPOCH.compareTo(EPOCH) == 0` fails the
+  strictly-forward check.
+- **Single-node self-election** — `RaftNodeBehaviorCandidate` ctor: after adding its own vote, if
+  that already meets the majority (only possible in a 1-node cluster — for any n ≥ 2 the own vote
+  is 1 < n/2+1), the node is scheduled to convert to leader asynchronously on its `nodeExecutor`
+  and skips the vote-request send / election-timeout scheduling. The async deferral matters: the
+  timeout-driven entry path re-enters the constructor on the same thread, so converting to leader
+  inline would break `RaftNodeImpl.convertToCandidate`'s cast and leave the constructor running on
+  a replaced behavior. Without this, a 1-node cluster looped `candidate → candidate → …` forever
+  and `submit()` (which requires a leader) could never execute.
+- **NEW_LOG subscriber now subscribed** — `RaftNodeBehaviorLeader` ctor subscribes
+  `entriesSubscriber`, so a new entry drives `appendEntries(NEW_LOG)` immediately instead of
+  waiting up to one 50 ms heartbeat. `EventBus.publish` is synchronous on the publisher's thread,
+  so no new executors are introduced. The ack-window gate in `shouldSendNextEntries` is untouched.
+- **Empty-cluster commit shortcut** — in `appendEntries`, if `self.activeConnections.isEmpty()`
+  (a true 1-node cluster; `activeConnections` is append-only until `disconnectFrom` exists), the
+  leader calls `updateCommittedIndex()` directly and skips the heartbeat timer, instead of
+  busy-rescheduling at a 0 ms delay that keeps re-firing against an empty connection list.
+
 ## Decisions — cut-vs-finish
 
 Cut (documented here, intentionally **not** fixed by this branch):
@@ -128,43 +158,51 @@ Cut (documented here, intentionally **not** fixed by this branch):
    *committed* term/index in `VoteRequest`, not the last-entry term/index required by Raft §5.4.2.
    Changing vote behavior is an election-semantics change and was deferred pending an explicit
    decision rather than bundled with the apply loop.
-2. **Dead leader `NEW_LOG` subscriber** — `RaftNodeBehaviorLeader.java:40-47` creates
-   `entriesSubscriber` and unsubscribes it in `closeInternal`, but never subscribes it. Replication
-   still works because the 50 ms heartbeat (`:23`) pushes entries, at the cost of up to one
-   heartbeat of latency per entry. Fixing it properly requires scoping `AppendLog` events per node
-   (the manager bus is shared across nodes — `RaftManager.java:12,30`); deferred as a follow-up.
-3. **2-node clusters never commit** — majority is `size/2+1` (`ClusterTopology.java:34-36`) but the
-   leader's `updateCommittedIndex` (`RaftNodeBehaviorLeader.java:146-168`) only counts followers'
-   acks, not itself. A 2-node cluster can replicate but never commit. Behavioral change; deferred.
-4. **Snapshots / log compaction** — `InstallSnapshotExample.java` and the `proto/raft/*` package
+
+   (Superseded-in-part by the single-node self-election fix below: the candidate now converts to
+   leader as soon as its own vote reaches a majority — a condition that is only *reachable* in a 1-node
+   cluster — without waiting for a vote response.)
+2. **Snapshots / log compaction** — `InstallSnapshotExample.java` and the `proto/raft/*` package
    (`src/main/java/.../proto/raft/`, including its own sketch test) are design sketches and remain
    as working notes. They are **not build targets** and must not be deleted without sign-off.
    `RaftLogs.rollback()` only trims uncommitted logs; committed logs are never compacted.
-5. **`disconnectFrom`** — `RaftNodeImpl.java:166-169` throws `UnsupportedOperationException`;
-   node removal is not part of phase 2.
-6. **`Replica` stub** — `lib/replication/Replica.java:15-19` is an empty `SetDataEvent` subscriber
+3. **`disconnectFrom`** — `RaftNodeImpl.java:166-169` throws `UnsupportedOperationException`;
+   node removal is not part of phase 2. (Consequence: the downed-follower quorum path — a leader
+   with a live follower disconnected — is untestable until this exists; the quorum fix above was
+   verified with 1- and 2-node *up* clusters instead.)
+4. **`Replica` stub** — `lib/replication/Replica.java:15-19` is an empty `SetDataEvent` subscriber
    ("Do something here!"). It represents the *map → replication* direction; the current design
    feeds the map *from* Raft, so this stays a stub.
-7. **Deletion over Raft** — there is no log entry type distinguishing "set" from "delete"
+5. **Deletion over Raft** — there is no log entry type distinguishing "set" from "delete"
    (`KeyDataInput` has no delete flag). The bridge applies `setData` only; a proper delete command
    (e.g. a dedicated `DataDelete` entry) is a follow-up, not guessed semantics.
-8. **`RaftLogs` performance** — `RaftLogs.java:68-69` notes walk-the-deque scaling; out of scope here.
-9. **`Main.java`** — left as the data-layer stress harness; it never had a cluster. Wiring a
+6. **`RaftLogs` performance** — `RaftLogs.java:68-69` notes walk-the-deque scaling; out of scope here.
+7. **`Main.java`** — left as the data-layer stress harness; it never had a cluster. Wiring a
    production-style demo (one process = one manager + one map + one bridge) is a phase 3/4 concern.
 
 ## Test evidence
 
-- Baseline: 152 tests green before changes.
-- Added: `lib/data/StateMachineBridgeTest` (6 unit tests: apply, non-data acknowledgment,
-  duplicate-delivery skip, out-of-order skip, unrelated events, close/unsubscribe) and
-  `RaftNodeTest.testStateMachineApply` (5 integration iterations: 3-node cluster, committed
-  `KeyDataInput` visible in the map with the latest write and a state-machine version of exactly
-  2 -- both writes applied exactly once on the shared bus, non-data entry acknowledged without
-  blocking later entries, bridge applied index >= last committed index, followers' logs caught up).
-- Result: **163 tests green** (`mvn -B test`), all 152 baseline tests still passing.
-  The apply-then-acknowledge ordering (above) is what lets `testStateMachineApply` assert the
-  bridge index and map state *immediately* after `submit().get()` returns; a flake found during
-  development (client future waking before the bridge applied the final entry) was the symptom
-  that exposed the pre-fix ordering.
+Counts are `mvn -B test` totals over the whole module. `RaftNodeTest` is parameterized (5
+iterations per `@ParameterizedTest`), so the test total moves with it.
+
+- Baseline (branch start, before any change): **152 tests green**, incl. 130 `RaftNodeTest`
+  iterations.
+- After the apply loop + hardening (commits `9a15525`, `eece74f`): **163 tests green**, adding
+  `StateMachineBridgeTest` (6) and `RaftNodeTest.testStateMachineApply` (5 iterations).
+- After the behavior fixes (this commit): **173 tests green**, adding two `RaftNodeTest`
+  regression tests × 5 iterations:
+  - `testSingleNodeElectionCommitApply` — a 1-node cluster self-elects a leader, commits a
+    `KeyDataInput` by its own log alone, and the bridge applies it: `submit().get()` returns,
+    `bridge.getLastAppliedIndex()` ≥ the committed index, `PartitionMap` holds the value, and the
+    `DataVersion` is exactly 1 (applied exactly once, no duplicate application).
+  - `testTwoNodeCommitApply` — a 2-node cluster elects a leader, replicates the entry to the
+    follower, and commits it with leader + follower = the quorum of 2; same apply/version
+    assertions, plus the follower's log caught up to the committed index.
+- Result: **173 tests green** (`mvn -B test`), all 152 baseline tests still passing, including
+  the existing `RaftNodeTest` suite now at 145 iterations (130 baseline + 5 apply-loop + 10 new).
+  The apply-then-acknowledge ordering is what lets these assert the bridge index and map state
+  *immediately* after `submit().get()` returns, deterministically (no timeout polls).
 - `RaftLogsTest` is the regression guard for the two-phase commit/acknowledge contract.
+- `testSingleNodeElectionCommitApply` / `testTwoNodeCommitApply` are the regression guards for the
+  single-node election and leader-counts-quorum behavior fixes.
 - Existing `testLogReplication*` remain the replication-regression guard.

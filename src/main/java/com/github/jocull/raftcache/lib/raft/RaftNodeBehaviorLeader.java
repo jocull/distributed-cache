@@ -45,6 +45,7 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                 }
             }
         };
+        self.eventBus.subscribe(entriesSubscriber);
 
         // Send the initial append first thing to declare self as leader
         appendEntries(AppendEntriesTrigger.INITIAL);
@@ -115,6 +116,16 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             c.setLastEntriesSent(Instant.now());
         });
 
+        // A single node has no replicas to sync with: nothing would ever acknowledge the
+        // entries to drive updateCommittedIndex. Its entries are already replicated to the
+        // whole cluster (itself), so commit them directly. Skip the heartbeat timer as well --
+        // with no connections to keep alive the target delay degenerates to an immediate
+        // (busy) reschedule.
+        if (self.activeConnections.isEmpty()) {
+            updateCommittedIndex();
+            return;
+        }
+
         // After appending, reset the next heartbeat
         if (heartbeatTimeout != null && !heartbeatTimeout.isDone()) {
             heartbeatTimeout.cancel(false);
@@ -151,6 +162,14 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                     .sorted(Comparator.reverseOrder())
                     .collect(Collectors.toList());
         }
+
+        // The leader's own log counts as one of the replicas in the quorum: the majority
+        // is n/2+1 over the whole cluster, leader included. Without counting it, a
+        // single-node cluster could never commit (nothing to acknowledge), and neither
+        // could a two-node cluster, or a three-node cluster left with only the leader
+        // and one follower alive.
+        currentIndices.add(self.logs.getCurrentTermIndex());
+        currentIndices.sort(Comparator.reverseOrder());
 
         final int majorityCount = self.clusterTopology.getMajorityCount();
         if (currentIndices.size() >= majorityCount) {

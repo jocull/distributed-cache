@@ -386,6 +386,108 @@ public class RaftNodeTest {
         }
     }
 
+    // A one-node cluster is its own quorum: it must be able to elect itself, commit its
+    // own entries, and apply them. Before the fixes, none of this worked:
+    // - the candidate only converted to leader on an external vote response, so the
+    //   single node looped candidate -> candidate forever
+    // - the leader's updateCommittedIndex only counted follower acknowledgements, so
+    //   with nothing to acknowledge the commit future never completed
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testSingleNodeElectionCommitApply(int iteration) {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        final PartitionMap partitionMap = new PartitionMap(new EventBus(), 4);
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware);
+             final StateMachineBridge bridge = new StateMachineBridge(raftManager.getEventBus(), partitionMap)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress());
+            middleware.addNode(nodeA);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final RaftNode leader = assertResultWithinTimeout("Did not get expected single-node leader", 5, TimeUnit.SECONDS, () -> {
+                final RaftNode result = getRaftLeader(middleware);
+                if (result != null && "nodeA".equals(result.getId())) {
+                    return result;
+                }
+                return null;
+            });
+
+            final KeyDataInput firstWrite = new KeyDataInput("single-node-key", Map.of("value", "lone".getBytes(StandardCharsets.UTF_8)));
+            final RaftLog<KeyDataInput> logFirstWrite = assertDoesNotThrow(
+                    () -> leader.submit(firstWrite).get(5, TimeUnit.SECONDS),
+                    "Expected the single node to commit its own entry (its own log is the quorum)");
+
+            assertTrue(bridge.getLastAppliedIndex() >= logFirstWrite.getTermIndex().getIndex(),
+                    "Bridge applied index " + bridge.getLastAppliedIndex()
+                            + " is below the committed index " + logFirstWrite.getTermIndex().getIndex()
+                            + " -- commit must only be acknowledged after it has been applied");
+
+            final KeyDataOutput output = partitionMap.getData("single-node-key")
+                    .orElseThrow(() -> new AssertionError("Expected single-node-key to be present after the bridge caught up"));
+            assertEquals("single-node-key", output.getKey());
+            assertEquals("lone", new String(output.getData().get("value"), StandardCharsets.UTF_8), "Applied entry should be the committed write");
+            assertEquals(1L, output.getVersion(), "Entry should be applied exactly once");
+        }
+    }
+
+    // A two-node cluster needs 2 votes / 2 replicated copies to commit (majority of 2).
+    // Before the quorum fix, the leader's updateCommittedIndex only counted follower
+    // acknowledgements (1 replica < majority 2), so no entry could ever commit -- the
+    // submit future would hang. This test hangs forever (well, to the join timeout)
+    // without the leader-counting-quorum fix.
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testTwoNodeCommitApply(int iteration) {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        final PartitionMap partitionMap = new PartitionMap(new EventBus(), 4);
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware);
+             final StateMachineBridge bridge = new StateMachineBridge(raftManager.getEventBus(), partitionMap)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final ClusterNodes nodes = assertResultWithinTimeout("Did not get expected leader and follower", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 1) {
+                    return result;
+                }
+                return null;
+            });
+
+            final KeyDataInput firstWrite = new KeyDataInput("two-node-key", Map.of("value", "paired".getBytes(StandardCharsets.UTF_8)));
+            final RaftLog<KeyDataInput> logFirstWrite = assertDoesNotThrow(
+                    () -> nodes.leader().submit(firstWrite).get(5, TimeUnit.SECONDS),
+                    "Expected the two-node cluster to commit (leader + follower = quorum of 2)");
+
+            assertTrue(nodes.followers().stream().allMatch(r -> logFirstWrite.getTermIndex().compareTo(r.getCurrentTermIndex().join()) >= 0),
+                    "Follower didn't receive the committed entry");
+
+            assertTrue(bridge.getLastAppliedIndex() >= logFirstWrite.getTermIndex().getIndex(),
+                    "Bridge applied index " + bridge.getLastAppliedIndex()
+                            + " is below the committed index " + logFirstWrite.getTermIndex().getIndex()
+                            + " -- commit must only be acknowledged after it has been applied");
+
+            final KeyDataOutput output = partitionMap.getData("two-node-key")
+                    .orElseThrow(() -> new AssertionError("Expected two-node-key to be present after the bridge caught up"));
+            assertEquals("two-node-key", output.getKey());
+            assertEquals("paired", new String(output.getData().get("value"), StandardCharsets.UTF_8), "Applied entry should be the committed write");
+            assertEquals(1L, output.getVersion(), "Entry should be applied exactly once");
+        }
+    }
+
     @SuppressWarnings("BusyWait")
     @ParameterizedTest
     @MethodSource("provideIterationsShort")
