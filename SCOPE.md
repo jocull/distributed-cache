@@ -221,19 +221,25 @@ which stay the detailed record.
 2. **Spill data out of memory to a consistent (durable) store** *(deferred by the user —
    "skip it for now, it's for later"; not started)* — README promises "expire data out of the map
    to a consistent store (synchronously)". **Interpretation clarified by the user**: this means
-   moving data *out of memory onto disk* / a durable consistent store, NOT per-entry TTLs.
-   Nothing exists: no spill/eviction path, no disk sink, no consistency guarantee to the store.
-3. **Fixed cluster topology** *(user-deferred)* — membership is fixed at startup; changing it
+   moving data *out of memory onto disk* / a durable consistent store (per-entry TTL is a
+   separate item, see #3). Nothing exists: no spill/eviction path, no disk sink, no
+   consistency guarantee to the store.
+3. **EXPIRE / TTL (per-entry expiration)** *(future work item — "great to have at some
+   point"; not started)* — TTL as its own capability: per-entry TTLs on values, an expiration
+   mechanism (sweep, checked read, or similar), and a replicated `EXPIRE`-style operation so
+   expiration is consistent across the cluster. Nothing exists yet: no TTL field, no sweeps,
+   no log command.
+4. **Fixed cluster topology** *(user-deferred)* — membership is fixed at startup; changing it
    today means taking the cluster down and rolling it over. No join/leave protocol, no joint
    consensus, no member transitions. This also keeps Decisions #3 (`disconnectFrom`) relevant
    until real removal semantics exist.
-4. **Snapshots / log compaction** *(deferred; not started)* — Decisions #2. The originally
+5. **Snapshots / log compaction** *(deferred; not started)* — Decisions #2. The originally
    defined operations will eventually need committed-log compaction before unbounded growth;
    `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see
    Decisions #2).
-5. **Election up-to-date rule** — Decisions #1 (vote on last-entry term/index per Raft §5.4.2,
+6. **Election up-to-date rule** — Decisions #1 (vote on last-entry term/index per Raft §5.4.2,
    not committed term/index).
-6. **Test-hardening: at most one leader per term (item #4 from the hardening list)** *(done
+7. **Test-hardening: at most one leader per term (item #4 from the hardening list)** *(done
    in this pass)* — the harness exposed only the max-term leader
    (`getRaftLeader` = `.filter(LEADER).max(term)`), so two simultaneous LEADER-state nodes at
    the *same* term were unexpressible, and the poll windows accepted any "good" snapshot,
@@ -243,14 +249,14 @@ which stay the detailed record.
    `testElectionWithFailure_oneNode`, `testElectionWithFailure_twoNodes`, and
    `testLogReplicationDuringTermChange`. A leader that is partitioned off and holding an
    **older** term is legal; a second leader at the *same* term is not, even transiently.
-7. **Test-hardening: old-leader step-down (item #3 from the hardening list)** *(done in this
+8. **Test-hardening: old-leader step-down (item #3 from the hardening list)** *(done in this
    pass)* — the failure tests interrupted the old leader, restored the network, and then
    only asserted `leader != null && followers == 2` — they never proved the old leader stepped
    down, so a stale leader that never recovers from its belief would still pass. Fix: capture
    the pre-failure leader; after restore, assert it is no longer LEADER at an overtaken term —
    stepping down to follower is fine, and winning a fresh election at a *higher* term (becoming
    the current leader again) is fine; staying LEADER while another node holds leadership is not.
-8. **Carried from Decisions** — `disconnectFrom` (Decision #3), `Replica` stub (Decision #4),
+9. **Carried from Decisions** — `disconnectFrom` (Decision #3), `Replica` stub (Decision #4),
    `RaftLogs` performance (Decision #6), `Main.java` cluster demo (Decision #7), and the
    phase 3 network transport.
 
