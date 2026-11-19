@@ -205,6 +205,53 @@ Cut (documented here, intentionally **not** fixed by this branch):
 7. **`Main.java`** — left as the data-layer stress harness; it never had a cluster. Wiring a
    production-style demo (one process = one manager + one map + one bridge) is a phase 3/4 concern.
 
+## Follow-ups / backlog
+
+Everything that must not be silently dropped. "Deferred" = user-accepted for now, but must
+exist before this is a production cache. Cross-references point at the Decisions above,
+which stay the detailed record.
+
+1. **DELETE over Raft** *(deferred; a real gap vs. the operations originally defined)* —
+   Decisions #5. Local deletion exists and is tested (`PartitionMap.deleteData` →
+   `KeyMap.deleteEntry`, `DeleteDataEvent`, `PartitionMapTest`), but there is no **replicated**
+   command: `KeyDataInput` carries no delete flag, the bridge applies `KeyDataInput` only, and
+   `DistributedCache` exposes just `put`/`get`. Realizing it needs an explicit delete entry type
+   (or an op-tagged entry), a bridge apply path, and a facade `delete()`. As it stands, SET is
+   the only write operation in the log; GET is served from local state and is not a log op.
+2. **EXPIRE / TTL** *(deferred; not started)* — README promises "expire data out of the map to a
+   consistent store (synchronously)". Nothing exists: no TTL on entries, no expiration sweeps,
+   no consistent-store sink.
+3. **Fixed cluster topology** *(user-deferred)* — membership is fixed at startup; changing it
+   today means taking the cluster down and rolling it over. No join/leave protocol, no joint
+   consensus, no member transitions. This also keeps Decisions #3 (`disconnectFrom`) relevant
+   until real removal semantics exist.
+4. **Snapshots / log compaction** *(deferred; not started)* — Decisions #2. The originally
+   defined operations will eventually need committed-log compaction before unbounded growth;
+   `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see
+   Decisions #2).
+5. **Election up-to-date rule** — Decisions #1 (vote on last-entry term/index per Raft §5.4.2,
+   not committed term/index).
+6. **Test-hardening: at most one leader per term (item #4 from the hardening list)** *(in
+   progress → this pass)* — the harness exposed only the max-term leader
+   (`getRaftLeader` = `.filter(LEADER).max(term)`), so two simultaneous LEADER-state nodes at
+   the *same* term were unexpressible, and the poll windows accepted any "good" snapshot,
+   hiding transient split-brain. Fix: `ClusterNodes` exposes **every** LEADER-state node
+   (`leaders()`), and the at-most-one-leader-per-term invariant is asserted on **every** poll
+   sample (not just accepted ones) in the split/restore windows of
+   `testElectionWithFailure_oneNode`, `testElectionWithFailure_twoNodes`, and
+   `testLogReplicationDuringTermChange`. A leader that is partitioned off and holding an
+   **older** term is legal; a second leader at the *same* term is not, even transiently.
+7. **Test-hardening: old-leader step-down (item #3 from the hardening list)** *(in progress →
+   this pass)* — the failure tests interrupted the old leader, restored the network, and then
+   only asserted `leader != null && followers == 2` — they never proved the old leader stepped
+   down, so a stale leader that never recovers from its belief would still pass. Fix: capture
+   the pre-failure leader; after restore, assert it is no longer LEADER at an overtaken term —
+   stepping down to follower is fine, and winning a fresh election at a *higher* term (becoming
+   the current leader again) is fine; staying LEADER while another node holds leadership is not.
+8. **Carried from Decisions** — `disconnectFrom` (Decision #3), `Replica` stub (Decision #4),
+   `RaftLogs` performance (Decision #6), `Main.java` cluster demo (Decision #7), and the
+   phase 3 network transport.
+
 ## Test evidence
 
 Counts are `mvn -B test` totals over the whole module. `RaftNodeTest` is parameterized (5
