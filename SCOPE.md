@@ -231,8 +231,8 @@ which stay the detailed record.
    Decisions #2).
 5. **Election up-to-date rule** — Decisions #1 (vote on last-entry term/index per Raft §5.4.2,
    not committed term/index).
-6. **Test-hardening: at most one leader per term (item #4 from the hardening list)** *(in
-   progress → this pass)* — the harness exposed only the max-term leader
+6. **Test-hardening: at most one leader per term (item #4 from the hardening list)** *(done
+   in this pass)* — the harness exposed only the max-term leader
    (`getRaftLeader` = `.filter(LEADER).max(term)`), so two simultaneous LEADER-state nodes at
    the *same* term were unexpressible, and the poll windows accepted any "good" snapshot,
    hiding transient split-brain. Fix: `ClusterNodes` exposes **every** LEADER-state node
@@ -241,8 +241,8 @@ which stay the detailed record.
    `testElectionWithFailure_oneNode`, `testElectionWithFailure_twoNodes`, and
    `testLogReplicationDuringTermChange`. A leader that is partitioned off and holding an
    **older** term is legal; a second leader at the *same* term is not, even transiently.
-7. **Test-hardening: old-leader step-down (item #3 from the hardening list)** *(in progress →
-   this pass)* — the failure tests interrupted the old leader, restored the network, and then
+7. **Test-hardening: old-leader step-down (item #3 from the hardening list)** *(done in this
+   pass)* — the failure tests interrupted the old leader, restored the network, and then
    only asserted `leader != null && followers == 2` — they never proved the old leader stepped
    down, so a stale leader that never recovers from its belief would still pass. Fix: capture
    the pre-failure leader; after restore, assert it is no longer LEADER at an overtaken term —
@@ -275,6 +275,23 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
   through a single-node cluster (×5), and the constructor guard. `DistributedCacheTest` is the
   regression guard for the client-facing API: leader routing, plus the read-your-writes ordering
   that lets `get` see the value the moment `put(...).get()` returns (no timeout polls).
+- After the test-hardening pass (commits `01341d8`, `0536a86`): still
+  **184 tests green** (`mvn -B test`), same 145 `RaftNodeTest` iterations — the test *set*
+  did not grow, but the existing failure/term-churn tests now prove two guarantees they
+  previously could not:
+  - **At most one leader per term** — `testElectionWithFailure_oneNode`,
+    `testElectionWithFailure_twoNodes`, and `testLogReplicationDuringTermChange` now assert,
+    on **every poll sample** (~50 ms) of every split/restore window, that no term is ever in
+    LEADER state on two nodes. `ClusterNodes` exposes `leaders()` (all LEADER-state nodes);
+    before, `getRaftLeader` returned only the max-term one, which made a second simultaneous
+    leader invisible. A partitioned old leader still holding an **older** term remains legal;
+    a violation fails on the sample that catches it instead of expiring quietly into the
+    5-second poll timeout.
+  - **Old-leader step-down** — the same three tests capture the pre-failure leader and
+    assert that after the restore it is no longer LEADER at an overtaken term: stepping down
+    to follower is the pass; winning a fresh election at a higher term (becoming the current
+    leader again) is also the pass. A leader that never relents could previously pass these
+    tests, or only fail via the 5-second poll timeout with no message naming the cause.
 - Result: **184 tests green** (`mvn -B test`), all 152 baseline tests still passing, including
   the existing `RaftNodeTest` suite at 145 iterations (130 baseline + 5 apply-loop + 10 new).
   The apply-then-acknowledge ordering is what lets these assert the bridge index and map state
