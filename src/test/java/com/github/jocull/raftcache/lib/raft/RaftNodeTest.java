@@ -167,6 +167,7 @@ public class RaftNodeTest {
             middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -177,6 +178,7 @@ public class RaftNodeTest {
             LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
             middleware.interrupt(nodes1.leader().getNodeAddress());
             final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 1) {
                     return result;
@@ -187,6 +189,7 @@ public class RaftNodeTest {
             LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
             middleware.restore(nodes1.leader().getNodeAddress());
             final ClusterNodes nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -216,6 +219,7 @@ public class RaftNodeTest {
             middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -227,6 +231,7 @@ public class RaftNodeTest {
             middleware.interrupt(nodes1.leader().getNodeAddress());
             middleware.interrupt(nodes1.followers().get(0).getNodeAddress());
             final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and candidates", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.candidates().size() == 2) {
                     return result;
@@ -238,6 +243,7 @@ public class RaftNodeTest {
             middleware.restore(nodes1.leader().getNodeAddress());
             middleware.restore(nodes1.followers().get(0).getNodeAddress());
             final ClusterNodes nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -510,6 +516,7 @@ public class RaftNodeTest {
             middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
 
             final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -589,6 +596,7 @@ public class RaftNodeTest {
             LOGGER.info("===== INTERRUPTING NETWORK: {} =====", nodes1.leader().getId());
             middleware.interrupt(nodes1.leader().getNodeAddress());
             final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 1) {
                     return result;
@@ -624,6 +632,7 @@ public class RaftNodeTest {
             LOGGER.info("===== RESTORING NETWORK: {} =====", nodes1.leader().getId());
             middleware.restore(nodes1.leader().getNodeAddress());
             final ClusterNodes nodes3 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
                 if (result.leader() != null && result.followers().size() == 2) {
                     return result;
@@ -652,12 +661,18 @@ public class RaftNodeTest {
 
     private static ClusterNodes getRaftLeaderAndFollowers(PassThruMiddleware middleware) {
         final RaftNode leader = getRaftLeader(middleware);
+        final List<RaftNode> leaders = getRaftLeaders(middleware);
         final List<RaftNode> followers = getRaftFollowers(middleware);
         final List<RaftNode> candidates = getRaftCandidates(middleware);
         return new ClusterNodes() {
             @Override
             public RaftNode leader() {
                 return leader;
+            }
+
+            @Override
+            public List<RaftNode> leaders() {
+                return leaders;
             }
 
             @Override
@@ -691,8 +706,43 @@ public class RaftNodeTest {
                 .orElse(null);
     }
 
+    private static List<RaftNode> getRaftLeaders(PassThruMiddleware middleware) {
+        final List<RaftNode> leaders = new ArrayList<>();
+        for (final RaftNode node : middleware.getAddressRaftNodeMap().values()) {
+            if (node.getNodeState().join().equals(NodeStates.LEADER)) {
+                leaders.add(node);
+            }
+        }
+        return leaders;
+    }
+
+    // Raft safety (the election-safety guarantee): at most one node may be in LEADER state
+    // within any single term. Two nodes in LEADER state at the same time is only legal when
+    // their terms differ -- e.g. the old leader, partitioned off, that has not yet heard of
+    // the higher term. The violation below (two leaders at one term) is never legal, even
+    // transiently. It is a hard throw so it fails the test on the very sample that sees it,
+    // instead of merely producing one more "unacceptable" poll iteration that expires quietly
+    // into the 5-second timeout.
+    private static void assertAtMostOneLeaderPerTerm(PassThruMiddleware middleware) {
+        final Map<Integer, List<String>> leadersByTerm = new TreeMap<>();
+        for (final RaftNode node : middleware.getAddressRaftNodeMap().values()) {
+            if (node.getNodeState().join().equals(NodeStates.LEADER)) {
+                leadersByTerm.computeIfAbsent(node.getCurrentTermIndex().join().getTerm(), t -> new ArrayList<>())
+                        .add(node.getId());
+            }
+        }
+        leadersByTerm.forEach((term, nodeIds) -> {
+            if (nodeIds.size() > 1) {
+                throw new AssertionError("Split brain: " + nodeIds.size() + " nodes are LEADER at term " + term
+                        + " (" + nodeIds + ") -- at most one leader is allowed per term");
+            }
+        });
+    }
+
     private interface ClusterNodes {
         RaftNode leader();
+
+        List<RaftNode> leaders();
 
         List<RaftNode> candidates();
 
