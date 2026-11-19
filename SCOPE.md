@@ -65,13 +65,33 @@ This branch adds:
 test-oriented with fault injection). No real transport, framing, or serialization of the
 `Request`/`Response` envelope on the wire.
 
-### Phase 4 — Non-partitioned distributed cache — ◐ partial
+### Phase 4 — Non-partitioned distributed cache — ✅ client API done in this branch
 
-The cluster + replicated log + data layer exist in-process, but there is no client API that
-routes reads/writes through the leader, no read-after-commit ordering guarantee exposed to users,
-and `Main.java` does not exercise the cluster. Note: the map is internally partitioned
-(from day one: `PartitionMap(partitionCount)`), so phases 4 and 5 blur — "single shard" effectively
-means "one cluster".
+The cluster + replicated log + data layer existed in-process; this branch adds the client API
+on top:
+
+- `lib/cache/DistributedCache`: `put(key, data)` finds the current leader among the supplied
+  nodes and routes the `KeyDataInput` through `RaftNode#submit`; `get(key)` serves the local
+  `PartitionMap` view. Thanks to apply-then-acknowledge, `put`'s future completes only after
+  the entry is committed by a majority **and** applied to the local state machine — so a `get`
+  immediately after `put` sees the value (read-your-writes, no client-side polling). The cache
+  also wires its own `StateMachineBridge` between the cluster bus and the local map, so a
+  consumer supplies the nodes and the map and gets a working cache with no extra plumbing.
+- End-to-end tests in `lib/cache/DistributedCacheTest`: `put`/`get` through a 3-node cluster
+  and through a single-node cluster (each ×5), asserting immediate visibility and exactly-once
+  application (version checks), plus the empty-node-list constructor guard.
+
+Deliberately not in scope for phase 4 (see Decisions / Phase 3):
+
+- Real network transport (`PassThruMiddleware` is in-memory only) — leader routing in
+  `DistributedCache` is in-process; the supplied nodes must be directly reachable. Routing over
+  a persistent connection follows with phase 3.
+- Deletion over Raft (Decision #5) — the facade has no delete path.
+- `Main.java` cluster demo (Decision #7) and downed-follower quorum validation
+  (Decision #3, blocked on `disconnectFrom`).
+
+Note: the map is internally partitioned (from day one: `PartitionMap(partitionCount)`), so
+phases 4 and 5 blur — "single shard" effectively means "one cluster".
 
 ### Phase 5 — Partitioned cache without repartition — ◐ partial
 
@@ -189,7 +209,7 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
   iterations.
 - After the apply loop + hardening (commits `9a15525`, `eece74f`): **163 tests green**, adding
   `StateMachineBridgeTest` (6) and `RaftNodeTest.testStateMachineApply` (5 iterations).
-- After the behavior fixes (this commit): **173 tests green**, adding two `RaftNodeTest`
+- After the behavior fixes (commit `c8f5b0b`): **173 tests green**, adding two `RaftNodeTest`
   regression tests × 5 iterations:
   - `testSingleNodeElectionCommitApply` — a 1-node cluster self-elects a leader, commits a
     `KeyDataInput` by its own log alone, and the bridge applies it: `submit().get()` returns,
@@ -198,10 +218,16 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
   - `testTwoNodeCommitApply` — a 2-node cluster elects a leader, replicates the entry to the
     follower, and commits it with leader + follower = the quorum of 2; same apply/version
     assertions, plus the follower's log caught up to the committed index.
-- Result: **173 tests green** (`mvn -B test`), all 152 baseline tests still passing, including
-  the existing `RaftNodeTest` suite now at 145 iterations (130 baseline + 5 apply-loop + 10 new).
+- After the phase-4 client facade (commit `a9b103e`): **184 tests green**, adding
+  `DistributedCacheTest` — 11 tests: `put`/`get` through a 3-node cluster (×5), `put`/`get`
+  through a single-node cluster (×5), and the constructor guard. `DistributedCacheTest` is the
+  regression guard for the client-facing API: leader routing, plus the read-your-writes ordering
+  that lets `get` see the value the moment `put(...).get()` returns (no timeout polls).
+- Result: **184 tests green** (`mvn -B test`), all 152 baseline tests still passing, including
+  the existing `RaftNodeTest` suite at 145 iterations (130 baseline + 5 apply-loop + 10 new).
   The apply-then-acknowledge ordering is what lets these assert the bridge index and map state
-  *immediately* after `submit().get()` returns, deterministically (no timeout polls).
+  *immediately* after `submit().get()` / `put(...).get()` returns, deterministically
+  (no timeout polls).
 - `RaftLogsTest` is the regression guard for the two-phase commit/acknowledge contract.
 - `testSingleNodeElectionCommitApply` / `testTwoNodeCommitApply` are the regression guards for the
   single-node election and leader-counts-quorum behavior fixes.
