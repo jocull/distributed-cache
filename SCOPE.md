@@ -34,7 +34,7 @@ Flagged deviations / gaps (see Decisions below):
 
 | Item | Location |
 |---|---|
-| Candidate votes on committed term/index, not last-log up-to-date (Raft §5.4.2) | `RaftNodeBehaviorCandidate.java:22-25` |
+| ~~Candidate votes on committed term/index, not last-log up-to-date (Raft §5.4.2)~~ — **fixed in this branch**: the candidate's `VoteRequest` reports the LAST log entry's term/index (Raft §5.4.1), the vote step-down paths no longer roll back uncommitted tails, and the candidate's vote tally counts granted responses only; guarded by `testUpToDateRuleStaleCandidateLoses` and the liveness discriminator `testUpToDateRuleUncommittedTailLoses` | `RaftNodeBehaviorCandidate.java` ctor, `RaftNodeImpl` vote step-downs, `RaftNodeBehaviorCandidate.onVoteResponse` |
 | ~~Leader's `AppendLog` subscriber was created but **never subscribed**~~ — **fixed in this branch**: subscribed in the leader ctor, so new entries push immediately via the `NEW_LOG` event instead of waiting up to one 50 ms heartbeat | `RaftNodeBehaviorLeader.java` ctor |
 | ~~A 2-node cluster can never commit: majority is computed as `size/2+1` but the leader only counted follower acks~~ — **fixed in this branch**: the leader's own log now counts toward the commit majority | `ClusterTopology.java:34-36`, `RaftNodeBehaviorLeader.updateCommittedIndex` |
 | ~~A 1-node cluster could never elect a leader (and therefore never commit or serve)~~ — **fixed in this branch**: the candidate recognizes its own vote as a majority when it is the only voter | `RaftNodeBehaviorCandidate.java` ctor |
@@ -177,16 +177,30 @@ These are behavioral (not merely additive) changes, made because they were requi
 
 ## Decisions — cut-vs-finish
 
-Cut (documented here, intentionally **not** fixed by this branch):
+Cut (documented here, intentionally **not** fixed by this branch — except #1, which was
+subsequently decided, fixed, and regression-tested):
 
-1. **Candidate log up-to-date election rule** — `RaftNodeBehaviorCandidate.java:22-25` sends the
-   *committed* term/index in `VoteRequest`, not the last-entry term/index required by Raft §5.4.2.
-   Changing vote behavior is an election-semantics change and was deferred pending an explicit
-   decision rather than bundled with the apply loop.
+1. **Candidate log up-to-date election rule** — *(resolved in this branch: commits
+   `6b33a9c`, `2c4dd89`, `1dc88a6`)*. The original cut: `RaftNodeBehaviorCandidate.java:22-25`
+   sent the *committed* term/index in `VoteRequest`, not the last-entry term/index required by
+   Raft §5.4.2. Changing vote behavior is an election-semantics change and was first deferred
+   pending an explicit decision rather than bundled with the apply loop.
 
    (In a 1-node cluster the single-node self-election fix above means the candidate converts to
-   leader on its own vote and this rule is never consulted there; it still governs 2+-node
-   elections and remains cut.)
+   leader on its own vote and this rule is never consulted there; it still governed 2+-node
+   elections.)
+
+   **Resolution.** The candidate now reports its LAST log entry's term/index (Raft §5.4.1), and
+   the voting path that the fix exposed was hardened so the rule is actually honored:
+   `convertToFollowerForVote` no longer rolls back uncommitted tails on the `onVoteRequest`
+   step-down paths, the candidate's vote tally counts granted responses only
+   (`isVoteGranted()` guard in `onVoteResponse`), and `PassThruMiddleware.interrupt`/`restore`
+   are per-node. Since committed entries are a subset of the log, the old committed-based
+   report was strictly more conservative — a liveness deviation, never a safety one.
+   Guarded by `testUpToDateRuleStaleCandidateLoses` (voter-side rule; the test itself is
+   NOT the discriminator, since there committed == last for every voter) and
+   `testUpToDateRuleUncommittedTailLoses` (the liveness discriminator, proven by reverting
+   the candidate to the committed report and watching the split starve — see Test evidence).
 2. **Snapshots / log compaction** — `InstallSnapshotExample.java` and the `proto/raft/*` package
    (`src/main/java/.../proto/raft/`, including its own sketch test) are design sketches and remain
    as working notes. They are **not build targets** and must not be deleted without sign-off.
@@ -237,8 +251,14 @@ which stay the detailed record.
    defined operations will eventually need committed-log compaction before unbounded growth;
    `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see
    Decisions #2).
-6. **Election up-to-date rule** — Decisions #1 (vote on last-entry term/index per Raft §5.4.2,
-   not committed term/index).
+6. **Election up-to-date rule** *(done in this branch)* — Decisions #1. The candidate's
+   `VoteRequest` now reports the last log entry's term/index per Raft §5.4.1 (commit
+   `6b33a9c`), with the voting path fixed so the rule is honored (`2c4dd89`): no rollback on
+   the vote step-down paths, granted-only vote tally, and per-node `interrupt`/`restore`.
+   Pinned by `testUpToDateRuleStaleCandidateLoses` (voter side) and discriminable by
+   `testUpToDateRuleUncommittedTailLoses` — the 7-node liveness proof that the old
+   committed-based report starves the split while the new last-entry report elects the
+   fresh node (commits `2c4dd89`, `1dc88a6`).
 7. **Test-hardening: at most one leader per term (item #4 from the hardening list)** *(done
    in this pass)* — the harness exposed only the max-term leader
    (`getRaftLeader` = `.filter(LEADER).max(term)`), so two simultaneous LEADER-state nodes at
@@ -300,8 +320,41 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
     to follower is the pass; winning a fresh election at a higher term (becoming the current
     leader again) is also the pass. A leader that never relents could previously pass these
     tests, or only fail via the 5-second poll timeout with no message naming the cause.
-- Result: **184 tests green** (`mvn -B test`), all 152 baseline tests still passing, including
-  the existing `RaftNodeTest` suite at 145 iterations (130 baseline + 5 apply-loop + 10 new).
+- After the up-to-date-rule fix (commits `6b33a9c`, `2c4dd89`, `1dc88a6`): the suite grows
+  184 → 189 → 194. The candidate's `VoteRequest` now reports the last log entry's term/index
+  (Raft §5.4.1); the regression pin exposed two voting-path defects fixed the same commit
+  (`2c4dd89`), and a follow-up added the liveness discriminator:
+  - `testUpToDateRuleStaleCandidateLoses` (commit `2c4dd89`, **189 tests green**) — 3 nodes;
+    one stale follower is isolated and lags, then the split leaves {stale, fresh} live; the
+    stale candidate is refused by the up-to-date rule (Raft §5.4.2) and a fresh follower
+    wins, with `assertAtMostOneLeaderPerTerm` on every poll phase. Honest framing: in this
+    test committed == last for every voter, so old and new rules decide every vote
+    identically — it is NOT a discriminator of `6b33a9c`; it pins the observable rule. The
+    same commit fixed the two defects the pin exposed: the vote step-downs were rolling back
+    uncommitted tails *before* the vote decision ran (`convertToFollowerForVote` now omits
+    the rollback at all `onVoteRequest` step-down sites; the explicit step-down paths keep it),
+    and `onVoteResponse` counted ungranted responses toward the majority (granted-only now).
+    `PassThruMiddleware.interrupt`/`restore` also became per-node, so restoring a partition
+    can no longer unseal the other side of a paired channel.
+  - `testUpToDateRuleUncommittedTailLoses` (commit `1dc88a6`, **194 tests green**) — the
+    LIVENESS DISCRIMINATOR of `6b33a9c`: 7 nodes, quorum 4; the two fresh followers hold an
+    *uncommitted* tail (leader + 2 = 3 < 4, so it can never commit), the two stale followers
+    lack it, and the live partition {A, B, C, D} is exactly quorum. New rule: the fresh
+    candidate's last-entry report gets the tie from the other fresh node plus both stale
+    grants → 4 of 7 → the fresh node wins. Old rule (committed report): the fresh candidates
+    cap at 3 of 7 (their own fresh peer refuses `(T, 1)` vs own `(T, 2)`), stale candidates
+    cap at 2 → no candidate can ever reach quorum → the fresh-wins assertion times out.
+    Discrimination was PROVEN, not just argued: with the committed-based report temporarily
+    restored the test fails 5 of 5 with the predicted starvation (the log shows the fresh
+    pair denying `(1, 1)` vs `(1, 2)` across terms 19..27, no election — deterministic); with
+    the fix in place it passes 5 of 5 and the log shows the tie-grant `((T, 2) vs (T, 2))`
+    the old rule refused. Direction is liveness only: committed entries are a subset of last
+    entries, so the old rule is strictly more conservative — it can only deny votes the new
+    rule grants (starvation), never the reverse (no stale-leader safety violation exists to
+    discriminate against).
+- Result: **194 tests green** (`mvn -B test`), all 152 baseline tests still passing, including
+  the existing `RaftNodeTest` suite at 155 iterations (130 baseline + 5 apply-loop + 10 new +
+  5 `testUpToDateRuleStaleCandidateLoses` + 5 `testUpToDateRuleUncommittedTailLoses`).
   The apply-then-acknowledge ordering is what lets these assert the bridge index and map state
   *immediately* after `submit().get()` / `put(...).get()` returns, deterministically
   (no timeout polls).
@@ -309,3 +362,6 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
 - `testSingleNodeElectionCommitApply` / `testTwoNodeCommitApply` are the regression guards for the
   single-node election and leader-counts-quorum behavior fixes.
 - Existing `testLogReplication*` remain the replication-regression guard.
+- `testUpToDateRuleStaleCandidateLoses` / `testUpToDateRuleUncommittedTailLoses` are the
+  regression guards for the up-to-date election rule (`6b33a9c`) and the voting-path fixes
+  (`2c4dd89`); the latter is the proven liveness discriminator of the report fix.
