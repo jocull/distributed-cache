@@ -466,6 +466,215 @@ public class RaftNodeTest {
         }
     }
 
+    // THE LIVENESS DISCRIMINATOR of the election up-to-date rule fix (commit 6b33a9c).
+    //
+    // testUpToDateRuleStaleCandidateLoses above pins the voter-side comparison (grants
+    // the fresh, denies the stale), but at every poll of that test every voter has
+    // committed == last, so the old (committed-entry) and the new (last-entry) candidate
+    // reports agree: it cannot tell the two rules apart. This test can, because the fresh
+    // nodes hold an UNCOMMITTED tail the stale ones lack, and a candidate's two reports
+    // now diverge.
+    //
+    // Shape -- 7 nodes (quorum 4) is the smallest topology in which TWO followers can
+    // hold an uncommitted tail: with a 3-node cluster the leader's own commit of the
+    // tail would quorum (L + 2), and with 5 a single partitioned follower can be the
+    // tail-holder at most, which a stale pair can still outvote on a committed report.
+    // Here leader + 2 fresh = 3 < 4 keeps the tail uncommitted, while the restored
+    // partition {A, B, C, D} is EXACTLY the 4-vote quorum:
+    //
+    //   1. elect a leader L; commit a baseline entry to all seven; nobody diverges yet.
+    //   2. seal C, D (the future stale pair) and X, Y (bystanders): the live partition
+    //      is {L, A, B}. L appends the tail entry and A, B replicate it -- 3 < 4, so it
+    //      can NEVER commit. A and B now have last = (T, 2) but committed = (T, 1).
+    //   3. seal L (zombie leader at term T) and restore C, D, whose logs are stuck at
+    //      (T, 1). The live partition is {A, B, C, D} -- exactly quorum -- and only the
+    //      fresh nodes carry the tail.
+    //
+    // Under the NEW rule (candidate reports its LAST entry, Raft §5.4.1):
+    //   - the fresh candidate reports (T, 2): the other fresh node grants (tie), C and
+    //     D grant (strictly fresher than their (T, 1)) -> 4 of 7 -> elected, at a term
+    //     strictly above T;
+    //   - a stale candidate reports (T, 1): A and B deny, at most one stale grants ->
+    //     2 of 7 -> can never be elected.
+    // Under the OLD rule (candidate reports its COMMITTED entry -- pre-6b33a9c):
+    //   - the fresh candidate reports (T, 1), hiding its tail: the other fresh node
+    //     denies (its own last (T, 2) is fresher), C and D grant -> 3 of 7 < 4;
+    //   - a stale candidate reports (T, 1): A and B deny, at most one stale grants ->
+    //     2 of 7 < 4.
+    //   No candidate at ANY term reaches 4, whichever node times out first: the
+    //   partition starves, and the fresh-wins assertion below times out. That is the
+    //   old code's failure mode, and it is deterministic.
+    //
+    // Direction -- liveness only, never safety. committed ⊆ last (a commit can never
+    // lead the log), so the OLD committed-based rule is strictly more conservative: it
+    // can only deny votes the new last-entry rule grants (the starvation above), and
+    // never the reverse (no stale-leader safety violation exists to discriminate).
+    // Discriminated: OLD-STARVES vs NEW-ELECTS -- the stale-never-leader invariants
+    // below hold under BOTH rules.
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testUpToDateRuleUncommittedTailLoses(int iteration) throws InterruptedException {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
+            final RaftNode nodeD = raftManager.newNode("nodeD", new NodeAddress("addressD"));
+            final RaftNode nodeE = raftManager.newNode("nodeE", new NodeAddress("addressE"));
+            final RaftNode nodeF = raftManager.newNode("nodeF", new NodeAddress("addressF"));
+            final RaftNode nodeG = raftManager.newNode("nodeG", new NodeAddress("addressG"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress())
+                    .addKnownNode(nodeD.getNodeAddress())
+                    .addKnownNode(nodeE.getNodeAddress())
+                    .addKnownNode(nodeF.getNodeAddress())
+                    .addKnownNode(nodeG.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC).addNode(nodeD).addNode(nodeE).addNode(nodeF).addNode(nodeG);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 6) {
+                    return result;
+                }
+                return null;
+            });
+
+            final RaftNode oldLeader = nodes1.leader();
+            final List<RaftNode> followers = nodes1.followers();
+            // Roles below are arbitrary: what matters is that the two "fresh" followers
+            // receive the uncommitted tail while the two "stale" ones do not.
+            final RaftNode freshA = followers.get(0);
+            final RaftNode freshB = followers.get(1);
+            final RaftNode staleC = followers.get(2);
+            final RaftNode staleD = followers.get(3);
+            final RaftNode sealedX = followers.get(4);
+            final RaftNode sealedY = followers.get(5);
+
+            final int oldLeaderTerm = oldLeader.getCurrentTermIndex().join().getTerm();
+            final TermIndex baseline = new TermIndex(oldLeaderTerm, 1);
+            final TermIndex tailEntry = new TermIndex(oldLeaderTerm, 2);
+
+            // Baseline: commit an entry while the whole cluster is live, so EVERY node
+            // (fresh and stale alike) holds the SAME committed position (T, 1) when the
+            // split forms, and the only divergence that ever appears is the uncommitted
+            // tail -- the exact thing the two candidate-report rules disagree on.
+            assertDoesNotThrow(
+                    () -> oldLeader.submit("up-to-date-rule-uncommitted-tail-baseline").get(5, TimeUnit.SECONDS),
+                    "Expected the leader to commit the baseline entry to the whole cluster");
+
+            // Quorum (4 of 7) resolving the commit future does NOT mean all seven hold
+            // the baseline: the AppendEntries to the remaining followers may still be
+            // in flight. Constrain the split to start from a fully converged cluster so
+            // that sealing a node can never strand it before the baseline. Otherwise
+            // a sealed node could legitimately still be at (0, 0), which is a product
+            // of the test's choice of when to seal, not of the scenario under test.
+            assertWithinTimeout("All seven nodes did not converge on the committed baseline before the split", 5, TimeUnit.SECONDS, () ->
+                    Stream.of(oldLeader, freshA, freshB, staleC, staleD, sealedX, sealedY)
+                            .allMatch(n -> n.getCurrentTermIndex().join().compareTo(baseline) >= 0
+                                    && n.getCommittedTermIndex().join().compareTo(baseline) >= 0));
+
+            // Seal the two future stale voters and the two bystanders. The live
+            // partition is now {L, A, B} -- 3 of 7, below the quorum of 4.
+            LOGGER.info("===== INTERRUPTING NETWORK: {} {} (stale pair) and {} {} (sealed bystanders) =====",
+                    staleC.getId(), staleD.getId(), sealedX.getId(), sealedY.getId());
+            middleware.interrupt(staleC.getNodeAddress());
+            middleware.interrupt(staleD.getNodeAddress());
+            middleware.interrupt(sealedX.getNodeAddress());
+            middleware.interrupt(sealedY.getNodeAddress());
+
+            // The tail entry. The commit future NEVER resolves (L + A + B = 3 < quorum 4),
+            // so it must not be awaited -- the test drives itself off the voters' log
+            // positions instead: the tail reaches the two fresh followers' CURRENT logs
+            // but can never commit. This is the premise the old committed-based rule
+            // hides (a fresh candidate would report committed (T, 1)) and the new
+            // last-entry rule does not (it reports last (T, 2)).
+            oldLeader.submit("up-to-date-rule-uncommitted-tail");
+
+            LOGGER.info("===== WAITING for the uncommitted tail on the fresh pair only =====");
+            assertWithinTimeout("Fresh followers did not hold the uncommitted tail while the stale pair stayed at the baseline", 5, TimeUnit.SECONDS, () -> {
+                final boolean tailHeldUncommitted = tailEntry.equals(freshA.getCurrentTermIndex().join())
+                        && tailEntry.equals(freshB.getCurrentTermIndex().join())
+                        && baseline.equals(freshA.getCommittedTermIndex().join())
+                        && baseline.equals(freshB.getCommittedTermIndex().join());
+                return tailHeldUncommitted;
+            });
+
+            // Zombie the old leader and restore the stale pair into the live partition
+            // WHILE IT STILL LAGS: the live partition is {A, B, C, D} = exactly the
+            // 4-vote quorum, and only A and B carry entry 2. The old leader remains a
+            // (stale) LEADER at term T; the per-term assertion tolerates it.
+            LOGGER.info("===== INTERRUPTING NETWORK: {} (old leader -> zombie) =====", oldLeader.getId());
+            middleware.interrupt(oldLeader.getNodeAddress());
+            LOGGER.info("===== RESTORING {} {} (stale pair into the live quorum, still lagging) =====", staleC.getId(), staleD.getId());
+            middleware.restore(staleC.getNodeAddress());
+            middleware.restore(staleD.getNodeAddress());
+
+            // The fresh node must win, at a term strictly higher than the old leader's.
+            // NEW rule: the fresh candidate's (T, 2) last-entry report is granted by the
+            // other fresh node (tie) and by both stale nodes -> 4 of 7. OLD rule: the
+            // same candidate reports its committed (T, 1): the other fresh node DENIES
+            // (its own last (T, 2) is fresher), the stale pair grants -> 3 of 7; and a
+            // stale candidate reaches at most 2 of 7. No term ever elects: the assert
+            // below times out -- that timeout is precisely the pre-6b33a9c starvation.
+            final RaftNode newLeader = assertResultWithinTimeout(
+                    "A fresh follower (" + freshA.getId() + " or " + freshB.getId() + ") did not win the split-brain election -- under the pre-fix committed-based report the fresh candidates cap at 3 of 7 and the stale candidates at 2 of 7, so the partition starves and elects NO LEADER at any term",
+                    5, TimeUnit.SECONDS, () -> {
+                        assertAtMostOneLeaderPerTerm(middleware);
+                        final RaftNode leader = getRaftLeader(middleware);
+                        if (leader == null
+                                || !(leader.equals(freshA) || leader.equals(freshB))) {
+                            return null;
+                        }
+                        if (leader.getCurrentTermIndex().join().getTerm() <= oldLeaderTerm) {
+                            return null;
+                        }
+                        if (NodeStates.LEADER.equals(staleC.getNodeState().join())
+                                || NodeStates.LEADER.equals(staleD.getNodeState().join())) {
+                            throw new AssertionError("Stale follower (" + staleC.getId() + " or " + staleD.getId() + ") is LEADER -- it lags the fresh followers on the up-to-date rule and must never win");
+                        }
+                        return leader;
+                    });
+
+            // Let the split run a few election windows: the stale pair must never appear
+            // as leaders, the fresh loser must hold its (higher-term) leadership, and
+            // never may two leaders coexist within one term.
+            LOGGER.info("===== HOLDING SPLIT: verifying the stale pair never becomes leader =====");
+            assertWithinTimeout("Stale pair never confirmed as non-leaders across the split window", 2, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
+                return !NodeStates.LEADER.equals(staleC.getNodeState().join())
+                        && !NodeStates.LEADER.equals(staleD.getNodeState().join())
+                        && NodeStates.LEADER.equals(newLeader.getNodeState().join());
+            });
+
+            // The uncommitted tail must SURVIVE the election and become committed: the
+            // fresh winner's tail is strictly fresher than the stale pair's log, so no
+            // rollback exists; the winner replicates (T, 2) to the stale pair, and the
+            // live quorum -- now including them -- commits it. Every node of the live
+            // partition must agree on the committed tail.
+            LOGGER.info("===== CONVERGING: the uncommitted tail must be committed by the winning partition =====");
+            assertWithinTimeout("The uncommitted tail was not committed by the winning partition", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
+                return Stream.of(freshA, freshB, staleC, staleD).allMatch(
+                        n -> n.getCommittedTermIndex().join().compareTo(tailEntry) >= 0);
+            });
+
+            // The sealed bystanders and the zombie leader advanced nothing: they never
+            // rejoined a live quorum, and the zombie, isolated at the old term, could
+            // not have committed past the baseline.
+            assertEquals(baseline, sealedX.getCommittedTermIndex().join(), "Sealed bystander must not have advanced its committed index");
+            assertEquals(baseline, sealedY.getCommittedTermIndex().join(), "Sealed bystander must not have advanced its committed index");
+            assertEquals(baseline, oldLeader.getCommittedTermIndex().join(), "Zombie leader must not have committed past the baseline while isolated");
+        }
+    }
+
     @ParameterizedTest
     @MethodSource("provideIterationsShort")
     void testLogReplication(int iteration) {
