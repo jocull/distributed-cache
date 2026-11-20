@@ -56,23 +56,28 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
         }
     }
 
+    // Isolation is per-NODE, not per-PAIR. A "side" belongs to the node whose RaftNode
+    // it wraps; send() checks the SENDER's own side and receive() checks the RECEIVER's
+    // own side, so a message crosses a pair only while NEITHER endpoint is down. Hence
+    // "seal a node" must flip ONLY that node's own side on every pair it touches, and
+    // never a neighbour's side.
+    //
+    // The pre-fix code ran Pair.interrupt()/Pair.restore(), which set/cleared BOTH sides
+    // of a pair. That meant restoring node X silently cleared the still-sealed side of a
+    // neighbour Y sharing the pair, re-opening the link even though Y was isolated. The
+    // (zombie) leader could then resume retransmitting and re-feed the very node a test
+    // had isolated, defeating partition-based regression pins (Decision #1). Interrupting
+    // a node still closes every link touching it in both directions; only the spurious
+    // cross-node side flip on restore is gone.
     public void interrupt(NodeAddress nodeAddress) {
         synchronized (connections) {
-            connections.forEach(c -> {
-                if (c.left.getAddress().equals(nodeAddress) || c.right.getAddress().equals(nodeAddress)) {
-                    c.interrupt();
-                }
-            });
+            connections.forEach(c -> c.interruptFor(nodeAddress));
         }
     }
 
     public void restore(NodeAddress nodeAddress) {
         synchronized (connections) {
-            connections.forEach(c -> {
-                if (c.left.getAddress().equals(nodeAddress) || c.right.getAddress().equals(nodeAddress)) {
-                    c.restore();
-                }
-            });
+            connections.forEach(c -> c.restoreFor(nodeAddress));
         }
     }
 
@@ -104,14 +109,14 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
             right.paired = left;
         }
 
-        public void interrupt() {
-            left.interrupted = true;
-            right.interrupted = true;
+        public void interruptFor(NodeAddress nodeAddress) {
+            left.interruptFor(nodeAddress);
+            right.interruptFor(nodeAddress);
         }
 
-        public void restore() {
-            left.interrupted = false;
-            right.interrupted = false;
+        public void restoreFor(NodeAddress nodeAddress) {
+            left.restoreFor(nodeAddress);
+            right.restoreFor(nodeAddress);
         }
 
         @Override
@@ -133,6 +138,25 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
 
         private PassThruChannelSide(RaftNode raftNode) {
             this.raftNode = raftNode;
+        }
+
+        // The node THIS side belongs to (the local endpoint). Distinct from the
+        // ChannelSide#getAddress() contract, which reports the PAIRED (remote) node --
+        // that contract is relied on by NodeConnectionOutboundImpl and must not change.
+        private NodeAddress ownAddress() {
+            return raftNode.getNodeAddress();
+        }
+
+        private void interruptFor(NodeAddress nodeAddress) {
+            if (ownAddress().equals(nodeAddress)) {
+                interrupted = true;
+            }
+        }
+
+        private void restoreFor(NodeAddress nodeAddress) {
+            if (ownAddress().equals(nodeAddress)) {
+                interrupted = false;
+            }
         }
 
         @Override

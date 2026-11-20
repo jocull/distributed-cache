@@ -270,6 +270,202 @@ public class RaftNodeTest {
         }
     }
 
+    // Regression pin for the election "up-to-date" rule (Raft §5.4.1 / §5.4.2, Decision
+    // #1 in SCOPE.md): a voter grants its vote only if the candidate's LAST log entry is
+    // at least as recent as the voter's own -- entry term first, then index
+    // (RaftNodeBehaviorFollower.onVoteRequest against RaftLogs.getCurrentTermIndex).
+    //
+    // PassThruMiddleware.interrupt(node) severs every channel touching that node, so a
+    // node is either fully inside the live partition or an isolated singleton: it cannot
+    // lag while staying reachable to the other voters. The reachable form of that
+    // scenario -- the window this rule exists to police -- is a stale node REJOINING the
+    // live quorum before it has caught up:
+    //
+    //   1. 3 nodes (quorum 2): elect a leader L; commit a baseline entry to all three.
+    //   2. isolate a follower S; L commits entry E with the live pair {L, fresh F}.
+    //      S now strictly lags F (and L) on every measure: last AND committed.
+    //   3. isolate L too: it remains a (stale) LEADER of its own one-node partition at
+    //      the old term, which the per-term leadership assertion tolerates.
+    //   4. restore S into the live quorum {S, F} WHILE IT STILL LAGS.
+    //
+    // From there the outcome is deterministic, whichever of S or F times out first:
+    //   - S's VoteRequests fail the last-entry comparison at F (S strictly lags), so S
+    //     can never collect the 2-vote quorum -- it has only its own vote, ever;
+    //   - F outranks S on log recency, so F always collects {F, S} and wins, at a term
+    //     strictly higher than L's.
+    //
+    // OLD VS NEW RULE -- honest framing. The fix (commit 6b33a9c) changed the
+    // candidate's VoteRequest to carry the log's LAST entry (Raft §5.4.1) instead of
+    // its committed entry. committed ⊆ last (a commit can never lead the log), so the
+    // old committed-based rule is strictly MORE conservative: it can deny a vote the
+    // new last-entry rule grants (a liveness deviation in the old code), and never the
+    // reverse (a safety violation). At vote time here every voter has committed ==
+    // last, so BOTH rules elect the same winner: this test is a PIN of the rule's
+    // observable behavior, not a discriminator between the two rules. The
+    // uncommitted-tail consequence (a longer, lower-term tail must be rolled back once
+    // the higher-term leader wins) is pinned by testUpToDateRuleUncommittedTailLoses
+    // below.
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testUpToDateRuleStaleCandidateLoses(int iteration) throws InterruptedException {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final ClusterNodes nodes1 = assertResultWithinTimeout("Did not get expected leaders and followers", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 2) {
+                    return result;
+                }
+                return null;
+            });
+
+            final RaftNode oldLeader = nodes1.leader();
+            final RaftNode staleFollower = nodes1.followers().get(0);
+            final RaftNode freshFollower = nodes1.followers().get(1);
+
+            // Baseline: commit an entry while the cluster is whole, so the stale and
+            // fresh followers hold the SAME last entry when the split forms and the
+            // later divergence is purely the partition's doing. This makes the
+            // up-to-date comparison at vote time a tie on last-entry TERM resolved by
+            // the index (Raft §5.4.2 tie-break), rather than a trivial 0-vs-1 term
+            // mismatch that an empty-log node would produce.
+            assertDoesNotThrow(
+                    () -> oldLeader.submit("up-to-date-rule-baseline").get(5, TimeUnit.SECONDS),
+                    "Expected the leader to commit the baseline entry to all three nodes");
+
+            // Isolate one follower so it misses the next committed entry -- it becomes the
+            // stale candidate of the partition.
+            LOGGER.info("===== INTERRUPTING NETWORK: {} (stale follower) =====", staleFollower.getId());
+            middleware.interrupt(staleFollower.getNodeAddress());
+
+            // Commit an entry quorum of 2 (oldLeader + freshFollower). After this, the stale
+            // follower strictly lags BOTH on current AND committed log -- the up-to-date
+            // comparison is a pure log-position test from here on.
+            final RaftLog<String> committedEntry = assertDoesNotThrow(
+                    () -> oldLeader.submit("up-to-date-rule-pin").get(5, TimeUnit.SECONDS),
+                    "Expected the leader to commit while the stale follower was isolated");
+
+            // Now isolate the leader too. It remains a (stale) LEADER of its own one-node
+            // partition at its old term; the per-term leadership assertion tolerates that
+            // zombie because it lives at the old term, and while isolated it cannot
+            // affect any vote.
+            LOGGER.info("===== INTERRUPTING NETWORK: {} (old leader) =====", oldLeader.getId());
+            middleware.interrupt(oldLeader.getNodeAddress());
+
+            // Bring the stale follower back into the live partition WHILE IT STILL LAGS:
+            // the live partition is now {stale, fresh} -- exactly the 2-of-3 quorum --
+            // and the stale node has not caught up. interrupt() severs EVERY channel
+            // touching a node, so a lagging voter cannot stay reachable to its other
+            // voters: this reachable form, a stale node rejoining ahead of its catch-up,
+            // IS the window the up-to-date rule exists to police.
+            LOGGER.info("===== RESTORING {} (stale follower, still lagging) -- election window on the {stale, fresh} partition =====", staleFollower.getId());
+            middleware.restore(staleFollower.getNodeAddress());
+
+            // Deterministic outcome for the {stale, fresh} partition, whichever of the two
+            // times out first:
+            //  - stale CANNOT win: every VoteRequest it sends fails the up-to-date
+            //    comparison at the fresh voter (stale strictly lags on the last entry:
+            //    same entry term, LOWER index -- the §5.4.2 tie-break), and it holds only
+            //    its own vote, never the 2-vote quorum;
+            //  - fresh ALWAYS wins: its self-vote plus the stale voter's (granted on log
+            //    recency) IS the quorum, and a term race between them can only ever
+            //    resolve in favour of the fresh candidate, since stale can never
+            //    outvote it.
+            // The split must therefore settle as freshFollower LEADER at a term strictly
+            // higher than the old leader's, with the stale follower never in LEADER
+            // state at any sample.
+            final int oldLeaderTerm = oldLeader.getCurrentTermIndex().join().getTerm();
+            assertResultWithinTimeout("Fresh follower " + freshFollower.getId() + " did not win the split election", 5, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
+                if (!NodeStates.LEADER.equals(freshFollower.getNodeState().join())) {
+                    return null;
+                }
+                final RaftNode leader = getRaftLeader(middleware);
+                if (leader == null || leader.getId().equals(oldLeader.getId())) {
+                    return null;
+                }
+                if (freshFollower.getCurrentTermIndex().join().getTerm() <= oldLeaderTerm) {
+                    return null;
+                }
+                if (NodeStates.LEADER.equals(staleFollower.getNodeState().join())) {
+                    throw new AssertionError("Stale follower " + staleFollower.getId() + " won the split election -- it lags the fresh follower on the up-to-date rule and must never win");
+                }
+                return freshFollower;
+            });
+
+            // Let the split run a few election windows: the stale follower must never
+            // appear as a leader, and never may two leaders coexist within one term.
+            LOGGER.info("===== HOLDING SPLIT: verifying stale follower never becomes leader =====");
+            assertWithinTimeout("Stale follower " + staleFollower.getId() + " never confirmed as non-leader across the split window", 2, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
+                return !NodeStates.LEADER.equals(staleFollower.getNodeState().join())
+                        && NodeStates.LEADER.equals(freshFollower.getNodeState().join());
+            });
+
+            // Restore ONLY the zombie leader (the stale follower is already in the live
+            // partition, following the new leader). The old leader carries the SAME log
+            // as the new leader -- it had replicated the entry it committed before the
+            // partition -- so no truncation is needed: it must simply hear the higher
+            // term, step down to follower, and agree on the committed position.
+            LOGGER.info("===== RESTORING NETWORK: {} (zombie leader) =====", oldLeader.getId());
+            middleware.restore(oldLeader.getNodeAddress());
+
+            // Re-converged cluster: exactly one leader plus two followers, and every node
+            // agrees on the CURRENT and COMMITTED log position. (The leader may be
+            // freshFollower or a node that won a fresh election after the restore -- what
+            // must hold is a single leader and identical logs everywhere.)
+            final ClusterNodes settled = assertResultWithinTimeout("Cluster did not converge to a single leader with identical committed state after network restore", 10, TimeUnit.SECONDS, () -> {
+                assertAtMostOneLeaderPerTerm(middleware);
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() == null || result.followers().size() != 2) {
+                    return null;
+                }
+                if (!middleware.getAddressRaftNodeMap().values().stream()
+                        .allMatch(r -> r.getCurrentTermIndex().join().equals(result.leader().getCurrentTermIndex().join()))) {
+                    return null;
+                }
+                if (!middleware.getAddressRaftNodeMap().values().stream()
+                        .allMatch(r -> r.getCommittedTermIndex().join().equals(result.leader().getCommittedTermIndex().join()))) {
+                    return null;
+                }
+                // The committed entry must be part of every node's committed log
+                if (committedEntry.getTermIndex().compareTo(result.leader().getCommittedTermIndex().join()) > 0) {
+                    return null;
+                }
+                return result;
+            });
+            final TermIndex unifiedCurrent = settled.leader().getCurrentTermIndex().join();
+            final TermIndex unifiedCommitted = settled.leader().getCommittedTermIndex().join();
+
+            // The old leader must not survive as a stale leader: it heard of the higher term
+            // and converted to follower -- or won a fresh election at a higher term.
+            assertWithinTimeout("Old leader " + oldLeader.getId() + " never stepped down after network restore -- it must be a follower, or have won a fresh election at a higher term",
+                    5, TimeUnit.SECONDS,
+                    () -> oldLeader.getNodeState().join() != NodeStates.LEADER || getRaftLeader(middleware) == oldLeader);
+
+            // The stale follower must have caught up: its current log includes the entry
+            // it was isolated from, and its committed position matches the cluster's
+            assertEquals(unifiedCurrent, staleFollower.getCurrentTermIndex().join(),
+                    "Stale follower did not catch up after restore");
+            assertEquals(unifiedCommitted, staleFollower.getCommittedTermIndex().join(),
+                    "Stale follower's committed position did not converge after restore");
+        }
+    }
+
     @ParameterizedTest
     @MethodSource("provideIterationsShort")
     void testLogReplication(int iteration) {

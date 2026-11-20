@@ -94,7 +94,10 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
     public void onVoteRequest(NodeConnectionOutbound sender, VoteRequest voteRequest) {
         if (voteRequest.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), sender.getRemoteNodeId(), voteRequest.getTerm());
-            self.convertToFollower(voteRequest.getTerm(), f -> {
+            // Voting advances the term but must NOT roll back the log: the up-to-date rule
+            // (Raft §5.4.1) compares the candidate's last entry against our CURRENT log,
+            // unmutated. See RaftNodeImpl.convertToFollowerForVote.
+            self.convertToFollowerForVote(voteRequest.getTerm(), f -> {
                 f.onVoteRequest(sender, voteRequest);
                 return null;
             });
@@ -113,6 +116,14 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
         }
         if (voteResponse.getTerm() < term) {
             LOGGER.warn("{} Received vote response from {} for term {} and will ignore because term is {}", self.getId(), sender.getRemoteNodeId(), voteResponse.getTerm(), term);
+            return;
+        }
+
+        if (!voteResponse.isVoteGranted()) {
+            // The voter evaluated the up-to-date rule (Raft §5.4.2) against its own log and
+            // refused the vote. Counting the response nonetheless would let a stale candidate
+            // reach a majority out of denials and step up as leader.
+            LOGGER.info("{} Received vote response from {} for term {} but the vote was not granted - not counting", self.getId(), sender.getRemoteNodeId(), voteResponse.getTerm());
             return;
         }
 

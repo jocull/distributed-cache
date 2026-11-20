@@ -195,7 +195,10 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     public void onVoteRequest(NodeConnectionOutbound sender, VoteRequest voteRequest) {
         if (voteRequest.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), sender.getRemoteNodeId(), voteRequest.getTerm());
-            self.convertToFollower(voteRequest.getTerm(), f -> {
+            // Voting advances the term but must NOT roll back the log: the up-to-date rule
+            // (Raft §5.4.1) compares the candidate's last entry against our CURRENT log,
+            // unmutated. See RaftNodeImpl.convertToFollowerForVote.
+            self.convertToFollowerForVote(voteRequest.getTerm(), f -> {
                 f.onVoteRequest(sender, voteRequest);
                 return null;
             });

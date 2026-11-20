@@ -181,6 +181,21 @@ class RaftNodeImpl implements RaftNode {
         return fnActionWithLock.apply((RaftNodeBehaviorFollower) behavior); // Do this action while the lock is held!
     }
 
+    /**
+     * Convert to a follower to vote on an incoming VoteRequest: the term advances but the log
+     * is deliberately NOT rolled back. A VoteRequest carries no log contents, and per Raft
+     * §5.4.1 the up-to-date rule must be evaluated against the voter's CURRENT (unmutated)
+     * log: a rollback here would discard the voter's uncommitted tail (e.g. entries
+     * replicated but not yet committed at partition time), turning a strictly-later log into
+     * a tie and letting a stale candidate's vote be granted. This matches convertToCandidate,
+     * which already omits the rollback for the same reason.
+     */
+    <TOut> TOut convertToFollowerForVote(int newTerm, Function<RaftNodeBehaviorFollower, TOut> fnActionWithLock) {
+        behavior.close();
+        behavior = new RaftNodeBehaviorFollower(this, newTerm);
+        return fnActionWithLock.apply((RaftNodeBehaviorFollower) behavior); // Do this action while the lock is held!
+    }
+
     RaftNodeBehaviorFollower convertToFollowerForNewLeader(String remoteNodeId, AppendEntries appendEntries) {
         behavior.close();
         final int oldTerm = behavior.term;
