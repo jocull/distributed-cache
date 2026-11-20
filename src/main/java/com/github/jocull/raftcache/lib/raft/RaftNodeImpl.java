@@ -94,6 +94,10 @@ class RaftNodeImpl implements RaftNode {
         }
     }
 
+    /* package-private-for-test */ NodeCommunicationReceiver currentReceiver() {
+        return behavior;
+    }
+
     @Deprecated // TODO: this should be consolidated somewhere else
     private void rollback(int oldTerm, int newTerm) {
         final TermIndex previousIndex = logs.getCurrentTermIndex();

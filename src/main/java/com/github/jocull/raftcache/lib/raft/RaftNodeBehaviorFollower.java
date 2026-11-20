@@ -93,9 +93,18 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         final TermIndex incomingTermIndex = new TermIndex(
                 voteRequest.getLastLogTermIndex().getTerm(), voteRequest.getLastLogTermIndex().getIndex());
         final boolean grantVote = incomingTermIndex.compareTo(currentIndex) >= 0;
-        votedForNodeId = grantVote ? sender.getRemoteNodeId() : self.getId(); // Vote for self instead
-        LOGGER.info("{} Voting in term {} for {} w/ grant {} (index {} vs {})", self.getId(), term,
-                votedForNodeId, grantVote, voteRequest.getLastLogTermIndex(), currentIndex);
+        // Grant at most one vote per term, but record votedForNodeId ONLY on a grant (Raft §5.4.1).
+        // A denial must not burn the node's single vote: leaving votedForNodeId null lets a more
+        // up-to-date candidate that arrives later in the same term still be granted. The old "vote
+        // for self instead" behaviour made a node that saw a stale candidate first also refuse the
+        // freshest candidate, which could cost an entire empty term to elect the freshest node.
+        // votedForNodeId is guaranteed null here — the guard above returns when it is non-null in
+        // the same term, so a node that already granted its vote cannot reach this point.
+        if (grantVote) {
+            votedForNodeId = sender.getRemoteNodeId();
+        }
+        LOGGER.info("{} vote term {} for {}: grant={} (candidate {} vs own log {})", self.getId(), term,
+                sender.getRemoteNodeId(), grantVote, voteRequest.getLastLogTermIndex(), currentIndex);
         // Voting resets the election timeout to let the voting process settle
         scheduleNextElectionTimeout();
 
