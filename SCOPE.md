@@ -41,7 +41,7 @@ to done (with commit refs), and the Test-evidence section gains the per-item run
 |---|---|
 | 1 DELETE | ✅ done — commit `40700d0`, 213 tests green |
 | 2 TTL/EXPIRE | ✅ done — commit `f8e901d`, 232 tests green |
-| 3 Pre-Vote | ⏭ in progress |
+| 3 Pre-Vote | ✅ done — commit `f35e60d`, 242 tests green |
 | 4 Snapshots | ⏭ pending (item 3 first) |
 
 ## Phase status
@@ -345,21 +345,30 @@ which stay the detailed record.
 9. **Carried from Decisions** — `disconnectFrom` (Decision #3), `Replica` stub (Decision #4),
    `RaftLogs` performance (Decision #6), `Main.java` cluster demo (Decision #7), and the
    phase 3 network transport.
-10. **Pre-Vote (optional Raft election extension)** *(explicitly deferred by the user on
-    2026-11-20 — "Reframe now + Pre-Vote later"; not started)* — catch-up *while a member is
-    still degraded* (e.g. ≥ 200 ms per-hop latency) is **not** a basic-algorithm guarantee:
+10. **Pre-Vote (optional Raft election extension)** — ~~explicitly deferred by the user on
+    2026-11-20 ("Reframe now + Pre-Vote later")~~ **implemented 2026-11-21, commit
+    `f35e60d` (242 tests green):** a follower's election timeout now runs a hypothetical
+    pre-vote round for `term+1` before touching its term; it converts to candidate only on a
+    pre-vote majority (own grant counted, etcd-style); responses never advance the receiver's
+    term; a live leader's `AppendEntries` invalidates an in-flight round. Partitioned nodes
+    stay FOLLOWER retrying pre-vote rounds instead of burning real terms — the term churn
+    this entry warned about. `RaftNodeTest.testElectionWithFailure_twoNodes` updated to
+    assert the surviving invariant (one leader, isolated pair are non-leaders) under both
+    world models; new `RaftNodeBehaviorPreVoteTest` pins the 10 deterministic grant/deny
+    contracts. The deferral's motivation, still accurate below —
+    catch-up *while a member is still degraded* (e.g. ≥ 200 ms per-hop latency) is **not** a basic-algorithm guarantee:
     an isolated/rejoined server disrupts the cluster (term churn) — Ongaro's thesis §9.6
     ("Preventing disruptions when a server rejoins the cluster") documents this and prescribes
     **Pre-Vote** (a candidate wins *hypothetical* votes from a majority before it is allowed
     to increment its term); the paper concedes the same for removed servers in §6 ("resulting
     in poor availability"). Production etcd implements Pre-Vote and default-enables it from
     v3.5. All citations are verbatim-verified in `raft-notes.md` (paper §5.2 / §5.4.1 / §6,
-    thesis §9.6 full text, etcd `raft.go` / `config.go` / `--pre-vote` docs). If implemented
-    later: it touches the election core in `src/main` (new pre-vote message(s) + candidate and
-    follower logic) and needs its own sign-off; the existing `RaftNodeFlakySlowNodeTest` would
-    then gain the ability to additionally pin catch-up *during* the degradation window.
-    The implementation itself remains spec-compliant without it — this is an availability
-    improvement, not a correctness fix.
+    thesis §9.6 full text, etcd `raft.go` / `config.go` / `--pre-vote` docs). The implementation
+    (now done, item 3 above) touched the election core in `src/main` (new pre-vote message(s) +
+    candidate and follower logic) as this entry anticipated; with it in place,
+    `RaftNodeFlakySlowNodeTest` gains the ability to additionally pin catch-up *during* the
+    degradation window. The baseline implementation was spec-compliant without pre-vote — it
+    is an availability improvement, not a correctness fix.
 
 ## Test evidence
 
@@ -529,4 +538,39 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
     facade's future completes only after the entry is committed AND applied (apply-then-
     acknowledge), which is what lets the test read `present` immediately after
     `expire(...).get()` returns, deterministically.
+- After Signed-off work plan item 3, Pre-Vote (commit `f35e60d`): **242 tests green, 0
+  failed, 1 pre-existing skip** (`mvn -o -B test`, green 2×: `/tmp/opencode/mvn-prevote.log`,
+  `/tmp/opencode/mvn-prevote-2.log`) — the +10 are the new `RaftNodeBehaviorPreVoteTest`
+  (deterministic, inside the pre-vote election-timeout window):
+  - **Follower voter** — grants a same-or-higher-term candidate with an up-to-date log and
+    denies a same-term candidate whose log is behind (`(0,0)` vs own `(1,5)`); a
+    lower-term request is denied. The grant is a pure prediction: the node remains a
+    FOLLOWER, its term and log are untouched, and **no `VoteResponse` is ever emitted**
+    (a follower that would burn a vote answering a pre-vote would break the later real
+    election it promised).
+  - **Candidate voter** — grants ONLY a strictly higher-term candidate whose log is
+    up-to-date (a same-term request is denied even with an up-to-date log — the candidate
+    has already voted for itself that term); a response still never changes
+    `term`/`votedForNodeId`/`state`.
+  - **Leader voter** — grants a strictly higher-term candidate with an up-to-date log,
+    denies a same-term one; the node stays LEADER at its term — fire-and-forget.
+  - **Collector (follower)** — converts to CANDIDATE only after its own grant plus peer
+    grants reach a pre-vote majority; a round that never reaches majority leaves the node
+    a FOLLOWER at its original term; foreign-term responses are ignored (a round for
+    term N is deaf to term N+1 chatter).
+  - **Round invalidation** — a live leader's `AppendEntries` arriving mid-round invalidates
+    the in-flight pre-vote (the follower drops its own round before evaluating the
+    message) — the etcd rule that a live, reachable leader means "there is already a
+    leader; don't fight for the throne".
+  One existing expectation needed updating to the new protocol:
+  `RaftNodeTest.testElectionWithFailure_twoNodes` phase 2 previously asserted the two
+  isolated nodes **self-promoted to CANDIDATE** (the old rule: every election timeout
+  became a candidacy; partitioned, each re-elected at higher terms — the exact churn this
+  item removes). Now an isolated follower holds only its own pre-vote grant (1 <
+  majority(3)=2), so it stays FOLLOWER retrying pre-vote rounds and can never elect
+  itself either (1 < 2 real votes). The assertion was tightened to the invariant that
+  survives BOTH world models: exactly one leader, and the isolated pair are non-leaders
+  (followers under pre-vote, candidates under the old rule); `assertAtMostOneLeaderPerTerm`
+  still runs on every poll sample. The rest of the suite already passed untouched — this
+  was the only observation of the old promotion behavior.
 
