@@ -27,4 +27,13 @@ class KeyValue {
         }
         parent.getEventBus().publish(event);
     }
+
+    /**
+     * Replaces the stored version without publishing a {@link SetDataEvent} -- the value is
+     * unchanged, only its expiration moved (a replicated EXPIRE). Value-change events stay
+     * reserved for {@link #setData(DataVersion)}.
+     */
+    public synchronized void updateExpiration(DataVersion data) {
+        dataVersion = data;
+    }
 }

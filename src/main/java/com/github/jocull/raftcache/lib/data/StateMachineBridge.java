@@ -1,6 +1,7 @@
 package com.github.jocull.raftcache.lib.data;
 
 import com.github.jocull.raftcache.lib.communication.KeyDataDeleteInput;
+import com.github.jocull.raftcache.lib.communication.KeyDataExpireInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.event.EventBus;
 import com.github.jocull.raftcache.lib.event.EventSubscriber;
@@ -26,9 +27,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * so log entries are applied on the publisher's own thread -- the single-threaded-per-node
  * mailbox model is preserved and no additional executors are introduced.
  *
- * <p>Entries of type {@link KeyDataInput} (SET) and {@link KeyDataDeleteInput} (DELETE) have
- * state-machine semantics; any other entry type (e.g. plain strings used by the replication
- * tests) is acknowledged and skipped.
+ * <p>Entries of type {@link KeyDataInput} (SET), {@link KeyDataDeleteInput} (DELETE) and
+ * {@link KeyDataExpireInput} (EXPIRE) have state-machine semantics; any other entry type
+ * (e.g. plain strings used by the replication tests) is acknowledged and skipped.
  */
 public class StateMachineBridge extends EventSubscriber implements AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(StateMachineBridge.class);
@@ -74,6 +75,10 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
             final KeyDataDeleteInput input = (KeyDataDeleteInput) entry;
             partitionMap.deleteData(input.getKey());
             LOGGER.debug("Applied delete log @ index {} (key={}) to the state machine", index, input.getKey());
+        } else if (entry instanceof KeyDataExpireInput) {
+            final KeyDataExpireInput input = (KeyDataExpireInput) entry;
+            final boolean updated = partitionMap.expireData(input);
+            LOGGER.debug("Applied expire log @ index {} (key={}, ttl={}, live entry={})", index, input.getKey(), input.getTtl(), updated);
         } else {
             // No state-machine handling for this entry type; acknowledge it by
             // advancing the applied index so later entries are not blocked behind it

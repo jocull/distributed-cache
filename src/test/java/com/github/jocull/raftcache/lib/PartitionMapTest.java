@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib;
 
+import com.github.jocull.raftcache.lib.communication.KeyDataExpireInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.data.Partition;
@@ -11,6 +12,9 @@ import com.github.jocull.raftcache.lib.event.events.SetDataEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -254,5 +258,102 @@ public class PartitionMapTest {
 
         assertEquals(1000, setDataEvents.size());
         assertEquals(1000, deleteDataEvents.size());
+    }
+
+    // ---- TTL/EXPIRE (Signed-off work plan, item 2) ----
+    //
+    // Map-level (no Raft): the data-layer TTL semantics -- checked read, no-resurrection on a
+    // late EXPIRE, and the sweep that actually frees memory and emits DeleteDataEvent.
+
+    private KeyDataInput input(String key, String value) {
+        return new KeyDataInput(key, Map.of("data", value.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void testExpireMakesTheEntryServeAsAbsentAfterItsTtlAndSweepRemovesIt() {
+        final MutableClock clock = new MutableClock(Instant.EPOCH);
+        final List<DeleteDataEvent> deleteEvents = new ArrayList<>();
+        final EventSubscriber subscriber = new EventSubscriber() {
+            @Override
+            public void onEvent(Object event) {
+                if (event instanceof DeleteDataEvent) {
+                    deleteEvents.add((DeleteDataEvent) event);
+                }
+            }
+        };
+        final PartitionMap pm = new PartitionMap(eventBus, 256, clock);
+        eventBus.subscribe(subscriber);
+
+        pm.setData(input("ttl-key", "v1"));
+        assertTrue(pm.getData("ttl-key").isPresent(), "Setup: ttl-key should be present");
+
+        // EXPIRE at clock 0 with a 1000ms TTL -> deadline at epoch-millis 1000
+        assertTrue(pm.expireData(new KeyDataExpireInput("ttl-key", Duration.ofMillis(1000L))),
+                "EXPIRE of a live key should succeed");
+        assertTrue(pm.getData("ttl-key").isPresent(), "The entry should still read before its deadline");
+
+        clock.advanceMillis(1000L);
+        assertTrue(pm.getData("ttl-key").isEmpty(),
+                "Expired entry must be served as absent (checked read) at its deadline");
+
+        // The sweep frees the memory and emits a delete event for it
+        assertEquals(1, pm.sweepExpired(), "The sweep should remove exactly the one expired entry");
+        assertEquals(1, deleteEvents.size(), "The sweep should emit one DeleteDataEvent");
+        assertEquals("ttl-key", deleteEvents.get(0).getKey());
+        assertTrue(pm.getData("ttl-key").isEmpty(), "The swept key must still read as absent");
+    }
+
+    @Test
+    void testExpireOfAbsentKeyIsANoOpAtTheMapLevel() {
+        final MutableClock clock = new MutableClock(Instant.EPOCH);
+        final PartitionMap pm = new PartitionMap(eventBus, 256, clock);
+
+        assertFalse(pm.expireData(new KeyDataExpireInput("absent", Duration.ofMillis(1000L))),
+                "EXPIRE of an absent key should report that it changed nothing");
+        assertTrue(pm.getData("absent").isEmpty(), "EXPIRE of an absent key must create no entry");
+    }
+
+    @Test
+    void testSweepLeavesNonExpiredEntriesAlone() {
+        final MutableClock clock = new MutableClock(Instant.EPOCH);
+        final PartitionMap pm = new PartitionMap(eventBus, 256, clock);
+
+        pm.setData(input("keep", "v1")); // no TTL: never expires
+        pm.setData(input("drop", "v1"));
+        pm.expireData(new KeyDataExpireInput("drop", Duration.ofMillis(1000L)));
+
+        clock.advanceMillis(1500L); // "drop" is past its deadline, "keep" is unaffected
+        assertEquals(1, pm.sweepExpired(), "Only the expired entry should be removed");
+
+        assertTrue(pm.getData("keep").isPresent(),
+                "TTL-less entries must survive the sweep even after the clock advanced");
+        assertTrue(pm.getData("drop").isEmpty(), "The expired entry must be gone");
+    }
+
+    @Test
+    void testExpiredEntryIsNeverResurrectedByASecondExpire() {
+        final MutableClock clock = new MutableClock(Instant.EPOCH);
+        final PartitionMap pm = new PartitionMap(eventBus, 256, clock);
+
+        pm.setData(input("key", "v1"));
+        pm.expireData(new KeyDataExpireInput("key", Duration.ofMillis(1000L)));
+        clock.advanceMillis(1500L); // now past the deadline
+
+        assertFalse(pm.expireData(new KeyDataExpireInput("key", Duration.ofMillis(10_000L))),
+                "A late EXPIRE on an already-expired entry must not change it");
+        assertTrue(pm.getData("key").isEmpty(),
+                "A late EXPIRE must never resurrect an already-expired entry");
+    }
+
+    @Test
+    void testKeyDataExpireInputRejectsNonPositiveTtls() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new KeyDataExpireInput("key", Duration.ZERO), "A zero TTL is not a positive TTL");
+        assertThrows(IllegalArgumentException.class,
+                () -> new KeyDataExpireInput("key", Duration.ofSeconds(-1)), "A negative TTL is not a positive TTL");
+        assertThrows(NullPointerException.class,
+                () -> new KeyDataExpireInput(null, Duration.ofSeconds(1)), "The key must not be null");
+        assertThrows(NullPointerException.class,
+                () -> new KeyDataExpireInput("key", null), "The TTL must not be null");
     }
 }

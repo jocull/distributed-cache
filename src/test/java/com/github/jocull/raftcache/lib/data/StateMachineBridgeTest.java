@@ -1,6 +1,8 @@
 package com.github.jocull.raftcache.lib.data;
 
+import com.github.jocull.raftcache.lib.MutableClock;
 import com.github.jocull.raftcache.lib.communication.KeyDataDeleteInput;
+import com.github.jocull.raftcache.lib.communication.KeyDataExpireInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.event.EventBus;
@@ -12,12 +14,15 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class StateMachineBridgeTest {
@@ -153,5 +158,109 @@ public class StateMachineBridgeTest {
 
         assertTrue(partitionMap.getData("key1").isEmpty(), "After close, committed logs should no longer be applied");
         assertEquals(0L, bridge.getLastAppliedIndex());
+    }
+
+    // ---- EXPIRE over Raft (Signed-off work plan, item 2/TTL) ----
+    //
+    // These tests use their own map+bridge pair built on a deterministic MutableClock: the
+    // bridge test above uses a real-clock map, which is fine for SET/DELETE but makes TTL
+    // timing non-deterministic. Here the clock starts at Instant.EPOCH and the test advances
+    // it explicitly, so expiration is pinned with no wall-clock sleeping.
+
+    private static KeyDataExpireInput expire(String key, long ttlMillis) {
+        return new KeyDataExpireInput(key, Duration.ofMillis(ttlMillis));
+    }
+
+    /** A self-contained state-machine pair wired to a deterministic clock. */
+    private static final class TimedStateMachine {
+        final MutableClock clock = new MutableClock(Instant.EPOCH);
+        final EventBus mapEventBus = new EventBus();
+        final PartitionMap map = new PartitionMap(mapEventBus, 4, clock);
+        final EventBus nodeEventBus = new EventBus();
+        final StateMachineBridge bridge = new StateMachineBridge(nodeEventBus, map);
+
+        void commit(RaftLog<?>... logs) {
+            nodeEventBus.publish(new LogsCommitted(List.of(logs)));
+        }
+
+        void advanceMillis(long millis) {
+            clock.advanceMillis(millis);
+        }
+    }
+
+    @Test
+    void testExpireMakesTheKeyAbsentOnceItsTtlHasPassed() {
+        final TimedStateMachine s = new TimedStateMachine();
+        s.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        assertTrue(s.map.getData("key1").isPresent(), "Setup: key1 should be present after the put");
+
+        // EXPIRE with a 5000ms TTL applied at clock 0 -> expires at epoch-millis 5000
+        s.commit(new RaftLog<>(new TermIndex(1, 2), expire("key1", 5000L)));
+
+        // The value is unchanged by EXPIRE -- it still reads the original data before the deadline
+        final KeyDataOutput before = s.map.getData("key1")
+                .orElseThrow(() -> new AssertionError("key1 should still be present before its deadline"));
+        assertArrayEquals("value1".getBytes(StandardCharsets.UTF_8), before.getData().get("value"),
+                "EXPIRE must not alter the stored data, only its expiry");
+
+        // At the boundary the entry is already considered expired (expiresAt <= now)
+        s.advanceMillis(4999L);
+        assertTrue(s.map.getData("key1").isPresent(), "key1 must still be present just before its deadline");
+        s.advanceMillis(1L); // now == 5000
+        assertTrue(s.map.getData("key1").isEmpty(), "key1 must be absent once its TTL has elapsed");
+        assertEquals(2L, s.bridge.getLastAppliedIndex());
+    }
+
+    @Test
+    void testExpireOfAbsentKeyIsANoOp() {
+        final TimedStateMachine s = new TimedStateMachine();
+
+        // An EXPIRE on a key that was never written must not fail, not create an entry,
+        // and must still advance the applied index so later entries are not blocked
+        s.commit(new RaftLog<>(new TermIndex(1, 1), expire("never-written", 5000L)));
+        assertTrue(s.map.getData("never-written").isEmpty(), "EXPIRE of an absent key must not create an entry");
+        assertEquals(1L, s.bridge.getLastAppliedIndex());
+        s.advanceMillis(6000L); // far past any TTL
+        assertTrue(s.map.getData("never-written").isEmpty(), "A late clock must not resurrect an absent key");
+
+        // A genuine put afterwards must still work and be visible
+        s.commit(new RaftLog<>(new TermIndex(1, 2), input("never-written", "value1")));
+        assertTrue(s.map.getData("never-written").isPresent(), "A put after an absent-key EXPIRE should apply");
+        assertEquals(2L, s.bridge.getLastAppliedIndex());
+    }
+
+    @Test
+    void testLateExpireCannotResurrectAnAlreadyExpiredKey() {
+        final TimedStateMachine s = new TimedStateMachine();
+        s.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        s.commit(new RaftLog<>(new TermIndex(1, 2), expire("key1", 5000L)));
+
+        // Let the first EXPIRE lapse: at the apply time of the late EXPIRE the entry is already expired
+        s.advanceMillis(6000L);
+        assertTrue(s.map.getData("key1").isEmpty(), "Setup: key1 should be expired before the late EXPIRE");
+
+        s.commit(new RaftLog<>(new TermIndex(1, 3), expire("key1", 5000L)));
+        assertTrue(s.map.getData("key1").isEmpty(),
+                "A late EXPIRE on an already-expired key must not resurrect it");
+        assertEquals(3L, s.bridge.getLastAppliedIndex());
+    }
+
+    @Test
+    void testSecondExpireExtendsTheDeadline() {
+        final TimedStateMachine s = new TimedStateMachine();
+        s.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        s.commit(new RaftLog<>(new TermIndex(1, 2), expire("key1", 5000L))); // deadline -> 5000
+
+        // Still live at 3000; a second EXPIRE of 10000ms applied there pushes the deadline to 13000
+        s.advanceMillis(3000L);
+        s.commit(new RaftLog<>(new TermIndex(1, 3), expire("key1", 10000L)));
+
+        // Past the first deadline (5000) but within the extended one (13000) -> still present
+        s.advanceMillis(3000L); // now == 6000
+        assertTrue(s.map.getData("key1").isPresent(),
+                "key1 must survive past the first deadline because the second EXPIRE extended it");
+        // Past the extended deadline -> absent
+        s.advanceMillis(7001L); // now == 13001
+        assertTrue(s.map.getData("key1").isEmpty(), "key1 must be absent past the extended deadline");
     }
 }

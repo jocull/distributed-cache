@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.cache;
 
+import com.github.jocull.raftcache.lib.MutableClock;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.data.PartitionMap;
@@ -17,6 +18,8 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -252,6 +255,108 @@ public class DistributedCacheTest {
                 assertEquals("v2", new String(output.getData().get("value"), StandardCharsets.UTF_8), "The re-put should be the authoritative value");
                 assertEquals(3L, output.getVersion(),
                         "v1(1) -> delete(2) -> v2(3): every write applied exactly once, in log order");
+            }
+        }
+    }
+
+    // EXPIRE over Raft (Signed-off work plan, item 2/TTL): the facade routes an EXPIRE through
+    // the leader like a SET/DELETE, the entry carries its TTL through replication, and once the
+    // (deterministic, cluster-wide) clock passes the deadline the key reads absent on every node.
+    @ParameterizedTest
+    @MethodSource("provideIterations")
+    void testExpireThroughCluster(int iteration) {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        // One clock for the whole in-process cluster: expiration is resolved at apply time
+        // against this clock, so advancing it makes the expiry deterministic without sleeping
+        final MutableClock clusterClock = new MutableClock(Instant.EPOCH);
+        final PartitionMap partitionMap = new PartitionMap(new EventBus(), 4, clusterClock);
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            final RaftNode nodeC = raftManager.newNode("nodeC", new NodeAddress("addressC"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress())
+                    .addKnownNode(nodeC.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB).addNode(nodeC);
+
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final RaftNode leader = awaitLeader(middleware, "Did not get expected leader");
+            assertNotNull(leader, "No leader elected");
+
+            try (final DistributedCache cache = new DistributedCache(raftManager.getEventBus(),
+                    List.of(nodeA, nodeB, nodeC), partitionMap)) {
+                assertDoesNotThrow(
+                        () -> cache.put("ttl-key", Map.of("value", "v1".getBytes(StandardCharsets.UTF_8))).get(5, TimeUnit.SECONDS),
+                        "Expected put(v1) to commit through the leader within the timeout");
+                assertTrue(cache.get("ttl-key").isPresent(), "Key should be present after put(v1)");
+
+                // EXPIRE is a replicated write: the future only completes after the entry is
+                // committed AND applied (apply-then-acknowledge), pinning the deadline at clock 0 + 2s
+                assertDoesNotThrow(
+                        () -> cache.expire("ttl-key", Duration.ofSeconds(2L)).get(5, TimeUnit.SECONDS),
+                        "Expected expire to commit through the leader within the timeout");
+                assertTrue(cache.get("ttl-key").isPresent(),
+                        "Key must still be readable before its expiry deadline has passed");
+
+                clusterClock.advanceMillis(1500L);
+                assertTrue(cache.get("ttl-key").isPresent(),
+                        "Key must still be present just under half the TTL later than its deadline... "
+                                + "at 1500ms, well before the 2000ms deadline");
+
+                clusterClock.advanceMillis(600L); // now past the 2000ms deadline
+                assertTrue(cache.get("ttl-key").isEmpty(),
+                        "Key must read absent once the deadline has passed, on the reading node");
+
+                // EXPIRE of an absent key is a no-op through the facade: the future completes
+                // normally (idempotent for the client)
+                assertDoesNotThrow(
+                        () -> cache.expire("never-written", Duration.ofSeconds(2L)).get(5, TimeUnit.SECONDS),
+                        "Expected expire of an absent key to complete without error");
+                assertTrue(cache.get("never-written").isEmpty(),
+                        "EXPIRE of an absent key must not create an entry");
+            }
+        }
+    }
+
+    // EXPIRE on the single-node cluster path: the same semantics without any peer traffic
+    @ParameterizedTest
+    @MethodSource("provideIterations")
+    void testExpireSingleNodeCluster(int iteration) {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        final MutableClock clusterClock = new MutableClock(Instant.EPOCH);
+        final PartitionMap partitionMap = new PartitionMap(new EventBus(), 4, clusterClock);
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress());
+            middleware.addNode(nodeA);
+
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final RaftNode leader = awaitLeader(middleware, "Did not get expected single-node leader");
+            assertNotNull(leader, "No leader elected");
+            assertEquals("nodeA", leader.getId());
+
+            try (final DistributedCache cache = new DistributedCache(raftManager.getEventBus(),
+                    List.of(nodeA), partitionMap)) {
+                assertDoesNotThrow(
+                        () -> cache.put("single-ttl-key", Map.of("value", "v1".getBytes(StandardCharsets.UTF_8))).get(5, TimeUnit.SECONDS),
+                        "Expected put to commit on the single-node cluster within the timeout");
+                assertDoesNotThrow(
+                        () -> cache.expire("single-ttl-key", Duration.ofSeconds(2L)).get(5, TimeUnit.SECONDS),
+                        "Expected expire to commit on the single-node cluster within the timeout");
+                assertTrue(cache.get("single-ttl-key").isPresent(),
+                        "Key must still be present before its deadline, on the single-node cluster");
+
+                clusterClock.advanceMillis(2100L);
+                assertTrue(cache.get("single-ttl-key").isEmpty(),
+                        "Key must read absent once its deadline has passed, on the single-node cluster");
             }
         }
     }

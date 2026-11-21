@@ -2,6 +2,7 @@ package com.github.jocull.raftcache.lib.cache;
 
 import com.github.jocull.raftcache.lib.AsyncUtilities;
 import com.github.jocull.raftcache.lib.communication.KeyDataDeleteInput;
+import com.github.jocull.raftcache.lib.communication.KeyDataExpireInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.data.PartitionMap;
@@ -11,6 +12,7 @@ import com.github.jocull.raftcache.lib.raft.NodeStates;
 import com.github.jocull.raftcache.lib.raft.RaftLog;
 import com.github.jocull.raftcache.lib.raft.RaftNode;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -90,6 +92,26 @@ public class DistributedCache implements AutoCloseable {
         Objects.requireNonNull(key);
         return findLeaderNode()
                 .thenCompose(leader -> leader.submit(new KeyDataDeleteInput(key)));
+    }
+
+    /**
+     * Sets the expiration of {@code key} to "now + {@code ttl}", routed to the current leader.
+     *
+     * <p>The returned future completes only after the expire entry has been committed by a
+     * majority of the cluster and applied to this cache's state machine (see
+     * apply-then-acknowledge). "Now" is taken at apply time on each node, so expiration is
+     * resolved independently per node against its local clock -- a recording of this choice,
+     * acceptable for a cache.
+     *
+     * <p>An EXPIRE on a key that is absent (or already expired) is a no-op in the state
+     * machine -- the future still completes normally, so retries are safe and the key is
+     * never resurrected.
+     */
+    public CompletableFuture<RaftLog<KeyDataExpireInput>> expire(String key, Duration ttl) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(ttl);
+        return findLeaderNode()
+                .thenCompose(leader -> leader.submit(new KeyDataExpireInput(key, ttl)));
     }
 
     /**
