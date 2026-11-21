@@ -15,6 +15,26 @@ and lists the remaining items as explicit **cut-vs-finish** decisions so nothing
 
 ---
 
+## Signed-off work plan (2026-11-20)
+
+Sign-off from the user (2026-11-20, unattended run): *"You should first begin by doing
+DELETE. Then do TTL/EXPIRE. Then do Pre-vote. Then look into doing snapshots/log compaction.
+Write down your plan, and then begin executing until you reach your goal unattended."*
+The first three items are approved implementation work — Pre-Vote is a `src/main` protocol
+change and is **explicitly signed off**; item 4 is an investigation/design deliverable
+("look into"), not necessarily a full implementation. The order is fixed. Commit and test
+as it goes (green `mvn -o -B test` at each step). **Do not push.**
+
+| # | Item | Closes | Delivery |
+|---|---|---|---|
+| 1 | **DELETE over Raft** | Decision #5, Follow-up #1 | A new log entry `KeyDataDeleteInput` (key only) in `lib/communication`, modeled on `KeyDataInput`; the bridge applies it via the existing, tested `PartitionMap.deleteData` (deleting an absent key is a no-op, so replay is idempotent — safe under Raft); `DistributedCache.delete(key)` routes through the leader exactly like `put`. Tests: bridge-level apply in `StateMachineBridgeTest`; facade e2e in `DistributedCacheTest` (put → delete → get empty, and re-put after delete visible with the next version) |
+| 2 | **TTL / EXPIRE** | Follow-up #3 | A replicated `EXPIRE` command: `KeyDataExpireInput(key, ttl)` routed through the leader; the bridge resolves the expiration at apply time against an injectable `Clock` held by `PartitionMap` (default `Clock.systemUTC()`, test-overloaded constructor) and stores it per entry; `getData` serves expired entries as absent (checked read); `sweepExpired()` removes all expired entries and publishes `DeleteDataEvent` per removal; `DistributedCache.expire(key, ttl)`. Expiration resolves independently on each node within milliseconds of each other — recorded choice, acceptable for a cache; deterministic tests via clock injection |
+| 3 | **Pre-Vote** | Follow-up #10 (thesis §9.6) | A pre-vote phase **before** any term bump: on its election timeout, a follower — *still a follower at its current term, granting nothing, writing nothing* — proposes its term+1 to the cluster and waits for a **hypothetical majority**; only once granted may it convert to candidate and increment its term. A higher-term response steps it down. Effect: a degraded member that repeatedly times out no longer burns real terms denying/being denied by healthy members — the term churn that the slow-follower tests observed goes away. `RaftNodeFlakySlowNodeTest` additionally pins catch-up **during** the degradation window (bounded cluster term) — the availability Pre-Vote exists for. New `PreVoteRequest`/`PreVoteResponse` messages + candidate/follower logic + deterministic grant/deny unit tests |
+| 4 | **Snapshots / log compaction** | Decision #2, Follow-up #5 | "Look into": an in-repo investigation + design document grounded in the actual code — `RaftLogs` (deque log, `rollback()` trims **uncommitted** only, committed entries are never compacted), the `InstallSnapshotExample` sketch and the `proto/raft/*` working notes (do-not-modify), Raft paper §7, Ongaro's thesis, and etcd practice — with a staged implementation plan. A partial implementation only if the full suite stays green; otherwise the design deliverable stands |
+
+As each item lands, this document is updated in place: the Decision / Follow-up entries flip
+to done (with commit refs), and the Test-evidence section gains the per-item run counts.
+
 ## Phase status
 
 ### Phase 1 — Basic Raft protocol — ✅ done (with flagged deviations)
@@ -91,7 +111,7 @@ Deliberately not in scope for phase 4 (see Decisions / Phase 3):
 - Real network transport (`PassThruMiddleware` is in-memory only) — leader routing in
   `DistributedCache` is in-process; the supplied nodes must be directly reachable. Routing over
   a persistent connection follows with phase 3.
-- Deletion over Raft (Decision #5) — the facade has no delete path.
+- Deletion over Raft (Decision #5) — in progress under the Signed-off work plan, item 1.
 - `Main.java` cluster demo (Decision #7) and downed-follower quorum validation
   (Decision #3, blocked on `disconnectFrom`).
 
