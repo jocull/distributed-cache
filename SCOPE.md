@@ -35,6 +35,15 @@ as it goes (green `mvn -o -B test` at each step). **Do not push.**
 As each item lands, this document is updated in place: the Decision / Follow-up entries flip
 to done (with commit refs), and the Test-evidence section gains the per-item run counts.
 
+**Status (2026-11-21):**
+
+| # | Status |
+|---|---|
+| 1 DELETE | ✅ done — commit `40700d0`, 213 tests green |
+| 2 TTL/EXPIRE | ✅ done — commit `f8e901d`, 232 tests green |
+| 3 Pre-Vote | ⏭ in progress |
+| 4 Snapshots | ⏭ pending (item 3 first) |
+
 ## Phase status
 
 ### Phase 1 — Basic Raft protocol — ✅ done (with flagged deviations)
@@ -111,7 +120,11 @@ Deliberately not in scope for phase 4 (see Decisions / Phase 3):
 - Real network transport (`PassThruMiddleware` is in-memory only) — leader routing in
   `DistributedCache` is in-process; the supplied nodes must be directly reachable. Routing over
   a persistent connection follows with phase 3.
-- Deletion over Raft (Decision #5) — in progress under the Signed-off work plan, item 1.
+- ~~Deletion over Raft (Decision #5)~~ — **done** under the Signed-off work plan, item 1
+  (commit `40700d0`): `KeyDataDeleteInput` entry, bridge apply, `DistributedCache.delete()`.
+- ~~EXPIRE / TTL (Follow-up #3)~~ — **done** under the Signed-off work plan, item 2
+  (commit `f8e901d`): `KeyDataExpireInput` entry, checked-read + sweep expiration,
+  `DistributedCache.expire(key, ttl)`.
 - `Main.java` cluster demo (Decision #7) and downed-follower quorum validation
   (Decision #3, blocked on `disconnectFrom`).
 
@@ -160,9 +173,14 @@ No live shard add/remove; consistent-hash migration does not exist.
   `RaftLogsTest.testFutureRaftLogsCommit` locks in the contract (`commit()` alone must not
   complete the future); `RaftNodeTest.testStateMachineApply` asserts the guarantee
   deterministically (no timeout polls).
-- **Payload scope.** Only `KeyDataInput` entries are applied (via `PartitionMap.setData`). `RaftLog`
-  is generic (`RaftLog.java:5`); any other entry type (e.g. plain strings used by existing tests) is
-  skipped. Deletion over Raft is **undefined** in the current command vocabulary — see Decisions.
+- **Payload scope.** The bridge applies, in explicit `instanceof` branches (each entry type must
+  be named), `KeyDataInput` → `PartitionMap.setData` (SET), `KeyDataDeleteInput` →
+  `PartitionMap.deleteData` (DELETE, absent-key no-op ⇒ idempotent under Raft — work plan item 1,
+  commit `40700d0`), and `KeyDataExpireInput` → `PartitionMap.expireData` (EXPIRE/TTL — work plan
+  item 2, commit `f8e901d`). `RaftLog` is generic (`RaftLog.java:5`); any other entry type
+  (e.g. plain strings used by existing tests) is skipped. The bridge advances
+  `lastAppliedIndex` for **every** entry type it applies, which is why the DELETE and EXPIRE
+  branches are explicit rather than folded into a catch-all.
 - **Indices.** `TermIndex.EPOCH = (0, 0)` (`TermIndex.java:6`), so real log indices start at 1 and
   `lastAppliedIndex` starting at 0 is correct.
 
@@ -241,9 +259,17 @@ subsequently decided, fixed, and regression-tested):
 4. **`Replica` stub** — `lib/replication/Replica.java:15-19` is an empty `SetDataEvent` subscriber
    ("Do something here!"). It represents the *map → replication* direction; the current design
    feeds the map *from* Raft, so this stays a stub.
-5. **Deletion over Raft** — there is no log entry type distinguishing "set" from "delete"
-   (`KeyDataInput` has no delete flag). The bridge applies `setData` only; a proper delete command
-   (e.g. a dedicated `DataDelete` entry) is a follow-up, not guessed semantics.
+5. **Deletion over Raft** — *(resolved: Signed-off work plan item 1, commit `40700d0`)*.
+   The original cut: there is no log entry type distinguishing "set" from "delete"
+   (`KeyDataInput` has no delete flag). The bridge applies `setData` only; a proper delete
+   command (e.g. a dedicated `DataDelete` entry) is a follow-up, not guessed semantics.
+   **Resolution.** `KeyDataDeleteInput` (key-only, modeled on `KeyDataInput`) is the replicated
+   DELETE command; the bridge applies it via the existing, tested `PartitionMap.deleteData`
+   (absent-key delete is a no-op, so replay is idempotent under Raft);
+   `DistributedCache.delete(key)` routes through the leader exactly like `put`, and its future
+   completes only after the entry is committed **and** applied (apply-then-acknowledge).
+   Guarded by 3 bridge-level tests (apply, absent-key no-op, re-delivery idempotency) and
+   DELETE e2e in `DistributedCacheTest` (3-node and single-node).
 6. **`RaftLogs` performance** — `RaftLogs.java:68-69` notes walk-the-deque scaling; out of scope here.
 7. **`Main.java`** — left as the data-layer stress harness; it never had a cluster. Wiring a
    production-style demo (one process = one manager + one map + one bridge) is a phase 3/4 concern.
@@ -254,24 +280,35 @@ Everything that must not be silently dropped. "Deferred" = user-accepted for now
 exist before this is a production cache. Cross-references point at the Decisions above,
 which stay the detailed record.
 
-1. **DELETE over Raft** *(deferred; a real gap vs. the operations originally defined)* —
-   Decisions #5. Local deletion exists and is tested (`PartitionMap.deleteData` →
-   `KeyMap.deleteEntry`, `DeleteDataEvent`, `PartitionMapTest`), but there is no **replicated**
-   command: `KeyDataInput` carries no delete flag, the bridge applies `KeyDataInput` only, and
-   `DistributedCache` exposes just `put`/`get`. Realizing it needs an explicit delete entry type
-   (or an op-tagged entry), a bridge apply path, and a facade `delete()`. As it stands, SET is
-   the only write operation in the log; GET is served from local state and is not a log op.
+1. **DELETE over Raft** *(done in this branch — Signed-off work plan item 1, commit `40700d0`)*
+   — Decisions #5. A `KeyDataDeleteInput` entry, a bridge apply path via `PartitionMap.deleteData`
+   (absent-key no-op ⇒ idempotent under Raft), and `DistributedCache.delete(key)` routed through
+   the leader; its future completes only after commit **and** apply, so a read immediately after
+   sees the key absent (no polling). Bridge-level tests in `StateMachineBridgeTest` (apply,
+   absent-key no-op, put/delete/put idempotency under re-delivery) plus DELETE e2e in
+   `DistributedCacheTest` (3-node and single-node: put → delete → absent, no-op delete still
+   completes, re-put visible with the correct version counter). Closes Decision #5.
 2. **Spill data out of memory to a consistent (durable) store** *(deferred by the user —
    "skip it for now, it's for later"; not started)* — README promises "expire data out of the map
    to a consistent store (synchronously)". **Interpretation clarified by the user**: this means
    moving data *out of memory onto disk* / a durable consistent store (per-entry TTL is a
    separate item, see #3). Nothing exists: no spill/eviction path, no disk sink, no
    consistency guarantee to the store.
-3. **EXPIRE / TTL (per-entry expiration)** *(future work item — "great to have at some
-   point"; not started)* — TTL as its own capability: per-entry TTLs on values, an expiration
-   mechanism (sweep, checked read, or similar), and a replicated `EXPIRE`-style operation so
-   expiration is consistent across the cluster. Nothing exists yet: no TTL field, no sweeps,
-   no log command.
+3. **EXPIRE / TTL (per-entry expiration)** *(done in this branch — Signed-off work plan item 2,
+   commit `f8e901d`)* — TTL as its own capability: per-entry TTLs on values, an expiration
+   mechanism (sweep, checked read, and a replicated `EXPIRE` command), consistent across the
+   cluster. Delivered: `KeyDataExpireInput(key, ttl)` routed through the leader like SET/DELETE;
+   expiration resolved at **apply time** against an injectable `Clock` held by `PartitionMap`
+   (default `Clock.systemUTC()`, test 3-arg constructor — the 2-arg one is preserved) and stored
+   per entry as an absolute deadline in `DataVersion` (`NO_EXPIRY = Long.MAX_VALUE`);
+   `getData` serves expired entries as absent (checked read); `sweepExpired()` frees memory and
+   emits one `DeleteDataEvent` per removal; a late EXPIRE never resurrects an already-expired key;
+   EXPIRE on an absent key is a no-op (idempotent under Raft). `DistributedCache.expire(key, ttl)`
+   facade. Recorded choice: each node resolves "now" from its own clock within milliseconds —
+   acceptable for a cache, and avoids trusting the leader's clock on replay. Guarded by
+   clock-deterministic bridge tests (deadline boundary, absent-key no-op, no late resurrection,
+   second-EXPIRE-extends), map-level sweep/event tests, input validation, and e2e EXPIRE on the
+   3-node and single-node clusters sharing one `MutableClock`.
 4. **Fixed cluster topology** *(user-deferred)* — membership is fixed at startup; changing it
    today means taking the cluster down and rolling it over. No join/leave protocol, no joint
    consensus, no member transitions. This also keeps Decisions #3 (`disconnectFrom`) relevant
@@ -458,3 +495,38 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
   proving the same invariants under a **degraded but not cut** link — a distinct failure
   mode from `interrupt`/`restore` (binary isolation), which the new knobs model
   probabilistically and as a latency floor.
+- After Signed-off work plan item 1, DELETE over Raft (commit `40700d0`): **213 tests green**
+  (`mvn -o -B test`, green 2×; log `/tmp/opencode/mvn-delete.log`), adding the 13 new DELETE
+  tests: 3 bridge-level cases in `StateMachineBridgeTest` (apply, absent-key no-op,
+  put/delete/put idempotency under re-delivery) and 10 DELETE e2e iterations in
+  `DistributedCacheTest` (`testPutDeleteReputThroughCluster` ×5 on the 3-node cluster,
+  `testPutDeleteSingleNodeCluster` ×5 on the 1-node cluster). The e2e pairs pin the full path:
+  leader routing, apply-then-acknowledge (absent immediately after `delete(...).get()` returns,
+  no polling), the no-op delete's safe future completion, and the version counter showing
+  exactly-once application in log order (v1=1 → delete=2 → no-op delete=3 → v2=4).
+- After Signed-off work plan item 2, TTL/EXPIRE (commit `f8e901d`): **232 tests green, 0
+  failed, 1 pre-existing skip** (`mvn -o -B test`, green 2×: `/tmp/opencode/mvn-ttl.log`,
+  `/tmp/opencode/mvn-ttl-2.log`),
+  adding 19 TTL tests on top of the 213:
+  - `StateMachineBridgeTest` (+4, bridge level): `testExpireMakesTheKeyAbsentOnceItsTtlHasPassed`
+    (read at the boundary: present at 4999 ms, absent at exactly 5000 ms; the value itself is
+    unchanged by EXPIRE), `testExpireOfAbsentKeyIsANoOp` (no entry created; a later genuine put
+    still applies), `testLateExpireCannotResurrectAnAlreadyExpiredKey` (a late EXPIRE after the
+    deadline leaves the key absent — idempotent and safe under Raft replay), and
+    `testSecondExpireExtendsTheDeadline` (a second EXPIRE pushes the deadline forward —
+    present past the first deadline, absent past the second). All driven by a deterministic
+    `MutableClock` (starts at `Instant.EPOCH`, advanced explicitly — no wall-clock sleeping),
+    which is the new shared test helper `src/test/.../lib/MutableClock.java`.
+  - `PartitionMapTest` (+5, map level, no Raft): sweep removes exactly the expired entries and
+    emits one `DeleteDataEvent` per removal; EXPIRE of an absent key reports no change and
+    creates nothing; non-expired and TTL-less entries survive the sweep; a late EXPIRE never
+    resurrects an expired entry; `KeyDataExpireInput` rejects null key/ttl (NPE) and
+    non-positive TTLs (IllegalArgumentException).
+  - `DistributedCacheTest` (+10, e2e): `testExpireThroughCluster` ×5 (put → `expire(2s)` →
+    present at 0 ms, present at 1500 ms, absent at 2100 ms on a cluster whose `PartitionMap`
+    is wired to one shared `MutableClock`; plus the facade no-op path for an absent key) and
+    `testExpireSingleNodeCluster` ×5 (the same on the single-node cluster). The `expire()`
+    facade's future completes only after the entry is committed AND applied (apply-then-
+    acknowledge), which is what lets the test read `present` immediately after
+    `expire(...).get()` returns, deterministically.
+
