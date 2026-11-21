@@ -1,6 +1,7 @@
 package com.github.jocull.raftcache.lib.cache;
 
 import com.github.jocull.raftcache.lib.AsyncUtilities;
+import com.github.jocull.raftcache.lib.communication.KeyDataDeleteInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.data.PartitionMap;
@@ -74,6 +75,21 @@ public class DistributedCache implements AutoCloseable {
         Objects.requireNonNull(data);
         return findLeaderNode()
                 .thenCompose(leader -> leader.submit(new KeyDataInput(key, data)));
+    }
+
+    /**
+     * Deletes {@code key}, routed to the current leader.
+     *
+     * <p>The returned future completes only after the delete entry has been committed by a
+     * majority of the cluster and applied to this cache's state machine (see
+     * apply-then-acknowledge), so a {@link #get} immediately afterwards sees the key as absent.
+     * Deleting a key that is already absent is a no-op in the state machine -- the future
+     * still completes normally, so retries are safe.
+     */
+    public CompletableFuture<RaftLog<KeyDataDeleteInput>> delete(String key) {
+        Objects.requireNonNull(key);
+        return findLeaderNode()
+                .thenCompose(leader -> leader.submit(new KeyDataDeleteInput(key)));
     }
 
     /**

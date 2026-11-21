@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.data;
 
+import com.github.jocull.raftcache.lib.communication.KeyDataDeleteInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.event.EventBus;
@@ -50,6 +51,47 @@ public class StateMachineBridgeTest {
         assertEquals("key1", output.get().getKey());
         assertArrayEquals("value1".getBytes(StandardCharsets.UTF_8), output.get().getData().get("value"));
         assertEquals(1L, bridge.getLastAppliedIndex());
+    }
+
+    @Test
+    void testKeyDataDeleteInputRemovesTheEntry() {
+        commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        assertTrue(partitionMap.getData("key1").isPresent(), "Setup: key1 should be present");
+
+        commit(new RaftLog<>(new TermIndex(1, 2), new KeyDataDeleteInput("key1")));
+
+        assertTrue(partitionMap.getData("key1").isEmpty(), "key1 should be gone after the delete entry was committed");
+        assertEquals(2L, bridge.getLastAppliedIndex());
+    }
+
+    @Test
+    void testDeleteOfAbsentKeyIsANoOp() {
+        // Deleting a key that was never written must not fail and must not block later entries
+        commit(new RaftLog<>(new TermIndex(1, 1), new KeyDataDeleteInput("never-written")));
+        commit(new RaftLog<>(new TermIndex(1, 2), input("key1", "value1")));
+
+        assertTrue(partitionMap.getData("never-written").isEmpty());
+        assertTrue(partitionMap.getData("key1").isPresent(), "Data entries after an absent-key delete should still be applied");
+        assertEquals(2L, bridge.getLastAppliedIndex());
+    }
+
+    @Test
+    void testDeleteThenReputAppliesInOrder() {
+        // put -> delete -> put must replay to "present, latest value" (idempotent under re-delivery)
+        final List<RaftLog<?>> batch = List.of(
+                new RaftLog<>(new TermIndex(1, 1), input("key1", "v1")),
+                new RaftLog<>(new TermIndex(1, 2), new KeyDataDeleteInput("key1")),
+                new RaftLog<>(new TermIndex(1, 3), input("key1", "v2")));
+        commit(batch.toArray(new RaftLog[0]));
+        final long version = partitionMap.getData("key1").get().getVersion();
+
+        // Re-delivering the whole batch (shared in-process bus) must not re-apply any of it
+        commit(batch.toArray(new RaftLog[0]));
+
+        assertTrue(partitionMap.getData("key1").isPresent(), "Key should be present again after the re-put");
+        assertArrayEquals("v2".getBytes(StandardCharsets.UTF_8), partitionMap.getData("key1").get().getData().get("value"));
+        assertEquals(version, partitionMap.getData("key1").get().getVersion(), "Duplicate delivery should not re-apply the put/delete/put");
+        assertEquals(3L, bridge.getLastAppliedIndex());
     }
 
     @Test
