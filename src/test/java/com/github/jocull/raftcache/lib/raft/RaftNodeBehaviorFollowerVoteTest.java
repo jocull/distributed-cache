@@ -4,6 +4,8 @@ import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
 import com.github.jocull.raftcache.lib.raft.messages.Introduction;
+import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
+import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.StateRequest;
 import com.github.jocull.raftcache.lib.raft.messages.StateResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
@@ -166,6 +168,14 @@ class RaftNodeBehaviorFollowerVoteTest {
         @Override
         public void sendVoteResponse(VoteResponse voteResponse) {
             voteResponses.add(voteResponse);
+        }
+
+        @Override
+        public void sendPreVoteRequest(PreVoteRequest preVoteRequest) {
+        }
+
+        @Override
+        public void sendPreVoteResponse(PreVoteResponse preVoteResponse) {
         }
 
         @Override

@@ -5,6 +5,8 @@ import com.github.jocull.raftcache.lib.raft.events.AppendLog;
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
+import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 
@@ -217,6 +219,26 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
         }
 
         LOGGER.info("{} Received a vote request from {} for term {} but already leader of term {}", self.getId(), sender.getRemoteNodeId(), voteResponse.getTerm(), term);
+    }
+
+    @Override
+    public void onPreVoteRequest(NodeConnectionOutbound sender, PreVoteRequest preVoteRequest) {
+        // A pre-vote request is a hypothetical vote: it must NOT make this leader step
+        // down, advance term, or mutate anything. Answer only whether we WOULD grant in a
+        // real election for that term: a leader's real vote path grants only on a
+        // strictly higher term (same-term requests are refused), plus the up-to-date rule.
+        final boolean grant = preVoteRequest.getTerm() > term && isUpToDate(preVoteRequest);
+        LOGGER.info("{} Pre-vote request from {} for term {} vs own term {} - grant={}",
+                self.getId(), sender.getRemoteNodeId(), preVoteRequest.getTerm(), term, grant);
+        sender.sendPreVoteResponse(new PreVoteResponse(preVoteRequest.getTerm(), grant));
+    }
+
+    @Override
+    public void onPreVoteResponse(NodeConnectionOutbound sender, PreVoteResponse preVoteResponse) {
+        // Pre-vote responses are fire-and-forget: per pre-vote semantics they must never
+        // advance our term or change our state, even if a higher term is mentioned.
+        LOGGER.warn("{} Received pre-vote response from {} for term {} - ignoring (pre-vote responses do not advance term)",
+                self.getId(), sender.getRemoteNodeId(), preVoteResponse.getTerm());
     }
 
     @Override

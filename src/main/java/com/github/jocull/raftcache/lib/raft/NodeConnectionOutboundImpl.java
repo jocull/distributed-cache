@@ -107,6 +107,14 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
             receiverProvider.run(receiver -> receiver.onVoteResponse(this, (VoteResponse) message));
             return;
         }
+        if (message instanceof PreVoteRequest) {
+            receiverProvider.run(receiver -> receiver.onPreVoteRequest(this, (PreVoteRequest) message));
+            return;
+        }
+        if (message instanceof PreVoteResponse) {
+            receiverProvider.run(receiver -> receiver.onPreVoteResponse(this, (PreVoteResponse) message));
+            return;
+        }
         if (message instanceof AppendEntries) {
             receiverProvider.run(receiver -> receiver.onAppendEntries(this, (AppendEntries) message));
             return;
@@ -153,6 +161,16 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     @Override
     public void sendVoteResponse(VoteResponse voteResponse) {
         send(voteResponse);
+    }
+
+    @Override
+    public void sendPreVoteRequest(PreVoteRequest preVoteRequest) {
+        send(preVoteRequest);
+    }
+
+    @Override
+    public void sendPreVoteResponse(PreVoteResponse preVoteResponse) {
+        send(preVoteResponse);
     }
 
     @Override

@@ -72,6 +72,26 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
         }
     }
 
+    /**
+     * Raft §5.4.2 up-to-date rule evaluated against a candidate's last log entry from a
+     * Pre-Vote request: grant iff the candidate's last entry is at least as up-to-date as
+     * our own (higher term, or equal term and higher-or-equal index).
+     *
+     * <p>Pure read: the comparison is made against our CURRENT, unmutated log — exactly as
+     * the vote-grant path requires (see {@code convertToFollowerForVote}). The term/index
+     * comparison deliberately excludes any state mutation; pre-vote handling must never
+     * change term, {@code votedFor}, or timers.
+     */
+    boolean isUpToDate(PreVoteRequest preVoteRequest) {
+        final TermIndex incomingTermIndex = new TermIndex(
+                preVoteRequest.getLastLogTermIndex().getTerm(),
+                preVoteRequest.getLastLogTermIndex().getIndex());
+        final TermIndex currentIndex = self.logs.getCurrentTermIndex();
+        LOGGER.trace("{} Pre-vote up-to-date check: candidate {} vs own log {} -> {}",
+                self.getId(), incomingTermIndex, currentIndex, incomingTermIndex.compareTo(currentIndex) >= 0);
+        return incomingTermIndex.compareTo(currentIndex) >= 0;
+    }
+
     StateResponse getStateResponse(StateRequest request) {
         final TermIndex current = self.logs.getCurrentTermIndex();
         final TermIndex committed = self.logs.getCommittedTermIndex();

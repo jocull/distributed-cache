@@ -13,6 +13,10 @@ public interface NodeCommunicationReceiver {
 
     void onVoteResponse(NodeConnectionOutbound sender, VoteResponse voteResponse);
 
+    void onPreVoteRequest(NodeConnectionOutbound sender, PreVoteRequest preVoteRequest);
+
+    void onPreVoteResponse(NodeConnectionOutbound sender, PreVoteResponse preVoteResponse);
+
     void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries);
 
     void onAcknowledgeEntries(NodeConnectionOutbound sender, AcknowledgeEntries acknowledgeEntries);

@@ -240,10 +240,20 @@ public class RaftNodeTest {
             LOGGER.info("===== INTERRUPTING NETWORK: {}, {} =====", nodes1.leader().getId(), nodes1.followers().get(0).getId());
             middleware.interrupt(nodes1.leader().getNodeAddress());
             middleware.interrupt(nodes1.followers().get(0).getNodeAddress());
-            final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leaders and candidates", 5, TimeUnit.SECONDS, () -> {
+            // Pre-vote changes what a partitioned follower looks like here. Without pre-vote
+            // the two isolated nodes timed out and self-promoted to CANDIDATE (re-electing at
+            // higher and higher terms while partitioned). With pre-vote (item 3) a node only
+            // becomes candidate after collecting a pre-vote MAJORITY: in its own 1-node
+            // partition it holds only its own grant (1 < majority(3)=2), so it stays FOLLOWER
+            // and retries pre-vote rounds -- exactly the term-escalation runaway pre-vote
+            // exists to prevent. Neither isolated node can elect itself either (1 < 2 real
+            // votes), so the only leader remaining is the pre-partition one. Assert the
+            // invariant that survives both world models: one leader, and the isolated pair
+            // are NON-leaders (followers pre-vote, candidates under the old rule).
+            final ClusterNodes nodes2 = assertResultWithinTimeout("Did not get expected leader and non-leaders", 5, TimeUnit.SECONDS, () -> {
                 assertAtMostOneLeaderPerTerm(middleware);
                 final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
-                if (result.leader() != null && result.candidates().size() == 2) {
+                if (result.leaders().size() == 1 && result.followers().size() + result.candidates().size() == 2) {
                     return result;
                 }
                 return null;

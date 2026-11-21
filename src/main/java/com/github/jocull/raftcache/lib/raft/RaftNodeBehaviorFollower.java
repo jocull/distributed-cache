@@ -3,10 +3,14 @@ package com.github.jocull.raftcache.lib.raft;
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
+import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.function.Function;
 
@@ -14,6 +18,14 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     private CompletableFuture<?> electionTimeout;
     private String votedForNodeId;
     private String leaderId;
+
+    // Pre-vote round (etcd "pre-vote"): before stepping up to candidate, this follower
+    // hypothetically asks the cluster for its votes. The round always runs FOR TERM + 1
+    // (each behavior instance has a fixed `term`, so a round cannot straddle terms).
+    // `preVoteGrants` holds the peer ids that granted; the candidate's own vote is implicit
+    // (counted as self, exactly as the candidate counts its own vote).
+    private final Set<String> preVoteGrants = new HashSet<>();
+    private boolean preVoteRoundActive = false;
 
     public RaftNodeBehaviorFollower(RaftNodeImpl self, int term) {
         super(self, NodeStates.FOLLOWER, term);
@@ -50,11 +62,39 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         LOGGER.trace("{} Scheduled next election timeout ({} ms)", self.getId(), timeoutMs);
     }
 
-    private void onElectionTimeout() {
+    /* package-private-for-test — also invoked asynchronously by the election scheduler */
+    void onElectionTimeout() {
         if (isTerminated()) {
             return;
         }
-        self.convertToCandidate(term + 1);
+        // Start (or re-start) a pre-vote round for term + 1. Grants start empty; our own
+        // pre-vote is implicit and counted separately. Re-use the same election timer to
+        // keep the round alive: if no majority of grants arrives before it fires, retry.
+        // (etcd "pre-vote": a term is only incremented when we actually become candidate.)
+        preVoteRoundActive = true;
+        preVoteGrants.clear();
+
+        // Our own vote can constitute a majority only in a one-node cluster, where no peer
+        // will ever respond. Take the shortcut directly to candidate (mirrors the
+        // candidate's own self-majority shortcut).
+        if (1 >= self.clusterTopology.getMajorityCount()) {
+            LOGGER.info("{} Own pre-vote is a majority ({} of {}) - advancing to candidate",
+                    self.getId(), 1, self.clusterTopology.getMajorityCount());
+            self.convertToCandidate(term + 1);
+            return;
+        }
+
+        // Per Raft §5.4.1 report the term/index of our LAST log entry — identical to the
+        // VoteRequest a real candidate for term + 1 would send.
+        final TermIndex lastLogTermIndex = self.logs.getCurrentTermIndex();
+        final PreVoteRequest preVoteRequest = new PreVoteRequest(term + 1, self.getId(),
+                new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
+                        lastLogTermIndex.getTerm(),
+                        lastLogTermIndex.getIndex()));
+        LOGGER.info("{} Starting a pre-vote round for term {} (own log {})", self.getId(), term + 1, lastLogTermIndex);
+        self.getActiveConnections().forEach(c -> c.sendPreVoteRequest(preVoteRequest));
+
+        scheduleNextElectionTimeout();
     }
 
     @Override
@@ -128,7 +168,76 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     }
 
     @Override
+    public void onPreVoteRequest(NodeConnectionOutbound sender, PreVoteRequest preVoteRequest) {
+        // A pre-vote request is a HYPOTHETICAL vote: it must leave us fully untouched —
+        // no term update, no votedFor mutation, no election-timer reset. We answer only
+        // whether we WOULD grant: accept the term (a follower accepts >=, since a real
+        // VoteRequest here would advance to it or stay at it) and pass the up-to-date rule
+        // against our current, unmutated log (Raft §5.4.2).
+        //
+        // votedFor is deliberately NOT consulted: a real same-term voter that already granted
+        // its vote WOULD deny us here (the one-vote-per-term rule). Not consulting it means a
+        // node that already voted for someone else may over-predict a grant — a
+        // hypothetical-grant that costs us nothing and never changes state. The over-prediction
+        // is liveness-only (it can at most let a stale node start a real election that it will
+        // then lose at the vote gate); the real election below remains strictly vote-gated, so
+        // safety is unaffected.
+        final boolean grant = preVoteRequest.getTerm() >= term && isUpToDate(preVoteRequest);
+        LOGGER.info("{} Pre-vote request from {} for term {} vs own term {} - grant={}",
+                self.getId(), sender.getRemoteNodeId(), preVoteRequest.getTerm(), term, grant);
+        sender.sendPreVoteResponse(new PreVoteResponse(preVoteRequest.getTerm(), grant));
+    }
+
+    @Override
+    public void onPreVoteResponse(NodeConnectionOutbound sender, PreVoteResponse preVoteResponse) {
+        if (!preVoteRoundActive) {
+            // A late grant for a round that already concluded (we reached a majority, a
+            // leader appeared, or we were converted away). Acting on it now could restart
+            // a round that is no longer ours.
+            LOGGER.warn("{} Received pre-vote response from {} for term {} while no pre-vote round is active - ignoring",
+                    self.getId(), sender.getRemoteNodeId(), preVoteResponse.getTerm());
+            return;
+        }
+
+        // Each behavior instance has a fixed term, and a round is always held for term + 1,
+        // so any response for a different term is stale or foreign — never count it.
+        final int roundTerm = term + 1;
+        if (preVoteResponse.getTerm() != roundTerm) {
+            LOGGER.warn("{} Received pre-vote response from {} for term {} but the active round is for term {} - ignoring",
+                    self.getId(), sender.getRemoteNodeId(), preVoteResponse.getTerm(), roundTerm);
+            return;
+        }
+        if (!preVoteResponse.isPreVoteGranted()) {
+            // The voter evaluated the up-to-date rule (Raft §5.4.2) against its own log and
+            // refused. Counting the denial would let a behind node reach a majority out of
+            // no-grants — exactly what pre-vote exists to prevent.
+            LOGGER.info("{} Pre-vote from {} for term {} denied - not counting", self.getId(), sender.getRemoteNodeId(), roundTerm);
+            return;
+        }
+
+        // All callbacks run serialized on this node's single executor, so the set needs no
+        // synchronization of its own.
+        preVoteGrants.add(sender.getRemoteNodeId());
+        final int grantTotal = 1 + preVoteGrants.size();
+        LOGGER.info("{} Pre-vote granted by {} for term {} - grants so far {} of {} (including self)",
+                self.getId(), sender.getRemoteNodeId(), roundTerm, grantTotal, self.clusterTopology.getClusterCount());
+        if (grantTotal >= self.clusterTopology.getMajorityCount()) {
+            // A majority of hypothetical grants: safe to increment the term for real.
+            preVoteRoundActive = false;
+            preVoteGrants.clear();
+            self.convertToCandidate(roundTerm);
+            LOGGER.info("{} Pre-vote majority reached - converting to candidate for term {}", self.getId(), roundTerm);
+        }
+    }
+
+    @Override
     public void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries) {
+        // A live leader just spoke: any in-flight pre-vote round is moot. Invalidate it
+        // immediately so late grants cannot resurrect a round and hijack the next
+        // election.
+        preVoteRoundActive = false;
+        preVoteGrants.clear();
+
         if (appendEntries.getTerm() > term) {
             LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term);
             self.convertToFollowerForNewLeader(sender.getRemoteNodeId(), appendEntries)

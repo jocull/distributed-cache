@@ -17,6 +17,10 @@ public interface NodeCommunicationSender {
 
     void sendVoteResponse(VoteResponse voteResponse);
 
+    void sendPreVoteRequest(PreVoteRequest preVoteRequest);
+
+    void sendPreVoteResponse(PreVoteResponse preVoteResponse);
+
     void sendAppendEntries(AppendEntries appendEntries);
 
     void sendAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries);
