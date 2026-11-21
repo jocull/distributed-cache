@@ -174,6 +174,15 @@ These are behavioral (not merely additive) changes, made because they were requi
   (a true 1-node cluster; `activeConnections` is append-only until `disconnectFrom` exists), the
   leader calls `updateCommittedIndex()` directly and skips the heartbeat timer, instead of
   busy-rescheduling at a 0 ms delay that keeps re-firing against an empty connection list.
+- **A vote denial does not burn the node's one vote** (commit `77638bd`, sign-off'd protocol fix)
+  — a follower that denied a stale candidate was writing `votedForNodeId` to its own id, which
+  latched the once-per-term guard for the whole term; a *fresher* candidate arriving later in the
+  same term then got no response, costing an entire empty term to elect the freshest node.
+  `RaftNodeBehaviorFollower.onVoteRequest` now records the vote only on a grant (denial leaves
+  `votedForNodeId` null, so a same-term fresher candidate can still win on the next RPC). Per Raft
+  §5.4.1 a node grants at most one vote per term — the fix preserves that bound while restoring
+  the freshness ordering Raft's election timeout randomization is meant to preserve.
+  Test seam: `RaftNodeImpl.currentReceiver()` (package-private, for tests).
 
 ## Decisions — cut-vs-finish
 
@@ -279,6 +288,21 @@ which stay the detailed record.
 9. **Carried from Decisions** — `disconnectFrom` (Decision #3), `Replica` stub (Decision #4),
    `RaftLogs` performance (Decision #6), `Main.java` cluster demo (Decision #7), and the
    phase 3 network transport.
+10. **Pre-Vote (optional Raft election extension)** *(explicitly deferred by the user on
+    2026-11-20 — "Reframe now + Pre-Vote later"; not started)* — catch-up *while a member is
+    still degraded* (e.g. ≥ 200 ms per-hop latency) is **not** a basic-algorithm guarantee:
+    an isolated/rejoined server disrupts the cluster (term churn) — Ongaro's thesis §9.6
+    ("Preventing disruptions when a server rejoins the cluster") documents this and prescribes
+    **Pre-Vote** (a candidate wins *hypothetical* votes from a majority before it is allowed
+    to increment its term); the paper concedes the same for removed servers in §6 ("resulting
+    in poor availability"). Production etcd implements Pre-Vote and default-enables it from
+    v3.5. All citations are verbatim-verified in `raft-notes.md` (paper §5.2 / §5.4.1 / §6,
+    thesis §9.6 full text, etcd `raft.go` / `config.go` / `--pre-vote` docs). If implemented
+    later: it touches the election core in `src/main` (new pre-vote message(s) + candidate and
+    follower logic) and needs its own sign-off; the existing `RaftNodeFlakySlowNodeTest` would
+    then gain the ability to additionally pin catch-up *during* the degradation window.
+    The implementation itself remains spec-compliant without it — this is an availability
+    improvement, not a correctness fix.
 
 ## Test evidence
 
@@ -365,3 +389,52 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
 - `testUpToDateRuleStaleCandidateLoses` / `testUpToDateRuleUncommittedTailLoses` are the
   regression guards for the up-to-date election rule (`6b33a9c`) and the voting-path fixes
   (`2c4dd89`); the latter is the proven liveness discriminator of the report fix.
+- After the vote-burn fix (commit `77638bd`, sign-off'd): **195 tests green** (`mvn -B test`),
+  adding `RaftNodeBehaviorFollowerVoteTest` — a deterministic 3-sequence election in a single
+  term: node X denies a stale candidate A (A's log behind X), then a fresher candidate B
+  arrives the same term and must still be grantable. PASSES on the fix; **proven to FAIL
+  against the old code** (the denial had latched `votedForNodeId`, so B got no response — an
+  entire wasted term). This is the regression guard for "a vote denial must not burn the
+  node's single vote".
+- After the per-node fault-injection knobs (commit `209696d`): still **195 tests green**
+  (`mvn -B test`) — `PassThruMiddleware` gains `setNodeLatency` / `setNodePacketLoss` /
+  `clearNodeFaults` / `clearAllNodeFaults` keyed by `NodeAddress`, additive on top of the
+  existing 1–9 ms baseline (reordering preserved), with `ConcurrentHashMap` backing and
+  boundary/exception contract. Knobs unused ⇒ behavior identical to the pre-change network,
+  so no existing test was disturbed.
+- After the slow-follower / flaky-node test reframe (commit `37d93f5`): **200 tests green**
+  (`mvn -o -B test`, twice in a row: 200 run, 0 failed, 1 skipped — the pre-existing
+  `@Disabled` in the untouched `proto/raft` package), adding `RaftNodeFlakySlowNodeTest`
+  (5 tests) on top of the new fault knobs:
+  - `testSlowFollower_clusterStaysLive_andCatchesUpAfterRecovery` (renamed from
+    `testSlowFollower_catchesUp_afterLeaderCommits`) — refactored to pin the contract the
+    *basic* algorithm actually guarantees when one member is degraded: the healthy quorum
+    (2 of 3) keeps committing a burst and no split brain forms; then `clearNodeFaults` and
+    the slow node **reconverges** to the committed tail. The previous version asserted
+    catch-up *while the node was still slow* — a livelock on the spec side (79/79 vote lines
+    to C were `grant=false`, terms climbed to 69, C's log stuck at (0,0)). Not a spec
+    deviation: Raft §5.2 mandates the term bump on candidacy, §5.4.1 mandates A/B denying C,
+    and both the paper (§6: "resulting in poor availability") and Ongaro's thesis §9.6
+    document exactly this disruption and the Pre-Vote extension as the fix (etcd:
+    default-enabled since v3.5). All sources verbatim-verified under
+    "Spec verification: slow-follower / rejoin liveness (2026-11-20)" in `raft-notes.md`
+    (commit `5964f55`).
+  - `testFlakyFollower_clusterStaysLive` — 70 % per-hop loss on one follower; the healthy
+    quorum keeps committing regardless (the flaky node may even win an election on the good
+    30 % — the test never pins the submit to a specific node).
+  - `testSlowLeader_clusterStaysLive_andKeepsCommitting` — leadership may or may not move
+    when the leader is slowed; both outcomes are legal and both are asserted live + safe
+    (the old version pinned the submit to `oldLeader` and was the flakiness this removes).
+  - `testNonLeader_submitFailsFast_notHangs` — a non-leader's `submit` rejects promptly
+    (`IllegalStateException` wrapped in `ExecutionException` within 1 s).
+  - `testKnobContract_boundariesAndDeterminism` — API boundaries on the new fault knobs
+    (negative latency, rate < 0 / > 1, null address all rejected; fluent setters) plus the
+    deterministic endpoints: loss 1.0 IS full isolation (healthy quorum commits; the isolated
+    node is lagging) and `clearNodeFaults` IS restore (the isolated node catches up again).
+- `RaftNodeFlakySlowNodeTest` is the regression guard for: the 3-node cluster staying live
+  and safe while a single member degrades (latency OR loss), a non-leader's `submit` failing
+  fast, and the fault knobs' contract. It complements the existing `RaftNodeTest`
+  election/replication hardening (at-most-one-leader-per-term, old-leader step-down) by
+  proving the same invariants under a **degraded but not cut** link — a distinct failure
+  mode from `interrupt`/`restore` (binary isolation), which the new knobs model
+  probabilistically and as a latency floor.
