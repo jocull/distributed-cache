@@ -93,7 +93,7 @@ This branch adds:
   non-data entries ignored; followers' committed indexes caught up) plus a unit test class
   `StateMachineBridgeTest` (apply, duplicate-delivery idempotency, out-of-order skip, ignore non-data).
 
-### Phase 3 — Node communication over network — 🔨 in progress (design done 2026-11-21)
+### Phase 3 — Node communication over network — ✅ done in this branch (staged A→D, 2026-11-21)
 
 `ChannelMiddleware` is an interface; the only implementation is `PassThruMiddleware` (in-memory,
 test-oriented with fault injection). No real transport, framing, or serialization of the
@@ -108,8 +108,39 @@ the behaviors today covered only by mocked (PassThru) tests. Snapshots/log-compa
 
 The design is documented in **`NETWORKING.md`** (wire format, `SocketChannelMiddleware`,
 fault-injection parity with `PassThruMiddleware`, node take-down/restart semantics, invariants
-N1–N6, the 7 IT scenarios, and staged implementation A→D). Implementation begins stage by stage
-with a green suite per stage; no code changes until Stage A.
+N1–N6, the 7 IT scenarios, and staged implementation A→D). All four stages are delivered in
+this branch — each committed only with a green `mvn -o -B test`, and each stage re-proves the
+behaviors today covered only by the PassThru-mocked `RaftNodeTest` tests over a real wire:
+
+- **Stage A** (commit `6dc8a1e`, 254 green) — the wire surface implements
+  `java.io.Serializable`, zero new dependencies (Decision #9): the 11 Raft message types, the
+  3 `KeyData*Input` payload types, and the topology types (`NodeAddress`, `NodeIdentifier`,
+  `TermIndex`); guarded by `WireSerializationTest` (12 tests: round-trip fidelity +
+  null/boundary rejection).
+- **Stage B** (commit `7a7eb1f`, 260 green) — `SocketChannelMiddleware`, the second (real)
+  `ChannelMiddleware` implementation: real `127.0.0.1`/ephemeral-port channels, 4-byte-BE
+  length framing (payload-neutral), a server-side handshake that resolves the peer's `RaftNode`
+  from its announced address, and PassThru-parity per-node `interrupt`/`restore` (N1–N3);
+  guarded by `SocketChannelMiddlewareTest` (6 tests).
+- **Stage C** (commit `b54199b`, 266 green) — `ClusterKit`, a production-shaped 3-node harness
+  (each node its own middleware on an ephemeral port, own `RaftManager`/`EventBus`, own
+  `PartitionMap`/`DistributedCache`), plus ITs 1–6: leader election, put/get (apply-then-
+  acknowledge visibility), delete/expire e2e, and partition-restore of a follower (N4, quorum
+  holds on 2-of-3) and of the leader (N5, higher-term re-election, old leader steps down or
+  re-wins at a higher term, one leader overall); guarded by `RealNetworkClusterTest` (6 tests).
+- **Stage D** (commit `f9b2fde`, 267 green) — N6, the last scenario: `ClusterKit.hardStop(i)`
+  kills a slot in crash order (facade unsubscribes → terminal node stop → idempotent socket
+  close; nothing resumable) and `restart(i)` brings the same slot back with process-restart
+  semantics (fresh ephemeral wire address, empty log at term 0, same Raft id, fresh state
+  machine; the survivors keep their bus and map but their facades are rebuilt over a fresh
+  node list). IT 7: v1 applied on all three → hard-stop a **follower** → v2 commits on a
+  2-of-3 quorum → the stopped node's view stays stale at "v1" → restart → the surviving
+  leader's continuation push replays v1-then-v2 into the fresh node's new map → all three
+  local maps hold "v2" at version 2 exactly → exactly one leader, the pre-stop survivor
+  (7 tests in the class).
+
+Snapshots/log compaction were **explicitly deferred** by the same direction ("we'll do
+snapshots later") and remain the `SNAPSHOTS.md` backlog (Decision #8).
 
 ### Phase 4 — Non-partitioned distributed cache — ✅ client API done in this branch
 
@@ -131,7 +162,9 @@ Deliberately not in scope for phase 4 (see Decisions / Phase 3):
 
 - Real network transport (`PassThruMiddleware` is in-memory only) — leader routing in
   `DistributedCache` is in-process; the supplied nodes must be directly reachable. Routing over
-  a persistent connection follows with phase 3.
+  a persistent connection follows with phase 3 — **delivered**: the Phase 3 stages above
+  (`SocketChannelMiddleware` + the 7-scenario real-socket IT suite, IT 2–4 exercising
+  `DistributedCache`'s leader-routed put/delete/expire over the wire).
 - ~~Deletion over Raft (Decision #5)~~ — **done** under the Signed-off work plan, item 1
   (commit `40700d0`): `KeyDataDeleteInput` entry, bridge apply, `DistributedCache.delete()`.
 - ~~EXPIRE / TTL (Follow-up #3)~~ — **done** under the Signed-off work plan, item 2
@@ -303,7 +336,7 @@ subsequently decided, fixed, and regression-tested):
    compaction are explicitly pushed later** — the user: "we'll do snapshots later though so don't
    forget about them". `SNAPSHOTS.md` stays the authoritative backlog for that work (Follow-up #5);
    nothing in `NETWORKING.md` implements snapshot transfer — it only records that the wire format
-   is payload-neutral for it.
+   is payload-neutral for it. **Resolution (2026-11-21):** all four stages delivered — commits `6dc8a1e`, `7a7eb1f`, `b54199b`, `f9b2fde` — all 7 IT scenarios green over real sockets (**267 tests green, 0 failed, 1 pre-existing skip**, `/tmp/opencode/mvn-net-14.log`); the snapshots deferral stands verbatim and `SNAPSHOTS.md` remains the backlog (Follow-up #5).
 9. **Wire serialization: JDK `java.io.Serializable`, no new dependencies** *(decided with #8)*.
    Offline Maven forbids adding a codec library (nothing beyond the current pom is available), and
    `jackson-databind` in the local repo is not a declared dependency — introducing it is still a
@@ -614,4 +647,8 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
   was the only observation of the old promotion behavior.
 - After Signed-off work plan item 4, Snapshots / log compaction (investigation + design only, no code in this pass): **no source-file changes** — the deliverable is `SNAPSHOTS.md` (ground truth, Raft §7 gap analysis, invariants S1–S5, staged implementation plan), so the suite state is inherited from item 3: **242 tests green, 0 failed, 1 pre-existing skip** (`mvn -o -B test`, green 2×: `/tmp/opencode/mvn-prevote.log`, `/tmp/opencode/mvn-prevote-2.log`). Per the signed-off plan clause ("A partial implementation only if the full suite stays green; otherwise the design deliverable stands"), the design deliverable stands and the staged plan is the Follow-up #5 implementation record.
 - After Phase 3 scoping (networking design, no code in this pass): **no source-file changes** — the deliverable is `NETWORKING.md` (wire format: 4-byte BE length + JDK `Serializable` payload; the second `ChannelMiddleware` impl `SocketChannelMiddleware` with PassThru-parity `interrupt`/`restore`; take-down/restart semantics; invariants N1–N6; the 7 IT scenarios and the staged A→D plan), plus the Decisions #8 (snapshots explicitly deferred — "we'll do snapshots later", `SNAPSHOTS.md` stays the backlog) and #9 (serialization: JDK `Serializable`, zero new dependencies, hand-rolled codec as recorded escape valve). Suite state inherited from item 4: **242 tests green, 0 failed, 1 pre-existing skip**; baseline re-verified at commit time. Implementation stages A→D each re-run `mvn -o -B test` (green before commit, logs at `/tmp/opencode/mvn-net-*.log`) before being committed.
+- After Phase 3 **stage A**, wire types `Serializable` (commit `6dc8a1e`): **254 tests green, 0 failed, 1 pre-existing skip** (`mvn -o -B test`, log `/tmp/opencode/mvn-net-5.log`), adding `WireSerializationTest` (12) — the closed wire surface (11 message types + the 3 `KeyData*Input` payload types + `NodeAddress`/`NodeIdentifier`/`TermIndex`) implements `java.io.Serializable` with **zero new dependencies** (Decision #9: offline Maven forbids a codec library), and the tests pin round-trip fidelity through `ByteArrayOutputStream`/`ObjectInputStream` plus the null/boundary construction rejection each type keeps.
+- After Phase 3 **stage B**, `SocketChannelMiddleware` over real sockets (commit `7a7eb1f`): **260 tests green, 0 failed, 1 pre-existing skip** (log `/tmp/opencode/mvn-net-11.log`), adding `SocketChannelMiddlewareTest` (6) — the second, *real* `ChannelMiddleware` implementation: `127.0.0.1`/ephemeral-port channels, 4-byte-BE length framing (payload-neutral for the `Serializable` payloads, so Decision #9's codec-swap escape valve does not re-touch framing), a server-side handshake that resolves the peer's `RaftNode` from its announced address, and PassThru-parity per-node `interrupt`/`restore` (invariants N1–N3: framing integrity, handshake resolution, fault isolation — sealed pairs stay framed and never desynchronize).
+- After Phase 3 **stage C**, `ClusterKit` + ITs 1–6 (commit `b54199b`): **266 tests green, 0 failed, 1 pre-existing skip** (log `/tmp/opencode/mvn-net-13.log`), adding `RealNetworkClusterTest` ITs 1–6 — a production-shaped 3-node cluster (`ClusterKit` gives each node its own middleware on an ephemeral port, own `RaftManager`/`EventBus`, own `PartitionMap`/`DistributedCache`, torn down deterministically): leader election, put/get with apply-then-acknowledge visibility via the facade, delete/expire e2e, and partition-restore of a follower (N4 — the healthy pair keeps committing on a 2-of-3 quorum while the dead connection dead-marks and drops) and of the leader (N5 — the surviving pair elects a new leader at a strictly higher term; after restore the old leader steps down or re-wins at a higher term, and the at-most-one-leader-per-term rule is re-asserted on every poll sample). The `RaftNodeTest` behaviors are thereby re-proven over a real wire.
+- After Phase 3 **stage D**, IT 7 hard-stop/restart (commit `f9b2fde`): **267 tests green, 0 failed, 1 pre-existing skip** (log `/tmp/opencode/mvn-net-14.log`) — the last of `NETWORKING.md`'s 7 scenarios (N6). `ClusterKit.hardStop(i)` stops a slot in crash order (facade unsubscribes → terminal `RaftManager` node stop → idempotent socket close; unlike `interrupt`/`restore` there is nothing to resume), and `restart(i)` brings the *same* slot back with process-restart semantics: a fresh `SocketChannelMiddleware` (new ephemeral wire address), a fresh discovery seeded with the two survivors' current addresses, a fresh `RaftManager` (fresh bus), a fresh node with the same Raft id, started before the slot swap; the survivors keep their bus and state machine, their facades rebuilt over a fresh node list (the old list references the terminal node, whose shut-down executor would reject a leader-routed call). IT 7 then verifies: v1 committed 3/3 and applied on all three state machines → hard-stop a **follower** (no term churn — it is never the leader) → v2 commits on a 2-of-3 quorum on the surviving pair → the stopped node's local view still reads "v1" (frozen state machine behind an unsubscribe-only `close()`) → `restart` → the surviving leader's continuation push replays v1-then-v2 into the fresh node's brand-new map (fresh `globalVersion`, so the two entries re-derive versions 1 and 2, matching the survivors byte-for-byte) → all three local maps hold "v2" at version 2 exactly → exactly one leader, the same pre-stop leader object. **Phase 3 is thereby complete** — the header above is flipped and the Phase 4 note that real transport "follows with phase 3" is delivered by these stages.
 
