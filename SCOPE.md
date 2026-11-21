@@ -93,11 +93,23 @@ This branch adds:
   non-data entries ignored; followers' committed indexes caught up) plus a unit test class
   `StateMachineBridgeTest` (apply, duplicate-delivery idempotency, out-of-order skip, ignore non-data).
 
-### Phase 3 — Node communication over network — ❌ not started
+### Phase 3 — Node communication over network — 🔨 in progress (design done 2026-11-21)
 
 `ChannelMiddleware` is an interface; the only implementation is `PassThruMiddleware` (in-memory,
 test-oriented with fault injection). No real transport, framing, or serialization of the
 `Request`/`Response` envelope on the wire.
+
+**Direction (user, 2026-11-21):** this is the focus now — implement a real socket
+`ChannelMiddleware` and build the integration-test suite that runs an actual 3-node cluster:
+mutate it, take nodes down/restore them, and run real request/response against it, re-proving
+the behaviors today covered only by mocked (PassThru) tests. Snapshots/log-compaction
+(`SNAPSHOTS.md`) are explicitly **deferred** per the same direction — "we'll do snapshots later"
+— and remain the recorded backlog, not part of this work.
+
+The design is documented in **`NETWORKING.md`** (wire format, `SocketChannelMiddleware`,
+fault-injection parity with `PassThruMiddleware`, node take-down/restart semantics, invariants
+N1–N6, the 7 IT scenarios, and staged implementation A→D). Implementation begins stage by stage
+with a green suite per stage; no code changes until Stage A.
 
 ### Phase 4 — Non-partitioned distributed cache — ✅ client API done in this branch
 
@@ -281,6 +293,28 @@ subsequently decided, fixed, and regression-tested):
 6. **`RaftLogs` performance** — `RaftLogs.java:68-69` notes walk-the-deque scaling; out of scope here.
 7. **`Main.java`** — left as the data-layer stress harness; it never had a cluster. Wiring a
    production-style demo (one process = one manager + one map + one bridge) is a phase 3/4 concern.
+8. **Phase 3 — real-network ITs are the immediate focus; snapshots deferred** *(decided
+   2026-11-21 — user direction)*. "This is a good place to start testing full network
+   implementations": scope + log first (`NETWORKING.md`, committed alongside this entry), then
+   implement stage by stage — a real `SocketChannelMiddleware` (second `ChannelMiddleware` impl,
+   alongside `PassThruMiddleware`), a 3-node real-socket `ClusterKit` harness in test scope, and
+   integration tests mirroring the behaviors currently covered only by PassThru-mocked tests
+   (election, put/get/delete/expire, partition-restore, hard-stop/restart). **Snapshots/log
+   compaction are explicitly pushed later** — the user: "we'll do snapshots later though so don't
+   forget about them". `SNAPSHOTS.md` stays the authoritative backlog for that work (Follow-up #5);
+   nothing in `NETWORKING.md` implements snapshot transfer — it only records that the wire format
+   is payload-neutral for it.
+9. **Wire serialization: JDK `java.io.Serializable`, no new dependencies** *(decided with #8)*.
+   Offline Maven forbids adding a codec library (nothing beyond the current pom is available), and
+   `jackson-databind` in the local repo is not a declared dependency — introducing it is still a
+   new dependency. The wire surface is small and closed (11 message types + the 3 `KeyData*Input`
+   payload types + 5 value types), and `KeyDataInput` internally holds a `Map.copyOf(...)`
+   (JDK `ImmutableCollections` map) whose external form under JDK serialization is an opaque
+   blob that round-trips byte-exact within one code version — adequate for in-JVM ITs and
+   recorded honestly as not cross-version-safe (a hand-rolled codec, already designed as the
+   escape valve in `NETWORKING.md` §2.1, is the step if cross-version compatibility is ever
+   required). Frame format (4-byte BE length + payload) is payload-neutral, so that swap does not
+   re-touch framing.
 
 ## Follow-ups / backlog
 
@@ -579,4 +613,5 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
   still runs on every poll sample. The rest of the suite already passed untouched — this
   was the only observation of the old promotion behavior.
 - After Signed-off work plan item 4, Snapshots / log compaction (investigation + design only, no code in this pass): **no source-file changes** — the deliverable is `SNAPSHOTS.md` (ground truth, Raft §7 gap analysis, invariants S1–S5, staged implementation plan), so the suite state is inherited from item 3: **242 tests green, 0 failed, 1 pre-existing skip** (`mvn -o -B test`, green 2×: `/tmp/opencode/mvn-prevote.log`, `/tmp/opencode/mvn-prevote-2.log`). Per the signed-off plan clause ("A partial implementation only if the full suite stays green; otherwise the design deliverable stands"), the design deliverable stands and the staged plan is the Follow-up #5 implementation record.
+- After Phase 3 scoping (networking design, no code in this pass): **no source-file changes** — the deliverable is `NETWORKING.md` (wire format: 4-byte BE length + JDK `Serializable` payload; the second `ChannelMiddleware` impl `SocketChannelMiddleware` with PassThru-parity `interrupt`/`restore`; take-down/restart semantics; invariants N1–N6; the 7 IT scenarios and the staged A→D plan), plus the Decisions #8 (snapshots explicitly deferred — "we'll do snapshots later", `SNAPSHOTS.md` stays the backlog) and #9 (serialization: JDK `Serializable`, zero new dependencies, hand-rolled codec as recorded escape valve). Suite state inherited from item 4: **242 tests green, 0 failed, 1 pre-existing skip**; baseline re-verified at commit time. Implementation stages A→D each re-run `mvn -o -B test` (green before commit, logs at `/tmp/opencode/mvn-net-*.log`) before being committed.
 
