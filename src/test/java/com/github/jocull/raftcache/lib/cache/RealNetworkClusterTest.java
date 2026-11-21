@@ -19,8 +19,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Phase 3, stage C — the integration tests of {@code NETWORKING.md} 4 (scenarios 1–6) re-proven
- * over a real wire: a production-shaped 3-node cluster where every Raft node sits behind its own
+ * Phase 3, stages C+D — the integration tests of {@code NETWORKING.md} 4 (scenarios 1–7)
+ * re-proven over a real wire: a production-shaped 3-node cluster where every Raft node sits behind its own
  * {@link com.github.jocull.raftcache.lib.raft.middleware.SocketChannelMiddleware}
  * (ephemeral {@code 127.0.0.1} port), its own {@code RaftManager}/{@code EventBus}, its own
  * {@code PartitionMap} and its own {@code DistributedCache} — built and torn down by
@@ -40,7 +40,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>partition the <em>leader</em> — the live pair elects a new leader at a strictly higher
  *       term and keeps committing (N4); restore → the old leader is stepped down or re-elected
  *       at a strictly higher term (the {@code RaftNodeTest} rule), one leader overall,
- *       convergence (N5).</li>
+ *       convergence (N5);</li>
+ *   <li>hard-stop a <em>follower</em> and restart it (N6) — the stopped node's view stays
+ *       stale while the surviving pair keeps committing on a 2-of-3 quorum; the restarted
+ *       slot (same Raft id, fresh wire address, empty log) replays the committed log into a
+ *       fresh state machine, and all three local maps converge on the same value and the
+ *       same version.</li>
  * </ol>
  *
  * <p>Value assertions compare the string content of the {@code value} field, never entry
@@ -247,6 +252,62 @@ class RealNetworkClusterTest {
                 assertEquals(version, kit.localViewOf(i, "live-pair").getVersion(),
                         "IT-6: version counters must agree across all three maps on node " + i);
             }
+        }
+    }
+
+    @Test
+    void it7HardStopAndRestart() throws Exception {
+        try (ClusterKit kit = new ClusterKit()) {
+            final RaftNode leader = kit.awaitLeader("IT-7: no leader before the hard stop", WAIT_SECONDS, UNIT);
+
+            // v1 — before the stop, all three are up: the write commits 3/3 and applies
+            // on every local state machine (apply-then-acknowledge: submit completes after
+            // the leader has applied it).
+            final long v1Index = leader
+                    .submit(new KeyDataInput("it7-key", Map.of("value", "v1".getBytes(StandardCharsets.UTF_8))))
+                    .get(WAIT_SECONDS, UNIT).getTermIndex().getIndex();
+            kit.awaitAppliedAll(v1Index, "IT-7: the pre-stop write did not apply on every node", WAIT_SECONDS, UNIT);
+
+            // Hard-stop a follower (not the leader — this scenario has no term change).
+            final int stopped = kit.indexOf(kit.followers().get(0));
+            kit.hardStop(stopped);
+
+            // v2 — with one peer gone: the surviving pair commits on a 2-of-3 quorum, the
+            // same shape as IT-6 (a dead connection dead-marks and drops, the quorum holds).
+            final long v2Index = leader
+                    .submit(new KeyDataInput("it7-key", Map.of("value", "v2".getBytes(StandardCharsets.UTF_8))))
+                    .get(WAIT_SECONDS, UNIT).getTermIndex().getIndex();
+            assertTrue(v2Index > v1Index, "IT-7: the two writes must land as two distinct log entries");
+            for (int i = 0; i < NODES; i++) {
+                if (i != stopped) {
+                    kit.awaitApplied(i, v2Index, "IT-7: surviving node " + i + " did not apply the committed write", WAIT_SECONDS, UNIT);
+                }
+            }
+
+            // The stopped node's state machine is frozen at the pre-stop view.
+            final KeyDataOutput stale = kit.localViewOf(stopped, "it7-key");
+            assertEquals("v1", new String(stale.getData().get("value"), StandardCharsets.UTF_8),
+                    "IT-7: the stopped node's view must stay at the pre-stop value");
+
+            // Restart slot: process-restart semantics — same Raft id, fresh wire address,
+            // empty log. The surviving leader then pushes its full log to the fresh node.
+            kit.restart(stopped);
+
+            // N6 — the restarted node replays the committed log (v1 then v2) into its fresh
+            // state machine and converges.
+            kit.awaitApplied(stopped, v2Index,
+                    "IT-7: the restarted node did not converge to the committed log", WAIT_SECONDS, UNIT);
+            for (int i = 0; i < NODES; i++) {
+                final KeyDataOutput view = kit.localViewOf(i, "it7-key");
+                assertEquals("v2", new String(view.getData().get("value"), StandardCharsets.UTF_8),
+                        "IT-7: node " + i + " must converge to the post-stop value (same value everywhere)");
+                assertEquals(2L, view.getVersion(),
+                        "IT-7: node " + i + " sees exactly the two entries as versions 1 and 2");
+            }
+
+            // The cluster is whole again: exactly one leader, and it is the survivor.
+            assertEquals(1, kit.leaders().size(), "IT-7: exactly one leader after the restart");
+            assertTrue(kit.leaders().get(0) == leader, "IT-7: the surviving leader must keep its seat");
         }
     }
 }

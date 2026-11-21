@@ -3,6 +3,7 @@ package com.github.jocull.raftcache.lib.cache;
 import com.github.jocull.raftcache.lib.MutableClock;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.data.PartitionMap;
+import com.github.jocull.raftcache.lib.event.EventBus;
 import com.github.jocull.raftcache.lib.raft.NodeStates;
 import com.github.jocull.raftcache.lib.raft.RaftManager;
 import com.github.jocull.raftcache.lib.raft.RaftNode;
@@ -35,6 +36,10 @@ import java.util.stream.Collectors;
  * <p>Knobs: {@link #interrupt(int)} seals one node's middleware two-way (the N3 discipline —
  * the far side stays framed and never desynchronizes), {@link #restore(int)} lifts the
  * partition, and the node's own paths resume traffic over the already-established channels.
+ * {@link #hardStop(int)} kills a node for good (facade, then node, then sockets — terminal),
+ * and {@link #restart(int)} brings the same slot back with process-restart semantics (fresh
+ * wire address, empty log, same Raft id) while the survivors keep bus and state machine
+ * (the N6 scenario).
  * {@link #awaitLeader(String, long, TimeUnit)} / {@link #awaitNewLeader} re-assert
  * at-most-one-leader-per-term on <em>every</em> poll sample (the {@code RaftNodeTest}
  * hardening rule): a per-term split-brain fails the test on the very sample that sees it.
@@ -51,6 +56,9 @@ public final class ClusterKit implements AutoCloseable {
     private final List<RaftNode> nodes = new ArrayList<>(NODE_COUNT);
     private final List<PartitionMap> maps = new ArrayList<>(NODE_COUNT);
     private final List<DistributedCache> caches = new ArrayList<>(NODE_COUNT);
+
+    /** The kit's clock (null = system UTC), reused for any state machine built after a restart. */
+    private MutableClock sharedClock;
 
     /** No shared clock: expirations resolve against {@code Clock.systemUTC()} (unused by the CRUD ITs). */
     public ClusterKit() {
@@ -79,6 +87,8 @@ public final class ClusterKit implements AutoCloseable {
     }
 
     private void build(MutableClock sharedClock) {
+        this.sharedClock = sharedClock;
+
         // Phase 1 — per-node scaffolding, in node order. The node's wire address is this
         // middleware's bound host:port: self-skipping and the server-side handshake target
         // resolution both match on exactly this string.
@@ -108,9 +118,7 @@ public final class ClusterKit implements AutoCloseable {
         // bridge onto its own node's bus and replays that node's committed entries into its
         // own map -- production shape: three independent state machines, same log.
         for (int i = 0; i < NODE_COUNT; i++) {
-            final PartitionMap map = sharedClock != null
-                    ? new PartitionMap(managers.get(i).getEventBus(), PARTITION_MAP_SIZE, sharedClock)
-                    : new PartitionMap(managers.get(i).getEventBus(), PARTITION_MAP_SIZE);
+            final PartitionMap map = newMapFor(managers.get(i).getEventBus());
             maps.add(map);
             caches.add(new DistributedCache(managers.get(i).getEventBus(), List.copyOf(nodes), map));
         }
@@ -175,6 +183,106 @@ public final class ClusterKit implements AutoCloseable {
     /** Ends a partition started by {@link #interrupt(int)}; traffic resumes in order. */
     public void restore(int i) {
         middlewares.get(i).restore(middlewares.get(i).getAddress());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Hard stop / restart (N6 — crash + process-restart semantics)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Hard-stops node {@code i} in crash order: its facade stops observing the bus first,
+     * then its manager stops its node (terminal — the node executor is shut down), then its
+     * middleware closes the server socket and channels (idempotent). The slot size is kept
+     * stable: the now-terminal objects stay in the lists; {@link #restart(int)} replaces
+     * them with fresh ones. Unlike {@link #interrupt(int)} nothing can be resumed — this is
+     * a process crash, not a partition.
+     */
+    public void hardStop(int i) {
+        closeQuietly(caches.get(i));       // unsubscribe from the bus before the executor dies
+        closeQuietly(managers.get(i));     // terminal: stops the node
+        closeQuietly(middlewares.get(i));  // idempotent: server socket + channels
+        LOGGER.info("ClusterKit hard-stopped node slot {}: {}@{}",
+                i, nodes.get(i).getId(), nodes.get(i).getNodeAddress().getAddress());
+    }
+
+    /**
+     * Restarts slot {@code i} with process-restart semantics — the same slot, a different
+     * process: fresh {@link SocketChannelMiddleware} (binds a fresh ephemeral wire address),
+     * fresh {@link InMemoryTopologyDiscovery} pre-seeded with the two survivors' <em>current</em>
+     * addresses, fresh {@link RaftManager} (hence a fresh event bus), a fresh Raft node with
+     * the <em>same Raft id</em> ({@code node(i+1)}), and a fresh state machine + facade for
+     * the slot. The survivors keep their bus and state machine, but their facades are
+     * rebuilt over a fresh node list that contains the new node object — their old list still
+     * holds the terminal old object, whose shut-down executor would reject any call.
+     *
+     * <p>Bootstrap discipline: the fresh node dials only the two survivors (its discovery
+     * lists exactly their current addresses, and each {@code openChannel} blocks until the
+     * peer's accept handler is installed), and the survivors never re-dial. The fresh node
+     * starts with an empty log at term 0, so the surviving leader's heartbeat pushes its
+     * full log over the fresh connection.
+     *
+     * @throws IllegalStateException if any join during bootstrap fails (everything this
+     *         call built is then closed before rethrowing; the terminal old-slot objects
+     *         are left as-is — there is nothing to restore)
+     */
+    public void restart(int i) {
+        final SocketChannelMiddleware middlewareNew = new SocketChannelMiddleware();
+        final InMemoryTopologyDiscovery discoveryNew = new InMemoryTopologyDiscovery();
+        for (int j = 0; j < NODE_COUNT; j++) {
+            if (j != i) {
+                discoveryNew.addKnownNode(middlewares.get(j).getAddress());
+            }
+        }
+        final RaftManager managerNew = new RaftManager(discoveryNew, middlewareNew);
+
+        try {
+            final RaftNode nodeNew = managerNew.newNode("node" + (i + 1), middlewareNew.getAddress());
+            middlewareNew.addNode(nodeNew); // required for the server-side handshake to resolve it
+
+            // Connect, then start, both joined before any further step (same ritual as build):
+            // the fresh node is a started FOLLOWER before the survivors talk to it.
+            nodeNew.connectWithTopology().join();
+            nodeNew.start().join();
+
+            // Swap the slots (sizes stay stable).
+            middlewares.set(i, middlewareNew);
+            discoveries.set(i, discoveryNew);
+            managers.set(i, managerNew);
+            nodes.set(i, nodeNew);
+
+            // Facade rebuild. Close the survivors' old facades before their replacements
+            // subscribe to the same buses, so no bus entry is ever applied twice.
+            for (int j = 0; j < NODE_COUNT; j++) {
+                if (j != i) {
+                    closeQuietly(caches.get(j));
+                }
+            }
+            final PartitionMap mapNew = newMapFor(managerNew.getEventBus());
+            maps.set(i, mapNew);
+            final List<RaftNode> clusterNodes = List.copyOf(nodes);
+            caches.set(i, new DistributedCache(managerNew.getEventBus(), clusterNodes, mapNew));
+            for (int j = 0; j < NODE_COUNT; j++) {
+                if (j != i) {
+                    caches.set(j, new DistributedCache(managers.get(j).getEventBus(), clusterNodes, maps.get(j)));
+                }
+            }
+            LOGGER.info("ClusterKit restarted slot {} as {}@{}", i, nodeNew.getId(), middlewareNew.getAddress());
+        } catch (RuntimeException ex) {
+            // Partial-failure cleanup: tear down what this call built; the old slot objects
+            // are already terminal (hardStop), so there is nothing to restore.
+            closeQuietly(managerNew);     // stops the fresh node
+            closeQuietly(middlewareNew);  // idempotent: fresh sockets
+            throw (ex instanceof IllegalStateException)
+                    ? ex
+                    : new IllegalStateException("Failed to restart cluster node slot " + i, ex);
+        }
+    }
+
+    /** A new state machine for this kit: {@link #PARTITION_MAP_SIZE} partitions, the kit's clock. */
+    private PartitionMap newMapFor(EventBus bus) {
+        return sharedClock != null
+                ? new PartitionMap(bus, PARTITION_MAP_SIZE, sharedClock)
+                : new PartitionMap(bus, PARTITION_MAP_SIZE);
     }
 
     // ---------------------------------------------------------------------------
