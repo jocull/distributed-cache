@@ -1,6 +1,10 @@
 package com.github.jocull.raftcache.lib.raft.messages;
 
-public class VoteResponse {
+import java.io.Serializable;
+
+public class VoteResponse implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final int term;
     private final TermIndex committedTermIndex;
     private final boolean voteGranted;

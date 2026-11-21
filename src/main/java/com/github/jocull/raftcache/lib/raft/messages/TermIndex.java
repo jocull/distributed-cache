@@ -1,6 +1,10 @@
 package com.github.jocull.raftcache.lib.raft.messages;
 
-public class TermIndex {
+import java.io.Serializable;
+
+public class TermIndex implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final int term;
     private final long index;
 

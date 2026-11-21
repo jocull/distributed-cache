@@ -2,7 +2,11 @@ package com.github.jocull.raftcache.lib.raft.messages;
 
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
 
-public class NodeIdentifier {
+import java.io.Serializable;
+
+public class NodeIdentifier implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final String id;
     private final NodeAddress nodeAddress;
 

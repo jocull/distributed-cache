@@ -1,6 +1,10 @@
 package com.github.jocull.raftcache.lib.raft.messages;
 
-public class AcknowledgeEntries {
+import java.io.Serializable;
+
+public class AcknowledgeEntries implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     // Current term, for the leader to update itself
     private final int term;
     // True if follower contained entry matching previous log entry and term

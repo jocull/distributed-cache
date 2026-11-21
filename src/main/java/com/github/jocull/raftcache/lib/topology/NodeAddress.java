@@ -1,8 +1,11 @@
 package com.github.jocull.raftcache.lib.topology;
 
+import java.io.Serializable;
 import java.util.Objects;
 
-public class NodeAddress {
+public class NodeAddress implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final String address;
 
     public NodeAddress(String address) {

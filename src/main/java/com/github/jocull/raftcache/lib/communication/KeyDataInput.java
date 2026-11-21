@@ -1,9 +1,12 @@
 package com.github.jocull.raftcache.lib.communication;
 
+import java.io.Serializable;
 import java.util.Map;
 import java.util.Objects;
 
-public class KeyDataInput {
+public class KeyDataInput implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final String key;
     private final Map<String, byte[]> data;
 

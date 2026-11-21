@@ -244,6 +244,14 @@ Existing bar: **242 green / 0 fail / 1 skip** (the only skip is the pre-existing
   this is an extension, not a redesign.
 5. **Snapshot transfer** (`SNAPSHOTS.md`) is the stage-6-ish consumer of this wire: once it is
    implemented, its payload crosses the same frames — the format is payload-neutral for that.
+6. **Missing/weak `equals` in the wire surface** (recorded during Stage A, 2026-11-21). The
+   message classes (`TermIndex`, `AcknowledgeEntries`, the vote/pre-vote pair, `AppendEntries`,
+   ...) have **no `equals`**, and `KeyDataInput.equals` compares `byte[]` values **by reference
+   identity** (a latent pre-existing wart: two semantically equal inputs are never equal). Stage A
+   deliberately does not touch value semantics (marker interface only), so `WireSerializationTest`
+   asserts round-trip fidelity field-by-field. Adding value `equals` to the wire types (and fixing
+   `KeyDataInput`) is a safe follow-up if ever needed — nothing in `src/main` relies on that
+   `equals` today (verified: the bridge and `PartitionMap` compare by key, not by entry equality).
 
 ## 7. Verification
 

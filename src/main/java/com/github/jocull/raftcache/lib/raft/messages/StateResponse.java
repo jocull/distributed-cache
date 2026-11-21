@@ -4,7 +4,11 @@ import com.github.jocull.raftcache.lib.raft.NodeStates;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 
-public class StateResponse extends Response {
+import java.io.Serializable;
+
+public class StateResponse extends Response implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final NodeIdentifier identifier;
     private final NodeStates state;
     private final int term;

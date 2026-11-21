@@ -8,7 +8,11 @@ package com.github.jocull.raftcache.lib.raft.messages;
  * <p>Per pre-vote semantics a response never advances the receiver's term, even when
  * {@code term} is greater than the receiver's current term.
  */
-public class PreVoteResponse {
+import java.io.Serializable;
+
+public class PreVoteResponse implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final int term;
     private final boolean preVoteGranted;
 

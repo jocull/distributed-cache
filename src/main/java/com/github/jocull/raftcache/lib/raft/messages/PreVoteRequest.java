@@ -8,7 +8,11 @@ package com.github.jocull.raftcache.lib.raft.messages;
  * no {@code votedFor} mutation, no timer reset. The only side effect permitted on the voter
  * is sending back a {@link PreVoteResponse}.
  */
-public class PreVoteRequest {
+import java.io.Serializable;
+
+public class PreVoteRequest implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final int term;
     private final String candidateId;
     private final TermIndex lastLogTermIndex;

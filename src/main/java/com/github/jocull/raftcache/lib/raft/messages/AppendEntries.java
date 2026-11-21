@@ -1,10 +1,13 @@
 package com.github.jocull.raftcache.lib.raft.messages;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
-public class AppendEntries {
+public class AppendEntries implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     // Leader's term
     private final int term;
     // Index of log immediately preceding new ones
@@ -48,7 +51,9 @@ public class AppendEntries {
                 '}';
     }
 
-    public static class RaftLog {
+    public static class RaftLog implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         private final TermIndex termIndex;
         private final Object entry;
 

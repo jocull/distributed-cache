@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.communication;
 
+import java.io.Serializable;
 import java.util.Objects;
 
 /**
@@ -13,7 +14,9 @@ import java.util.Objects;
  * {@code false}) -- so replaying the same entry, or applying it on several nodes that share a
  * bus, is idempotent and safe under Raft.
  */
-public class KeyDataDeleteInput {
+public class KeyDataDeleteInput implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final String key;
 
     public KeyDataDeleteInput(String key) {

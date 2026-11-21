@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.communication;
 
+import java.io.Serializable;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -17,7 +18,9 @@ import java.util.Objects;
  * it is deliberately not resolved when the entry is submitted (the leader and the followers
  * apply it at different instants).
  */
-public class KeyDataExpireInput {
+public class KeyDataExpireInput implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final String key;
     private final Duration ttl;
 
