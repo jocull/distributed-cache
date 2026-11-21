@@ -42,7 +42,7 @@ to done (with commit refs), and the Test-evidence section gains the per-item run
 | 1 DELETE | ✅ done — commit `40700d0`, 213 tests green |
 | 2 TTL/EXPIRE | ✅ done — commit `f8e901d`, 232 tests green |
 | 3 Pre-Vote | ✅ done — commit `f35e60d`, 242 tests green |
-| 4 Snapshots | ⏭ pending (item 3 first) |
+| 4 Snapshots | ✅ investigated — `SNAPSHOTS.md` + this flip (no code; suite still 242 green) |
 
 ## Phase status
 
@@ -67,7 +67,7 @@ Flagged deviations / gaps (see Decisions below):
 | ~~Leader's `AppendLog` subscriber was created but **never subscribed**~~ — **fixed in this branch**: subscribed in the leader ctor, so new entries push immediately via the `NEW_LOG` event instead of waiting up to one 50 ms heartbeat | `RaftNodeBehaviorLeader.java` ctor |
 | ~~A 2-node cluster can never commit: majority is computed as `size/2+1` but the leader only counted follower acks~~ — **fixed in this branch**: the leader's own log now counts toward the commit majority | `ClusterTopology.java:34-36`, `RaftNodeBehaviorLeader.updateCommittedIndex` |
 | ~~A 1-node cluster could never elect a leader (and therefore never commit or serve)~~ — **fixed in this branch**: the candidate recognizes its own vote as a majority when it is the only voter | `RaftNodeBehaviorCandidate.java` ctor |
-| No snapshot install / log compaction (Raft §7) | `InstallSnapshotExample.java` is a sketch only |
+| No snapshot install / log compaction (Raft §7) — **investigated 2026-11-21 (item 4):** gap analysis + invariants + staged plan in `SNAPSHOTS.md`; implementation still outstanding (Follow-up #5) | `InstallSnapshotExample.java` sketch (do-not-modify); design in `SNAPSHOTS.md` |
 | `disconnectFrom` throws `UnsupportedOperationException` | `RaftNodeImpl.java:166-169` |
 
 ### Phase 2 — Basic state machine fed by Raft — 🔨 completed in this branch
@@ -248,10 +248,18 @@ subsequently decided, fixed, and regression-tested):
    NOT the discriminator, since there committed == last for every voter) and
    `testUpToDateRuleUncommittedTailLoses` (the liveness discriminator, proven by reverting
    the candidate to the committed report and watching the split starve — see Test evidence).
-2. **Snapshots / log compaction** — `InstallSnapshotExample.java` and the `proto/raft/*` package
+2. **Snapshots / log compaction** — *(investigation + design delivered 2026-11-21 as item 4:
+   `SNAPSHOTS.md`)*. `InstallSnapshotExample.java` and the `proto/raft/*` package
    (`src/main/java/.../proto/raft/`, including its own sketch test) are design sketches and remain
    as working notes. They are **not build targets** and must not be deleted without sign-off.
    `RaftLogs.rollback()` only trims uncommitted logs; committed logs are never compacted.
+   **Resolution (2026-11-21).** Item 4 delivered per the signed-off plan as the investigation/design
+   deliverable — `SNAPSHOTS.md` records the full ground truth (§1: the deque log with its `EPOCH_LOG`
+   seed and compaction-absent `rollback()`, the uncalled `PartitionMap.getSnapshot()`, the absent
+   snapshot message/handler/trigger, the catch-up path with no escape hatch), the §7/§5.4.1/etcd gap
+   analysis (§2), the five safety invariants S1–S5, and a five-stage implementation plan ordered by
+   risk (§3–§4). Per the plan's clause, no partial implementation was taken in the unattended pass;
+   Stages 1–2 are recorded as the safe, isolated first implementation step.
 3. **`disconnectFrom`** — `RaftNodeImpl.java:166-169` throws `UnsupportedOperationException`;
    node removal is not part of phase 2. (Consequence: the downed-follower quorum path — a leader
    with a live follower disconnected — is untestable until this exists; the quorum fix above was
@@ -313,10 +321,7 @@ which stay the detailed record.
    today means taking the cluster down and rolling it over. No join/leave protocol, no joint
    consensus, no member transitions. This also keeps Decisions #3 (`disconnectFrom`) relevant
    until real removal semantics exist.
-5. **Snapshots / log compaction** *(deferred; not started)* — Decisions #2. The originally
-   defined operations will eventually need committed-log compaction before unbounded growth;
-   `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see
-   Decisions #2).
+5. **Snapshots / log compaction** — *(investigated 2026-11-21, item 4 delivered as design, `SNAPSHOTS.md`)* — Decisions #2, design in `SNAPSHOTS.md`. Ground truth: committed entries are **never** compacted (only the uncommitted tail is trimmed, `RaftLogs.rollback()`), no snapshot message / follower install / leader trigger exists, and `PartitionMap.getSnapshot()` — the exact state a snapshot must capture — is already implemented but never called. Remaining work is the staged plan (`SNAPSHOTS.md` §4): Stage 1 state capture + `replaceState`/`adopt`; Stage 2 `RaftLogs` snapshot boundary + `compact()` (closing the `containsStartPoint` TODOs); Stage 3 `InstallSnapshot`/`Response` messages (sketch-shaped: term, leaderId, lastIncluded index/term, payload, offset/done); Stage 4 follower install behind the S2 progress-only guard; Stage 5 leader laggard detection + send + compaction trigger behind the S1 bound. Stages 1–2 are isolated and testable without protocol risk. `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see Decisions #2).
 6. **Election up-to-date rule** *(done in this branch)* — Decisions #1. The candidate's
    `VoteRequest` now reports the last log entry's term/index per Raft §5.4.1 (commit
    `6b33a9c`), with the voting path fixed so the rule is honored (`2c4dd89`): no rollback on
@@ -573,4 +578,5 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
   (followers under pre-vote, candidates under the old rule); `assertAtMostOneLeaderPerTerm`
   still runs on every poll sample. The rest of the suite already passed untouched — this
   was the only observation of the old promotion behavior.
+- After Signed-off work plan item 4, Snapshots / log compaction (investigation + design only, no code in this pass): **no source-file changes** — the deliverable is `SNAPSHOTS.md` (ground truth, Raft §7 gap analysis, invariants S1–S5, staged implementation plan), so the suite state is inherited from item 3: **242 tests green, 0 failed, 1 pre-existing skip** (`mvn -o -B test`, green 2×: `/tmp/opencode/mvn-prevote.log`, `/tmp/opencode/mvn-prevote-2.log`). Per the signed-off plan clause ("A partial implementation only if the full suite stays green; otherwise the design deliverable stands"), the design deliverable stands and the staged plan is the Follow-up #5 implementation record.
 
