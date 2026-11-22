@@ -3,6 +3,8 @@ package com.github.jocull.raftcache.lib.raft;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshot;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshotResponse;
 import com.github.jocull.raftcache.lib.raft.messages.Introduction;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
@@ -469,6 +471,14 @@ class RaftNodeBehaviorPreVoteTest {
 
         @Override
         public void sendAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries) {
+        }
+
+        @Override
+        public void sendInstallSnapshot(InstallSnapshot installSnapshot) {
+        }
+
+        @Override
+        public void sendInstallSnapshotResponse(InstallSnapshotResponse installSnapshotResponse) {
         }
 
         List<VoteResponse> voteResponses() {

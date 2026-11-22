@@ -123,6 +123,14 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
             receiverProvider.run(receiver -> receiver.onAcknowledgeEntries(this, (AcknowledgeEntries) message));
             return;
         }
+        if (message instanceof InstallSnapshot) {
+            receiverProvider.run(receiver -> receiver.onInstallSnapshot(this, (InstallSnapshot) message));
+            return;
+        }
+        if (message instanceof InstallSnapshotResponse) {
+            receiverProvider.run(receiver -> receiver.onInstallSnapshotResponse(this, (InstallSnapshotResponse) message));
+            return;
+        }
 
         throw new UnsupportedOperationException("Unknown message type: " + message.getClass().getName());
     }
@@ -181,5 +189,15 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     @Override
     public void sendAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries) {
         send(acknowledgeEntries);
+    }
+
+    @Override
+    public void sendInstallSnapshot(InstallSnapshot installSnapshot) {
+        send(installSnapshot);
+    }
+
+    @Override
+    public void sendInstallSnapshotResponse(InstallSnapshotResponse installSnapshotResponse) {
+        send(installSnapshotResponse);
     }
 }

@@ -20,4 +20,8 @@ public interface NodeCommunicationReceiver {
     void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries);
 
     void onAcknowledgeEntries(NodeConnectionOutbound sender, AcknowledgeEntries acknowledgeEntries);
+
+    void onInstallSnapshot(NodeConnectionOutbound sender, InstallSnapshot installSnapshot);
+
+    void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse);
 }

@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.data;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.Map;
 
@@ -15,8 +16,14 @@ import java.util.Map;
  * identical expiry semantics on a node whose clock differs.
  *
  * <p>Immutable: the data map is a detached copy.
+ *
+ * <p>{@link Serializable} so a {@link Snapshot} of these values can ride the wire as the
+ * payload of an {@code InstallSnapshot} message (SNAPSHOTS.md stage 3): the wire is JDK
+ * serialization (NETWORKING.md decision #9).
  */
-public class DataVersion {
+public class DataVersion implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     /** No expiration (never expires). */
     public static final long NO_EXPIRY = Long.MAX_VALUE;
 

@@ -114,4 +114,27 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
         final StateResponse response =getStateResponse(stateRequest);
         sender.sendStateResponse(response);
     }
+
+    /**
+     * Default: an InstallSnapshot is only meaningful to a follower that accepts it (SNAPSHOTS.md
+     * stage 4); other roles never act on one. Warn and ignore so an unexpected copy (e.g. a
+     * leader message racing a role change) is logged, not fatal.
+     */
+    @Override
+    public void onInstallSnapshot(NodeConnectionOutbound sender, InstallSnapshot installSnapshot) {
+        LOGGER.warn("{} Ignoring InstallSnapshot from {} (term={}, lastIncluded {} @ {}) — {} does not install snapshots",
+                self.getId(), sender.getRemoteNodeId(), installSnapshot.getTerm(),
+                installSnapshot.getLastIncludedIndex(), installSnapshot.getLastIncludedTerm(), state);
+    }
+
+    /**
+     * Default: InstallSnapshotResponse is only meaningful to the leader that sent the
+     * InstallSnapshot (SNAPSHOTS.md stage 5). Ignore with a warning elsewhere.
+     */
+    @Override
+    public void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse) {
+        LOGGER.warn("{} Ignoring InstallSnapshotResponse from {} (term={}, index={}) — {} does not track snapshot installs",
+                self.getId(), sender.getRemoteNodeId(), installSnapshotResponse.getTerm(),
+                installSnapshotResponse.getIndex(), state);
+    }
 }

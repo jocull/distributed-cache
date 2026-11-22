@@ -24,4 +24,8 @@ public interface NodeCommunicationSender {
     void sendAppendEntries(AppendEntries appendEntries);
 
     void sendAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries);
+
+    void sendInstallSnapshot(InstallSnapshot installSnapshot);
+
+    void sendInstallSnapshotResponse(InstallSnapshotResponse installSnapshotResponse);
 }

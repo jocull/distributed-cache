@@ -7,6 +7,8 @@ import com.github.jocull.raftcache.lib.raft.NodeStates;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshot;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshotResponse;
 import com.github.jocull.raftcache.lib.raft.messages.Introduction;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
@@ -16,6 +18,8 @@ import com.github.jocull.raftcache.lib.raft.messages.StateResponse;
 import com.github.jocull.raftcache.lib.raft.messages.TermIndex;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
+import com.github.jocull.raftcache.lib.data.DataVersion;
+import com.github.jocull.raftcache.lib.data.Snapshot;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import org.junit.jupiter.api.Test;
 
@@ -183,6 +187,44 @@ class WireSerializationTest {
         AcknowledgeEntries deny = roundTrip(new AcknowledgeEntries(6, false, new TermIndex(6, 5)));
         assertEquals(6, deny.getTerm());
         assertFalse(deny.isSuccess());
+    }
+
+    @Test
+    void installSnapshotRoundTripWithRealSnapshotPayload() throws Exception {
+        // The payload is the same object the state machine captures (lib.data.Snapshot); it must be
+        // Serializable enough for the wire (N2 round-trip fidelity on the stage-3 message).
+        Snapshot snapshot = new Snapshot(6, 21, Map.of(
+                "alpha", new DataVersion(Map.of("f1", new byte[]{1, 2}), 7, 1_700_000_000_000L),
+                "beta", new DataVersion(Map.of("f1", new byte[]{9}), 3)));
+
+        // Single chunk: offset=0, done=true (offset/done are reserved for chunked sends).
+        InstallSnapshot install = roundTrip(new InstallSnapshot(6, "leader-1", 21, 6, 0L, snapshot, true));
+        assertEquals(6, install.getTerm());
+        assertEquals("leader-1", install.getLeaderId());
+        assertEquals(21, install.getLastIncludedIndex());
+        assertEquals(6, install.getLastIncludedTerm());
+        assertEquals(0, install.getOffset());
+        assertTrue(install.isDone());
+        assertTrue(install.getPayload() instanceof Snapshot, "payload must be the snapshot object itself");
+        Snapshot back = (Snapshot) install.getPayload();
+        assertEquals(6, back.term());
+        assertEquals(21, back.index());
+        assertEquals(snapshot.entries().keySet(), back.entries().keySet());
+        for (String key : snapshot.entries().keySet()) {
+            DataVersion original = snapshot.entries().get(key);
+            DataVersion deserialized = back.entries().get(key);
+            assertEquals(original.getVersion(), deserialized.getVersion());
+            assertEquals(original.getExpiresAtEpochMillis(), deserialized.getExpiresAtEpochMillis());
+            assertEquals(original.getData().keySet(), deserialized.getData().keySet());
+            for (String field : original.getData().keySet()) {
+                assertTrue(Arrays.equals(original.getData().get(field), deserialized.getData().get(field)),
+                        "entry for " + key + "/" + field + " must match byte-for-byte");
+            }
+        }
+
+        InstallSnapshotResponse reply = roundTrip(new InstallSnapshotResponse(6, 21));
+        assertEquals(6, reply.getTerm());
+        assertEquals(21, reply.getIndex());
     }
 
     @Test

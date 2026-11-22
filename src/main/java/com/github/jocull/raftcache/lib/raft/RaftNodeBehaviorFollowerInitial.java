@@ -2,6 +2,8 @@ package com.github.jocull.raftcache.lib.raft;
 
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshot;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshotResponse;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
@@ -44,6 +46,16 @@ class RaftNodeBehaviorFollowerInitial extends RaftNodeBehavior {
 
     @Override
     public void onAcknowledgeEntries(NodeConnectionOutbound sender, AcknowledgeEntries acknowledgeEntries) {
+        throw new IllegalStateException(self.getId() + ": Initial follower is not yet started.");
+    }
+
+    @Override
+    public void onInstallSnapshot(NodeConnectionOutbound sender, InstallSnapshot installSnapshot) {
+        throw new IllegalStateException(self.getId() + ": Initial follower is not yet started.");
+    }
+
+    @Override
+    public void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse) {
         throw new IllegalStateException(self.getId() + ": Initial follower is not yet started.");
     }
 }

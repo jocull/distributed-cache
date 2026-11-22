@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.data;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -25,7 +26,8 @@ import java.util.Map;
  * @param index   index of that entry, i.e. the last applied index (0 if none -- log indices start at 1)
  * @param entries key -> value with version and expiration, at the moment of capture
  */
-public record Snapshot(long term, long index, Map<String, DataVersion> entries) {
+public record Snapshot(long term, long index, Map<String, DataVersion> entries) implements Serializable {
+    private static final long serialVersionUID = 1L;
 
     public Snapshot {
         if (entries == null) {
