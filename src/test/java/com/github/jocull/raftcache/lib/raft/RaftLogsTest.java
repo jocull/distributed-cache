@@ -175,4 +175,116 @@ public class RaftLogsTest {
         assertNotEquals(Thread.currentThread(), futureThread.get());
         assertTrue(futureExceptionallyRan.get());
     }
+
+    @Test
+    void testCompactKeepsTailAndBoundaryIsStartPoint() {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        raftLogs.appendLog(1, "a"); // (1,1)
+        raftLogs.appendLog(1, "b"); // (1,2)
+        raftLogs.appendLog(1, "c"); // (1,3)
+        raftLogs.appendLog(1, "d"); // (1,4)
+        raftLogs.commit(new TermIndex(1, 2L));
+
+        // Fresh log: no snapshot at the start point
+        assertFalse(raftLogs.hasStartPointSnapshot());
+        assertEquals(TermIndex.EPOCH, raftLogs.getStartTermIndex());
+        assertNull(raftLogs.getSnapshotPayload());
+
+        raftLogs.compact(new TermIndex(1, 2L), "payload");
+
+        assertTrue(raftLogs.hasStartPointSnapshot());
+        assertEquals(new TermIndex(1, 2L), raftLogs.getStartTermIndex());
+        assertEquals("payload", raftLogs.getSnapshotPayload());
+
+        // Tail and commit pointers are untouched by compaction
+        assertEquals(4L, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals(2L, raftLogs.getCommittedTermIndex().getIndex());
+
+        // The boundary is now the start point; the compacted region is gone
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 2L)));
+        assertFalse(raftLogs.containsStartPoint(new TermIndex(1, 1L)));
+
+        // Ranges never serve the marker as content
+        final List<RaftLog<?>> range = raftLogs.getLogRange(TermIndex.EPOCH, 25);
+        assertEquals(2, range.size());
+        assertEquals("c", range.get(0).getEntry());
+        assertEquals("d", range.get(1).getEntry());
+    }
+
+    @Test
+    void testRollbackStopsAtBoundary() {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        raftLogs.appendLog(1, "a");
+        raftLogs.appendLog(1, "b");
+        raftLogs.appendLog(1, "c");
+        raftLogs.commit(new TermIndex(1, 2L));
+        raftLogs.compact(new TermIndex(1, 2L), "payload");
+
+        // Demotion rolls back only uncommitted entries; the boundary marker survives (S5)
+        final List<RaftLog<?>> removed = raftLogs.rollback();
+        assertEquals(1, removed.size());
+        assertEquals("c", removed.get(0).getEntry());
+
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 2L)));
+        // With the recorded tail pulled down to committed, the reported tail stays at the
+        // start point instead of dropping past it (S3)
+        assertEquals(new TermIndex(1, 2L), raftLogs.getCurrentTermIndex());
+
+        // The log keeps working past the boundary
+        final RaftLog<String> c2 = raftLogs.appendLog(1, "c2");
+        assertEquals(3L, c2.getTermIndex().getIndex());
+        assertEquals(3L, raftLogs.getCurrentTermIndex().getIndex());
+    }
+
+    @Test
+    void testCompactInstallBeyondTail() {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        raftLogs.appendLog(1, "a");
+        raftLogs.appendLog(1, "b");
+        raftLogs.rollback(); // discard the uncommitted tail -> recorded tail back at the epoch
+
+        // The snapshot at (1,2) sits beyond the local tail: a full install (S2)
+        raftLogs.compact(new TermIndex(1, 2L), "payload");
+
+        assertEquals(new TermIndex(1, 2L), raftLogs.getCurrentTermIndex());
+        assertTrue(raftLogs.hasStartPointSnapshot());
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 2L)));
+        assertFalse(raftLogs.containsStartPoint(new TermIndex(1, 1L)));
+        assertTrue(raftLogs.getLogRange(TermIndex.EPOCH, 25).isEmpty());
+
+        // Computed appends continue past the boundary, never into the compacted region
+        final RaftLog<String> c = raftLogs.appendLog(1, "c");
+        assertEquals(3L, c.getTermIndex().getIndex());
+
+        // Committing up to, and past, the boundary re-applies nothing; fresh entries commit as usual
+        assertTrue(raftLogs.commit(new TermIndex(1, 2L)).isEmpty());
+        final List<RaftLog<?>> committed = raftLogs.commit(new TermIndex(1, 3L));
+        assertEquals(1, committed.size());
+        assertEquals("c", committed.get(0).getEntry());
+    }
+
+    @Test
+    void testCompactGuards() {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        raftLogs.appendLog(1, "a");
+        raftLogs.appendLog(1, "b");
+
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.compact(null, "payload"));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.compact(new TermIndex(1, -1L), "payload"));
+
+        raftLogs.commit(new TermIndex(1, 1L));
+        raftLogs.compact(new TermIndex(1, 1L), "payload1");
+
+        // Same boundary again: idempotent, only the payload is updated
+        raftLogs.compact(new TermIndex(1, 1L), "payload1b");
+        assertEquals("payload1b", raftLogs.getSnapshotPayload());
+
+        // S5: the start point only ever moves forward
+        assertThrows(IllegalStateException.class, () -> raftLogs.compact(TermIndex.EPOCH, "payload2"));
+
+        // Never drop locally-committed entries
+        raftLogs.appendLog(1, "c");
+        raftLogs.commit(new TermIndex(1, 2L));
+        assertThrows(IllegalStateException.class, () -> raftLogs.compact(new TermIndex(2, 1L), "payload2"));
+    }
 }

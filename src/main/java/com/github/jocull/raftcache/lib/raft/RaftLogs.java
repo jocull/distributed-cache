@@ -11,6 +11,16 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+/**
+ * A node's Raft log: an index-ordered deque of (term, index) -> entry records,
+ * seeded by a start record.
+ *
+ * <p>The start record is a position marker, never content: the epoch for a fresh
+ * log, or -- after {@link #compact} -- the snapshot boundary (SNAPSHOTS.md stage 2).
+ * It is deliberately excluded from {@link #commit} and {@link #getLogRange} results:
+ * the boundary's state is already reflected in the state machine (adopted via the
+ * payload), so returning it for re-application would be a double-apply.
+ */
 class RaftLogs {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftLogs.class);
     private static final CompletableRaftLog<?> EPOCH_LOG = new CompletableRaftLog<>(TermIndex.EPOCH, RaftLogs.class);
@@ -21,6 +31,15 @@ class RaftLogs {
     private TermIndex currentTermIndex = TermIndex.EPOCH;
     private TermIndex committedTermIndex = TermIndex.EPOCH;
 
+    // Snapshot boundary (SNAPSHOTS.md stage 2): the last-included (term, index) the log
+    // was compacted to, held by the current start seed. Nullable == no snapshot yet: the
+    // start point is the epoch and the payload is absent. The payload is the portable
+    // state the boundary reflects (a com.github.jocull.raftcache.lib.data.Snapshot in
+    // practice); a future InstallSnapshot message (stage 3) will carry it across the wire.
+    private TermIndex snapshotBoundary = null;
+    private Object snapshotPayload = null;
+    private CompletableRaftLog<?> startSeed = EPOCH_LOG;
+
     public RaftLogs(EventBus eventBus) {
         this.eventBus = eventBus;
 
@@ -29,19 +48,37 @@ class RaftLogs {
     }
 
     public synchronized TermIndex getCurrentTermIndex() {
-        return currentTermIndex;
+        return currentTail();
     }
 
     public synchronized TermIndex getCommittedTermIndex() {
         return committedTermIndex;
     }
 
+    /**
+     * The log's true tail (SNAPSHOTS.md S3): whichever is further <em>by index</em>,
+     * the last recorded entry or the snapshot boundary. After a follower installs a
+     * snapshot (stage 4) the recorded tail can sit behind the boundary, and everything
+     * downstream (vote reporting, the nextIndex a leader computes, computed appends)
+     * must treat the boundary as the last known entry.
+     */
+    private TermIndex currentTail() {
+        if (snapshotBoundary != null && snapshotBoundary.getIndex() > currentTermIndex.getIndex()) {
+            return snapshotBoundary;
+        }
+        return currentTermIndex;
+    }
+
     public synchronized boolean containsStartPoint(TermIndex index) {
-        // TODO: Could probably be optimized by using actual offsets.
-        //       Could track the "offset of offsets" to keep things
-        //       consistent even after a snapshot.
-        //
-        // TODO: It would probably be faster to walk this backwards and check from the end?
+        // O(1) common cases (closes the old TODOs): the start point is an exact field
+        // hit (epoch for a fresh log, the snapshot boundary after compact), and anything
+        // before the start point is compacted away and can never match.
+        if (index.equals(startSeed.getTermIndex())) {
+            return true;
+        }
+        if (index.getIndex() < startSeed.getTermIndex().getIndex()) {
+            return false;
+        }
         return logs.stream().anyMatch(log -> log.getTermIndex().equals(index));
     }
 
@@ -62,7 +99,10 @@ class RaftLogs {
     }
 
     private <T> CompletableRaftLog<T> appendLogInternal(int term, T rawLog) {
-        return appendLogInternal(new TermIndex(term, currentTermIndex.getIndex() + 1), rawLog);
+        // Computed appends continue past the true tail: when the recorded tail lags
+        // behind the snapshot boundary (post-install), appending off the raw field would
+        // land inside the compacted region and break the append conflict walk.
+        return appendLogInternal(new TermIndex(term, currentTail().getIndex() + 1), rawLog);
     }
 
     // TODO: Profiling shows bad performance in this section.
@@ -111,11 +151,98 @@ class RaftLogs {
     }
 
     public synchronized <TOut> List<TOut> getLogRange(TermIndex startTermIndex, int limit, Function<RaftLog<?>, TOut> fnTransform) {
+        // Batched by the index axis, and never serves the start record (epoch, or the
+        // snapshot boundary after compact): its state is already in the state machine
+        // and re-applying it would be a double-apply.
         return logs.stream()
-                .filter(r -> r.getTermIndex().compareTo(startTermIndex) > 0)
+                .filter(r -> r != startSeed
+                        && r.getTermIndex().getIndex() > startTermIndex.getIndex())
                 .map(fnTransform)
                 .limit(limit)
                 .collect(Collectors.toList());
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot boundary (SNAPSHOTS.md stage 2)
+    // ------------------------------------------------------------------
+
+    /**
+     * The start point of the log: the epoch for a fresh log, or the last-included
+     * (term, index) the log was compacted to.
+     */
+    public synchronized TermIndex getStartTermIndex() {
+        return snapshotBoundary == null ? TermIndex.EPOCH : snapshotBoundary;
+    }
+
+    public synchronized boolean hasStartPointSnapshot() {
+        return snapshotBoundary != null;
+    }
+
+    /**
+     * The portable state the snapshot boundary reflects (a
+     * {@code com.github.jocull.raftcache.lib.data.Snapshot} in practice), or {@code null}
+     * on a fresh log. A stage-3 {@code InstallSnapshot} message will carry it across the wire.
+     */
+    public synchronized Object getSnapshotPayload() {
+        return snapshotPayload;
+    }
+
+    /**
+     * Compact the log to the boundary: drop every record at or below it, reseeding the
+     * deque with the boundary record (exactly like {@link #EPOCH_LOG} but a real term/index).
+     *
+     * <p>Records above the boundary are kept, so the recorded tail and commit pointer are
+     * left untouched (S1 in practice keeps the boundary at or below the committed index).
+     * If <em>nothing</em> survives, this is a full install (SNAPSHOTS.md S2: the snapshot
+     * sits beyond the local tail) and the boundary <em>becomes</em> the recorded tail.
+     *
+     * <p>S5: the start point only moves forward, so compacting backwards is refused;
+     * compacting past a locally-committed index would drop adopted state and is refused
+     * too.
+     */
+    public synchronized void compact(TermIndex boundary, Object payload) {
+        if (boundary == null) {
+            throw new IllegalArgumentException("compact boundary must not be null");
+        }
+        if (boundary.getIndex() < 0) {
+            throw new IllegalArgumentException("compact boundary must not be negative: " + boundary);
+        }
+        if (boundary.getIndex() < startSeed.getTermIndex().getIndex()) {
+            throw new IllegalStateException("Cannot compact to " + boundary
+                    + "; the start point is already at " + startSeed.getTermIndex());
+        }
+        if (committedTermIndex.getIndex() > boundary.getIndex()) {
+            throw new IllegalStateException("Cannot compact to " + boundary
+                    + "; committed is already at " + committedTermIndex);
+        }
+
+        final CompletableRaftLog<?> boundarySeed = new CompletableRaftLog<>(boundary, RaftLogs.class);
+        final Deque<CompletableRaftLog<?>> survivors = new ArrayDeque<>();
+        survivors.add(boundarySeed);
+        int dropped = 0;
+        for (CompletableRaftLog<?> log : logs) {
+            if (log == startSeed) {
+                continue;
+            }
+            if (log.getTermIndex().getIndex() > boundary.getIndex()) {
+                survivors.add(log);
+            } else {
+                dropped++;
+            }
+        }
+
+        logs.clear();
+        logs.addAll(survivors);
+        startSeed = boundarySeed;
+        snapshotBoundary = boundary;
+        snapshotPayload = payload;
+        if (survivors.size() == 1) {
+            // Full install: everything the log held was replaced by the boundary, so the
+            // boundary is now the last known entry (the recorded tail may have lagged or
+            // pointed at uncommitted garbage that the snapshot supersedes).
+            currentTermIndex = boundary;
+        }
+        LOGGER.debug("Compacted log to boundary {} (dropped {} record(s), {} kept)", boundary, dropped, survivors.size() - 1);
     }
 
     /**
@@ -129,6 +256,11 @@ class RaftLogs {
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
             final CompletableRaftLog<?> log = iterator.next();
+            if (log == startSeed) {
+                // The start record (epoch or snapshot boundary) is a position marker, not
+                // rollbackable content: S5 -- the start point only ever moves forward.
+                continue;
+            }
             if (log.getTermIndex().compareTo(committedTermIndex) > 0) {
                 removed.add(log);
                 log.rollback();
@@ -147,18 +279,23 @@ class RaftLogs {
      * a client cannot observe its own write as acknowledged before it has taken effect.
      */
     public synchronized List<RaftLog<?>> commit(TermIndex termIndex) {
-        if (currentTermIndex.compareTo(termIndex) < 0) {
-            throw new IllegalArgumentException("Cannot commit " + termIndex + " when current is " + currentTermIndex);
+        // The commit index moves along the index axis and cannot outrun the true tail --
+        // which, post-install (stage 4), is the boundary even when the recorded tail lags.
+        final TermIndex tail = currentTail();
+        if (termIndex.getIndex() > tail.getIndex()) {
+            throw new IllegalArgumentException("Cannot commit " + termIndex + " when current is " + tail);
         }
-        if (termIndex.compareTo(committedTermIndex) < 0) {
+        if (termIndex.getIndex() < committedTermIndex.getIndex()) {
             throw new IllegalArgumentException("Cannot commit " + termIndex + " when committed is " + committedTermIndex);
         }
 
-        // Move the commit index forwards and return the committed logs
+        // Move the commit index forwards and return the committed logs, skipping the start
+        // record: its state was already adopted and re-applying it would be a double-apply.
         final TermIndex previousCommitIndex = committedTermIndex;
         committedTermIndex = termIndex;
         return logs.stream()
-                .filter(r -> r.getTermIndex().compareTo(previousCommitIndex) > 0
+                .filter(r -> r != startSeed
+                        && r.getTermIndex().compareTo(previousCommitIndex) > 0
                         && r.getTermIndex().compareTo(termIndex) <= 0)
                 .collect(Collectors.toList());
     }
