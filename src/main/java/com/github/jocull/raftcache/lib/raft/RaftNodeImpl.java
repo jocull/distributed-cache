@@ -211,12 +211,30 @@ class RaftNodeImpl implements RaftNode {
         return fnActionWithLock.apply((RaftNodeBehaviorFollower) behavior); // Do this action while the lock is held!
     }
 
+    /**
+     * Convert to a follower of a new leader: close the old behavior, roll back the
+     * uncommitted tail (entries the new leader may not have), start a fresh follower at
+     * the leader's term and record that leader as the one we now follow. The
+     * {@link AppendEntries} form is sugar over the decoupled one: it only exists so the
+     * term is read off the arriving message exactly as before.
+     */
     RaftNodeBehaviorFollower convertToFollowerForNewLeader(String remoteNodeId, AppendEntries appendEntries) {
+        return convertToFollowerForNewLeader(remoteNodeId, appendEntries.getTerm());
+    }
+
+    /**
+     * The decoupled form (SNAPSHOTS.md stage 4): the same conversion driven by an
+     * {@code InstallSnapshot}, whose term is taken directly rather than read off an append
+     * message. Rollback here is safe and required: a higher-term leader's snapshot
+     * supersedes whatever uncommitted entries the old leader replicated to us, so they are
+     * discarded (Raft §5.3 / the snapshot replaces the state).
+     */
+    RaftNodeBehaviorFollower convertToFollowerForNewLeader(String remoteNodeId, int newTerm) {
         behavior.close();
         final int oldTerm = behavior.term;
-        rollback(oldTerm, appendEntries.getTerm());
+        rollback(oldTerm, newTerm);
 
-        behavior = new RaftNodeBehaviorFollower(this, appendEntries.getTerm());
+        behavior = new RaftNodeBehaviorFollower(this, newTerm);
         ((RaftNodeBehaviorFollower) behavior).setLeaderId(remoteNodeId);
         LOGGER.info("{} Changed leader to {}", id, remoteNodeId);
 

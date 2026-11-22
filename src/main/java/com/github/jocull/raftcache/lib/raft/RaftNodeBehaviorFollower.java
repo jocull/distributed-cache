@@ -1,8 +1,11 @@
 package com.github.jocull.raftcache.lib.raft;
 
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
+import com.github.jocull.raftcache.lib.raft.events.SnapshotInstalled;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshot;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshotResponse;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
@@ -327,5 +330,93 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         }
 
         LOGGER.warn("{} Received acknowledge entries from {} for term {} but doesn't make sense as follower of term {}", self.getId(), sender.getRemoteNodeId(), acknowledgeEntries.getTerm(), term);
+    }
+
+    /**
+     * Receive a leader's snapshot (SNAPSHOTS.md stage 4, Raft §7). A follower only ever
+     * acts on a snapshot from a leader at least as current as itself; otherwise it
+     * refuses and reports who it thinks it should be talking to.
+     *
+     * <p>Order of operations, matching the stage-4 spec:
+     * <ol>
+     *   <li>Higher term than ours: step down to it (the same "convert to follower of the
+     *       new leader" path {@link #onAppendEntries} uses), then re-dispatch this very
+     *       message on the fresh follower.</li>
+     *   <li>Lower term than ours: refuse and reply with OUR term so the sender can step
+     *       down if it still thinks it leads.</li>
+     *   <li>Equal term: the sender asserts leadership. Install the snapshot —
+     *       <b>adopt into the state machine first, then compact the log to the
+     *       boundary</b> — and reply with the new log tail so the leader can resume
+     *       {@link AppendEntries} behind the snapshot (stage 5).</li>
+     * </ol>
+     *
+     * <p>The state-machine install is done by publishing a {@link SnapshotInstalled}
+     * event on the node's event bus: the {@code StateMachineBridge} (the state-machine
+     * owner) is subscribed to that bus and performs the actual {@code adopt}. This keeps
+     * the Raft layer from naming any state-machine type — the payload crosses as a loose
+     * {@link Object}.
+     */
+    @Override
+    public void onInstallSnapshot(NodeConnectionOutbound sender, InstallSnapshot installSnapshot) {
+        final int incomingTerm = installSnapshot.getTerm();
+        final long lastIncludedIndex = installSnapshot.getLastIncludedIndex();
+
+        // (1) A strictly higher term means this peer learned a leader newer than the one
+        // we follow (or we are a laggard from a prior term). Step down first, then
+        // re-evaluate this snapshot against our new term.
+        if (incomingTerm > term) {
+            LOGGER.info("{} Received install-snapshot from {} for term {} above our term {} - converting to follower first",
+                    self.getId(), sender.getRemoteNodeId(), incomingTerm, term);
+            self.convertToFollowerForNewLeader(sender.getRemoteNodeId(), incomingTerm)
+                    .onInstallSnapshot(sender, installSnapshot);
+            return;
+        }
+
+        // (2) A lower term is stale: we already know a newer term. Refuse and report ours.
+        if (incomingTerm < term) {
+            final TermIndex tail = self.logs.getCurrentTermIndex();
+            LOGGER.warn("{} Received install-snapshot from {} for term {} below our term {} - refusing",
+                    self.getId(), sender.getRemoteNodeId(), incomingTerm, term);
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex()));
+            return;
+        }
+
+        // (3) Equal term: the sender claims to lead this term. S2 (progress-only) first:
+        // a snapshot is only accepted if it is STRICTLY beyond our current log tail
+        // (lastIncludedIndex > tail index). A snapshot at or behind the tail would replace
+        // no newer state (it must never replace newer/committed state with older), and
+        // refusing a re-sent, already-installed snapshot is what makes redelivery a no-op.
+        final TermIndex tail = self.logs.getCurrentTermIndex();
+        if (lastIncludedIndex <= tail.getIndex()) {
+            LOGGER.warn("{} Refusing install-snapshot from {}: boundary index {} is not beyond our tail {} (S2 progress-only)",
+                    self.getId(), sender.getRemoteNodeId(), lastIncludedIndex, tail.getIndex());
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex()));
+            return;
+        }
+
+        // On the accept path: record the sender as this term's leader (if we don't yet
+        // know one) so subsequent heartbeats from it are accepted -- the same ordering
+        // as onAppendEntries (all validity checks before any state change).
+        if (leaderId == null) {
+            leaderId = sender.getRemoteNodeId();
+            LOGGER.info("{} Made follower of {} (on install-snapshot)", self.getId(), leaderId);
+        }
+
+        // Advance the state machine FIRST (adopt), then compact the log to the boundary
+        // (S4 order: state reflects the boundary before the log is trimmed to it).
+        final int lastIncludedTerm = installSnapshot.getLastIncludedTerm();
+        final Object payload = installSnapshot.getPayload();
+        self.eventBus.publish(new SnapshotInstalled(lastIncludedTerm, lastIncludedIndex, payload));
+        final TermIndex boundary = new TermIndex(lastIncludedTerm, lastIncludedIndex);
+        self.logs.compact(boundary, payload);
+
+        final TermIndex newTail = self.logs.getCurrentTermIndex();
+        LOGGER.info("{} Installed snapshot from {} (boundary {}, {}) - tail now {} @ term {}",
+                self.getId(), sender.getRemoteNodeId(), lastIncludedTerm, lastIncludedIndex, newTail, term);
+        // Reply with the new tail so the leader can resume append-entries past the
+        // snapshot boundary (stage 5 recovery).
+        sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, newTail.getIndex()));
+        // A leader just spoke: reset the election timeout.
+        scheduleNextElectionTimeout();
     }
 }

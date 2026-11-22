@@ -8,6 +8,7 @@ import com.github.jocull.raftcache.lib.event.EventSubscriber;
 import com.github.jocull.raftcache.lib.raft.RaftLog;
 import com.github.jocull.raftcache.lib.raft.TermIndex;
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
+import com.github.jocull.raftcache.lib.raft.events.SnapshotInstalled;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,14 +60,33 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
 
     @Override
     public void onEvent(Object event) {
-        if (!(event instanceof LogsCommitted)) {
+        if (event instanceof LogsCommitted) {
+            final LogsCommitted logsCommitted = (LogsCommitted) event;
+            for (RaftLog<?> raftLog : logsCommitted.getLogs()) {
+                applyLog(raftLog);
+            }
+            LOGGER.trace("Applied logs up to index {}", lastApplied.get().getIndex());
             return;
         }
-        final LogsCommitted logsCommitted = (LogsCommitted) event;
-        for (RaftLog<?> raftLog : logsCommitted.getLogs()) {
-            applyLog(raftLog);
+        if (event instanceof SnapshotInstalled) {
+            onSnapshotInstalled((SnapshotInstalled) event);
+            return;
         }
-        LOGGER.trace("Applied logs up to index {}", lastApplied.get().getIndex());
+        // Unknown event type: ignore (the bus is shared with other publishers).
+    }
+
+    private void onSnapshotInstalled(SnapshotInstalled snapshotInstalled) {
+        final Object payload = snapshotInstalled.getPayload();
+        if (!(payload instanceof Snapshot)) {
+            // We only install snapshots we know how to adopt; a foreign payload is
+            // logged, not fatal (another bridge/state machine may own it).
+            LOGGER.warn("SnapshotInstalled payload of type {} at ({}, {}) is not a {} this bridge adopts - ignoring",
+                    payload == null ? "null" : payload.getClass().getName(),
+                    snapshotInstalled.getTerm(), snapshotInstalled.getIndex(),
+                    Snapshot.class.getSimpleName());
+            return;
+        }
+        adopt((Snapshot) payload);
     }
 
     private void applyLog(RaftLog<?> raftLog) {

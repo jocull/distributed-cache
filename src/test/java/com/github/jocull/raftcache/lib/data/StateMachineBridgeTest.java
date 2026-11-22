@@ -10,6 +10,7 @@ import com.github.jocull.raftcache.lib.event.events.SetDataEvent;
 import com.github.jocull.raftcache.lib.raft.RaftLog;
 import com.github.jocull.raftcache.lib.raft.TermIndex;
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
+import com.github.jocull.raftcache.lib.raft.events.SnapshotInstalled;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -22,6 +23,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -411,5 +413,77 @@ public class StateMachineBridgeTest {
         laggard.advanceMillis(5000L); // now == 10000 (boundary-inclusive expiry)
         assertTrue(laggard.map.getData("key1").isEmpty(),
                 "Past the absolute deadline the entry must be gone, regardless of the local clock's origin");
+    }
+
+    // ---- SNAPSHOTS.md stage 4 (install-snapshot wiring into the bridge) ----
+    //
+    // The follower that accepted an InstallSnapshot publishes SnapshotInstalled on its own
+    // node event bus (see RaftNodeBehaviorFollowerInstallSnapshotTest); a bridge
+    // subscribed to that bus must then adopt the payload and re-anchor its applied
+    // position. A foreign payload on a shared bus is ignored, never fatal.
+
+    @Test
+    void testSnapshotInstalledEventAdoptsThePayload() {
+        final TimedStateMachine origin = new TimedStateMachine();
+        origin.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "v1")));
+        origin.commit(new RaftLog<>(new TermIndex(1, 2), input("key2", "v2")));
+        final Snapshot snapshot = origin.bridge.getSnapshot();
+        final long key1Version = snapshot.entry("key1").getVersion();
+        final long key2Version = snapshot.entry("key2").getVersion();
+
+        // The follower accepted the snapshot and published the event on its own bus;
+        // the bridge subscribed to that bus must install the snapshot's state
+        final TimedStateMachine laggard = new TimedStateMachine();
+        laggard.nodeEventBus.publish(new SnapshotInstalled(1, 2, snapshot));
+
+        assertTrue(laggard.map.getData("key1").isPresent(),
+                "A SnapshotInstalled carrying a Snapshot must adopt the state");
+        assertArrayEquals("v1".getBytes(StandardCharsets.UTF_8),
+                laggard.map.getData("key1").orElseThrow().getData().get("value"));
+        assertEquals(key1Version, laggard.map.getData("key1").orElseThrow().getVersion(),
+                "The restored entry must carry its restored version");
+        assertArrayEquals("v2".getBytes(StandardCharsets.UTF_8),
+                laggard.map.getData("key2").orElseThrow().getData().get("value"));
+        assertEquals(key2Version, laggard.map.getData("key2").orElseThrow().getVersion(),
+                "An unrelated restored entry must carry its restored version");
+        assertEquals(2L, laggard.bridge.getLastAppliedIndex(),
+                "The SnapshotInstalled event must re-anchor the applied position to the snapshot boundary");
+        assertEquals(1L, laggard.bridge.getLastAppliedTerm(),
+                "The applied term must be the snapshot's boundary term");
+
+        // Delivering the entries behind the boundary again is a no-op (the replay guard)
+        laggard.commit(new RaftLog<>(new TermIndex(1, 2), input("key2", "replayed")));
+        assertArrayEquals("v2".getBytes(StandardCharsets.UTF_8),
+                laggard.map.getData("key2").orElseThrow().getData().get("value"),
+                "Entries at or below the boundary must be skipped, not re-applied");
+        assertEquals(key2Version, laggard.map.getData("key2").orElseThrow().getVersion(),
+                "Entries at or below the boundary must not re-stamp versions");
+        assertEquals(2L, laggard.bridge.getLastAppliedIndex(),
+                "Replaying behind the boundary must not move the applied position");
+    }
+
+    @Test
+    void testSnapshotInstalledWithAForeignPayloadIsIgnored() {
+        final TimedStateMachine s = new TimedStateMachine();
+        s.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        final long originalVersion = s.map.getData("key1").orElseThrow().getVersion();
+
+        // Another state machine on the shared bus publishes a snapshot of a type this
+        // bridge does not recognise: it must be logged and ignored, never fatal
+        assertDoesNotThrow(() -> s.nodeEventBus.publish(new SnapshotInstalled(9, 9, "foreign payload")));
+
+        assertEquals(1L, s.bridge.getLastAppliedIndex(),
+                "A foreign payload must not move the applied position");
+        assertEquals(originalVersion, s.map.getData("key1").orElseThrow().getVersion(),
+                "A foreign payload must not re-stamp the state");
+        assertArrayEquals("value1".getBytes(StandardCharsets.UTF_8),
+                s.map.getData("key1").orElseThrow().getData().get("value"),
+                "A foreign payload must not alter the state");
+
+        // Normal processing continues: a genuine commit after the foreign event applies
+        s.commit(new RaftLog<>(new TermIndex(1, 2), input("key2", "value2")));
+        assertTrue(s.map.getData("key2").isPresent(),
+                "Data entries after a foreign payload should still be applied");
+        assertEquals(2L, s.bridge.getLastAppliedIndex());
     }
 }
