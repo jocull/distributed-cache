@@ -36,4 +36,15 @@ class KeyValue {
     public synchronized void updateExpiration(DataVersion data) {
         dataVersion = data;
     }
+
+    /**
+     * Replaces the stored version without publishing <em>any</em> event -- used when
+     * adopting a {@link Snapshot}: that reinstalls already-committed state rather than
+     * performing a new state-machine write, so neither a {@code SetDataEvent} nor a
+     * {@code DeleteDataEvent} is expected. Unlike {@link #setData(DataVersion)} the data
+     * itself changes; unlike {@link #updateExpiration(DataVersion)} no event is published.
+     */
+    public synchronized void restore(DataVersion data) {
+        dataVersion = data;
+    }
 }

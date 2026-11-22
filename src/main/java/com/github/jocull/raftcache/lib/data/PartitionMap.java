@@ -118,12 +118,55 @@ public class PartitionMap {
         return globalVersion.incrementAndGet();
     }
 
-    public Map<Partition, Map<String, KeyDataOutput>> getSnapshot() {
-        // TODO: Semaphore lock the world while doing this?
-        //       Return an object that contains the global version at snapshot time?
-        //       Make the return object a better interface?
-        final Map<Partition, Map<String, KeyDataOutput>> snapshot = new HashMap<>(partitionMap.size());
-        partitionMap.forEach((k, v) -> snapshot.put(k, v.getSnapshot()));
-        return snapshot;
+    /**
+     * Captures the state machine's full data state now (SNAPSHOTS.md stage 1): for every
+     * key, its data, version counter and absolute expiration. Entries already expired at
+     * this map's {@link #getClock()} are no longer part of the state and are not captured.
+     *
+     * <p>This is the state half of a {@link Snapshot}; the boundary (term, index) belongs
+     * to the state machine ({@link StateMachineBridge#getSnapshot()}) and the raft log,
+     * not to the data layer.
+     *
+     * <p>The returned map is a detached copy: {@link DataVersion}s are immutable, and the
+     * map itself is a fresh copy, so later mutations do not disturb a captured state.
+     */
+    public Map<String, DataVersion> capture() {
+        final Map<String, DataVersion> state = new HashMap<>();
+        for (final KeyMap keyMap : partitionMap.values()) {
+            state.putAll(keyMap.capture());
+        }
+        return state;
+    }
+
+    /**
+     * Replaces the full data state with {@code state} (see {@link #capture()}): keys
+     * absent from it are dropped, and each captured key is reinstalled with its captured
+     * data, version and absolute expiration.
+     *
+     * <p>Installs via the silent state-machine path -- no state-machine events are
+     * published, because adopting a snapshot reinstalls already-committed state rather
+     * than performing new writes.
+     *
+     * <p>The monotonic version counter is preserved: when the captured state carries a
+     * higher version than the local counter (a snapshot of a state machine that had
+     * advanced further), the counter is fast-forwarded so subsequent local writes are
+     * still strictly newer.
+     */
+    public synchronized void restore(Map<String, DataVersion> state) {
+        long maxVersion = 0L;
+        final Map<Partition, Map<String, DataVersion>> byPartition = new HashMap<>(partitionMap.size());
+        for (final Map.Entry<String, DataVersion> entry : state.entrySet()) {
+            byPartition.computeIfAbsent(getPartitionForKey(entry.getKey()), p -> new HashMap<>())
+                    .put(entry.getKey(), entry.getValue());
+            if (entry.getValue().getVersion() > maxVersion) {
+                maxVersion = entry.getValue().getVersion();
+            }
+        }
+        for (final Map.Entry<Partition, KeyMap> partitionEntry : partitionMap.entrySet()) {
+            partitionEntry.getValue().restore(byPartition.getOrDefault(partitionEntry.getKey(), Map.of()));
+        }
+        if (maxVersion > globalVersion.get()) {
+            globalVersion.set(maxVersion);
+        }
     }
 }

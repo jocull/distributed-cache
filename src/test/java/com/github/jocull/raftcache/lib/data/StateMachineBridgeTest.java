@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -23,6 +24,8 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class StateMachineBridgeTest {
@@ -262,5 +265,151 @@ public class StateMachineBridgeTest {
         // Past the extended deadline -> absent
         s.advanceMillis(7001L); // now == 13001
         assertTrue(s.map.getData("key1").isEmpty(), "key1 must be absent past the extended deadline");
+    }
+
+    // ---- SNAPSHOTS.md stage 1 (capture/replace) ----
+    //
+    // Bridge-level: the snapshot's boundary (term, index of the last applied entry), the
+    // adopt/replace semantics, and the replay guard that makes re-delivery of the entries
+    // behind the boundary idempotent. Capture/replace at the map level lives in PartitionMapTest.
+
+    @Test
+    void testSnapshotRecordGuards() {
+        assertThrows(NullPointerException.class, () -> new Snapshot(1L, 1L, null));
+        assertThrows(IllegalArgumentException.class, () -> new Snapshot(-1L, 1L, Map.of()));
+        assertThrows(IllegalArgumentException.class, () -> new Snapshot(1L, -1L, Map.of()));
+
+        // The entries map is a detached copy: mutating the caller's map does not disturb the snapshot
+        final Map<String, DataVersion> live = new HashMap<>();
+        live.put("key1", new DataVersion(Map.of("value", new byte[]{'v'}), 1L));
+        final Snapshot snapshot = new Snapshot(1L, 1L, live);
+        live.clear();
+        assertEquals(1, snapshot.size(), "The snapshot's entries must be a detached copy");
+        assertEquals(1L, snapshot.entry("key1").getVersion());
+    }
+
+    @Test
+    void testGetSnapshotReportsStateAndLastAppliedBoundary() {
+        commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        commit(new RaftLog<>(new TermIndex(2, 2), input("key2", "value2")));
+
+        final Snapshot snapshot = bridge.getSnapshot();
+        assertEquals(2L, snapshot.term(), "boundary term = the term of the last applied entry");
+        assertEquals(2L, snapshot.index(), "boundary index = the last applied index");
+        assertEquals(2, snapshot.size());
+        assertArrayEquals("value1".getBytes(StandardCharsets.UTF_8), snapshot.entry("key1").getData().get("value"));
+        assertEquals(bridge.getLastAppliedIndex(), snapshot.index());
+        assertEquals(bridge.getLastAppliedTerm(), snapshot.term());
+    }
+
+    @Test
+    void testAdoptReinstallsStateAndMakesOldEntriesIdempotent() {
+        final TimedStateMachine origin = new TimedStateMachine();
+        origin.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "v1")));
+        origin.commit(new RaftLog<>(new TermIndex(1, 2), input("key2", "v2")));
+        origin.commit(new RaftLog<>(new TermIndex(1, 3), input("key1", "v3"))); // re-put of key1
+
+        final Snapshot snapshot = origin.bridge.getSnapshot();
+        assertEquals(3L, snapshot.index());
+        assertEquals(1L, snapshot.term());
+        final long key1Version = snapshot.entry("key1").getVersion();
+        final long key2Version = snapshot.entry("key2").getVersion();
+
+        // Origin moves on -- the live state and the snapshot diverge
+        origin.commit(new RaftLog<>(new TermIndex(1, 4), input("key2", "changed")));
+        origin.commit(new RaftLog<>(new TermIndex(1, 5), new KeyDataDeleteInput("key1")));
+        assertTrue(origin.map.getData("key1").isEmpty(), "Setup: origin deleted key1 after the snapshot");
+
+        // A lagging node installing the snapshot gets exactly its state
+        final TimedStateMachine laggard = new TimedStateMachine();
+        laggard.bridge.adopt(snapshot);
+        assertArrayEquals("v3".getBytes(StandardCharsets.UTF_8),
+                laggard.map.getData("key1").orElseThrow().getData().get("value"));
+        assertEquals(key1Version, laggard.map.getData("key1").orElseThrow().getVersion());
+        assertArrayEquals("v2".getBytes(StandardCharsets.UTF_8),
+                laggard.map.getData("key2").orElseThrow().getData().get("value"));
+        assertEquals(key2Version, laggard.map.getData("key2").orElseThrow().getVersion());
+        assertEquals(3L, laggard.bridge.getLastAppliedIndex(), "adopt must re-anchor the applied position");
+        assertEquals(1L, laggard.bridge.getLastAppliedTerm());
+
+        // Re-installing a snapshot at the same boundary is an idempotent re-install
+        laggard.bridge.adopt(snapshot);
+        assertEquals(key1Version, laggard.map.getData("key1").orElseThrow().getVersion(),
+                "Re-adopt at the same boundary must not re-stamp versions");
+
+        // Delivering the entries behind the boundary again is a no-op (the replay guard)
+        laggard.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "v1")),
+                new RaftLog<>(new TermIndex(1, 2), input("key2", "v2")),
+                new RaftLog<>(new TermIndex(1, 3), input("key1", "v3")));
+        assertEquals(key1Version, laggard.map.getData("key1").orElseThrow().getVersion(),
+                "Entries at or below the boundary must be skipped, not re-applied");
+        assertEquals(key2Version, laggard.map.getData("key2").orElseThrow().getVersion());
+
+        // New writes after the install continue past the fast-forwarded version counter
+        laggard.commit(new RaftLog<>(new TermIndex(2, 4), input("key1", "v4")));
+        assertEquals(key1Version + 1, laggard.map.getData("key1").orElseThrow().getVersion(),
+                "A post-adopt write must get a version above the restored ones");
+        assertEquals(key2Version, laggard.map.getData("key2").orElseThrow().getVersion(),
+                "An unrelated restored entry must be untouched");
+    }
+
+    @Test
+    void testAdoptRefusesAStaleSnapshot() {
+        commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        final long originalVersion = partitionMap.getData("key1").orElseThrow().getVersion();
+
+        // The snapshot claims an older boundary (index 0) than what this node already applied
+        final Snapshot stale = new Snapshot(1L, 0L, Map.of("key1", new DataVersion(Map.of("value", new byte[]{'o'}), 1L)));
+        bridge.adopt(stale);
+
+        assertEquals(1L, bridge.getLastAppliedIndex(), "A refused adopt must not move the applied position");
+        assertEquals(originalVersion, partitionMap.getData("key1").orElseThrow().getVersion(),
+                "A refused adopt must not re-stamp the state");
+        assertArrayEquals("value1".getBytes(StandardCharsets.UTF_8),
+                partitionMap.getData("key1").orElseThrow().getData().get("value"));
+    }
+
+    @Test
+    void testCaptureExcludesAlreadyExpiredEntries() {
+        final TimedStateMachine origin = new TimedStateMachine();
+        origin.commit(new RaftLog<>(new TermIndex(1, 1), input("stay", "v1")));
+        origin.commit(new RaftLog<>(new TermIndex(1, 2), input("drop", "v1")));
+        origin.commit(new RaftLog<>(new TermIndex(1, 3), expire("drop", 1000L))); // deadline at epoch-millis 1000
+
+        origin.advanceMillis(2000L); // "drop" is past its deadline at capture time
+        final Snapshot snapshot = origin.bridge.getSnapshot();
+
+        assertEquals(1, snapshot.size(), "An entry expired at capture time is not part of the state");
+        assertEquals("v1", new String(snapshot.entry("stay").getData().get("value"), StandardCharsets.UTF_8));
+        assertNull(snapshot.entry("drop"));
+
+        // And a node installing it must never see the expired key
+        final TimedStateMachine laggard = new TimedStateMachine();
+        laggard.bridge.adopt(snapshot);
+        assertTrue(laggard.map.getData("stay").isPresent());
+        assertTrue(laggard.map.getData("drop").isEmpty(),
+                "An entry expired at capture time must not be resurrected by the install");
+    }
+
+    @Test
+    void testTtlSurvivesTheSnapshotHopAsAnAbsoluteDeadline() {
+        final TimedStateMachine origin = new TimedStateMachine();
+        origin.commit(new RaftLog<>(new TermIndex(1, 1), input("key1", "value1")));
+        origin.commit(new RaftLog<>(new TermIndex(1, 2), expire("key1", 10000L))); // applied at clock 0 -> deadline 10000
+
+        final Snapshot snapshot = origin.bridge.getSnapshot();
+        assertEquals(10000L, snapshot.entry("key1").getExpiresAtEpochMillis(),
+                "The captured deadline must be an absolute epoch-millis value, not a TTL");
+
+        // The receiving node's clock is elsewhere (already 5000 in): the deadline is not
+        // recomputed from its clock, so the entry is live until the absolute instant 10000
+        final TimedStateMachine laggard = new TimedStateMachine();
+        laggard.advanceMillis(5000L);
+        laggard.bridge.adopt(snapshot);
+
+        assertTrue(laggard.map.getData("key1").isPresent(), "Before the absolute deadline the entry must be live");
+        laggard.advanceMillis(5000L); // now == 10000 (boundary-inclusive expiry)
+        assertTrue(laggard.map.getData("key1").isEmpty(),
+                "Past the absolute deadline the entry must be gone, regardless of the local clock's origin");
     }
 }

@@ -1,6 +1,5 @@
 package com.github.jocull.raftcache.lib.data;
 
-import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.event.EventBus;
 import com.github.jocull.raftcache.lib.event.events.DeleteDataEvent;
 
@@ -123,15 +122,46 @@ class KeyMap {
         return expired.size();
     }
 
-    public Map<String, KeyDataOutput> getSnapshot() {
+    /**
+     * A point-in-time capture of this partition's state (SNAPSHOTS.md stage 1): for each
+     * key, the full {@link DataVersion} -- data, version counter and absolute expiration.
+     * Entries already expired at this map's clock are no longer part of the state and are
+     * not captured.
+     *
+     * <p>In contrast to the client read view ({@link PartitionMap#getData(String)} serves
+     * a {@link KeyDataOutput} which drops the expiration), the capture carries the
+     * expiration -- the gap that made the old {@code getSnapshot()} unusable for
+     * snapshots.
+     */
+    public Map<String, DataVersion> capture() {
+        final long now = parent.getClock().millis();
+        final Map<String, DataVersion> state = new HashMap<>(keyMap.size());
         synchronized (keyMap) {
-            Map<String, KeyDataOutput> snapshot = new HashMap<>(keyMap.size());
-            keyMap.forEach((k, v) -> {
-                if (v.getData().isPresent()) {
-                    snapshot.put(k, new KeyDataOutput(k, v.getData().get().getData(), v.getData().get().getVersion()));
+            for (final Map.Entry<String, KeyValue> entry : keyMap.entrySet()) {
+                final Optional<DataVersion> dataVersion = entry.getValue().getData();
+                if (dataVersion.isPresent() && !dataVersion.get().isExpired(now)) {
+                    state.put(entry.getKey(), dataVersion.get());
                 }
-            });
-            return snapshot;
+            }
+        }
+        return state;
+    }
+
+    /**
+     * Replaces this partition's entries with exactly {@code state} (see {@link #capture()}).
+     *
+     * <p>Installs via the silent state-machine path ({@link KeyValue#restore(DataVersion)}):
+     * adopting a snapshot reinstalls already-committed state, so no
+     * {@code SetDataEvent}/{@code DeleteDataEvent} is published.
+     */
+    public synchronized void restore(Map<String, DataVersion> state) {
+        synchronized (keyMap) {
+            keyMap.clear();
+            for (final Map.Entry<String, DataVersion> entry : state.entrySet()) {
+                final KeyValue keyValue = new KeyValue(entry.getKey(), this);
+                keyValue.restore(entry.getValue());
+                keyMap.put(entry.getKey(), keyValue);
+            }
         }
     }
 }

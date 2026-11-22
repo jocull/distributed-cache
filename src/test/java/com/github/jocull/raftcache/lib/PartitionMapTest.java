@@ -3,6 +3,7 @@ package com.github.jocull.raftcache.lib;
 import com.github.jocull.raftcache.lib.communication.KeyDataExpireInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
+import com.github.jocull.raftcache.lib.data.DataVersion;
 import com.github.jocull.raftcache.lib.data.Partition;
 import com.github.jocull.raftcache.lib.data.PartitionMap;
 import com.github.jocull.raftcache.lib.event.EventBus;
@@ -114,8 +115,14 @@ public class PartitionMapTest {
         });
     }
 
+    // ---- SNAPSHOTS.md stage 1 (capture/replace) ----
+    //
+    // Map-level (no Raft): the capture is a detached, full state (data + version, unlike the
+    // read view) and the restore is a silent full replacement that fast-forwards the
+    // version counter. The bridge-level adopt/replay-guard tests live in StateMachineBridgeTest.
+
     @Test
-    void testSnapshot() {
+    void testCaptureIsADetachedCopyOfTheLiveState() {
         final Random random = new Random();
         final PartitionMap pm = new PartitionMap(eventBus, 256);
         final List<KeyDataInput> inputs = IntStream.range(0, 1000)
@@ -129,25 +136,18 @@ public class PartitionMapTest {
 
         inputs.forEach(pm::setData);
 
-        final Map<Partition, Map<String, KeyDataOutput>> snapshot = pm.getSnapshot();
+        // The capture is the full state (data + version) -- the same state the read view serves
+        final Map<String, DataVersion> capture = pm.capture();
+        assertEquals(1000, capture.size());
         inputs.forEach(input -> {
-            final String key = input.getKey();
-            final KeyDataOutput output = pm.getData(key).orElseThrow();
-            assertEquals(input.getKey(), output.getKey());
-            assertEquals(input.getData(), output.getData());
-
-            final Partition partition = pm.getPartitionForKey(input.getKey());
-            final KeyDataOutput snapshotOutput = snapshot.get(partition).get(input.getKey());
-            assertEquals(input.getKey(), snapshotOutput.getKey());
-            assertEquals(input.getData(), snapshotOutput.getData());
-
-            assertEquals(output.getKey(), snapshotOutput.getKey());
-            assertEquals(output.getData(), snapshotOutput.getData());
-            assertEquals(output.getVersion(), snapshotOutput.getVersion());
+            final KeyDataOutput output = pm.getData(input.getKey()).orElseThrow();
+            final DataVersion captured = capture.get(input.getKey());
+            assertEquals(input.getData(), captured.getData());
+            assertEquals(output.getVersion(), captured.getVersion());
         });
 
-        // Mess with the PartitionMap entirely. The snapshot should still be valid.
-        final int initialSnapshotSize = snapshot.values().stream().mapToInt(Map::size).sum();
+        // Mess with the PartitionMap entirely. The capture should still be valid.
+        final int initialCaptureSize = capture.size();
         final List<KeyDataInput> inputs2 = IntStream.range(0, 1000)
                 .mapToObj(i -> UUID.randomUUID().toString())
                 .map(key -> {
@@ -159,21 +159,11 @@ public class PartitionMapTest {
 
         inputs2.forEach(pm::setData);
 
-        // Nothing about the snapshot should have changed
-        assertEquals(initialSnapshotSize, snapshot.values().stream().mapToInt(Map::size).sum());
-        inputs.forEach(input -> {
-            final Partition partition = pm.getPartitionForKey(input.getKey());
-            final KeyDataOutput snapshotOutput = snapshot.get(partition).get(input.getKey());
-            assertEquals(input.getKey(), snapshotOutput.getKey());
-            assertEquals(input.getData(), snapshotOutput.getData());
-        });
-
-        // None of these keys should appear
-        inputs2.forEach(input -> {
-            final Partition partition = pm.getPartitionForKey(input.getKey());
-            final KeyDataOutput snapshotOutput = snapshot.get(partition).get(input.getKey());
-            assertNull(snapshotOutput);
-        });
+        // Nothing about the capture should have changed and no later key may have crept into it
+        assertEquals(initialCaptureSize, capture.size());
+        inputs.forEach(input -> assertEquals(input.getData(), capture.get(input.getKey()).getData()));
+        inputs2.forEach(input -> assertNull(capture.get(input.getKey()),
+                "A key written after the capture must not appear in it"));
 
         // Clear everything from the data set
         inputs.forEach(i -> pm.deleteData(i.getKey()));
@@ -182,14 +172,62 @@ public class PartitionMapTest {
         inputs.forEach(i -> assertEquals(Optional.empty(), pm.getData(i.getKey())));
         inputs2.forEach(i -> assertEquals(Optional.empty(), pm.getData(i.getKey())));
 
-        // Again, nothing about the snapshot should have changed
-        assertEquals(initialSnapshotSize, snapshot.values().stream().mapToInt(Map::size).sum());
-        inputs.forEach(input -> {
-            final Partition partition = pm.getPartitionForKey(input.getKey());
-            final KeyDataOutput snapshotOutput = snapshot.get(partition).get(input.getKey());
-            assertEquals(input.getKey(), snapshotOutput.getKey());
-            assertEquals(input.getData(), snapshotOutput.getData());
+        // Again, nothing about the capture should have changed
+        assertEquals(initialCaptureSize, capture.size());
+        inputs.forEach(input -> assertEquals(input.getData(), capture.get(input.getKey()).getData()));
+    }
+
+    @Test
+    void testRestoreReplacesTheFullStateSilentlyAndFastForwardsTheCounter() {
+        final EventBus sourceBus = new EventBus();
+        final EventBus targetBus = new EventBus();
+        final List<SetDataEvent> targetSetEvents = new ArrayList<>();
+        final List<DeleteDataEvent> targetDeleteEvents = new ArrayList<>();
+        targetBus.subscribe(new EventSubscriber() {
+            @Override
+            public void onEvent(Object event) {
+                if (event instanceof SetDataEvent) {
+                    targetSetEvents.add((SetDataEvent) event);
+                }
+                if (event instanceof DeleteDataEvent) {
+                    targetDeleteEvents.add((DeleteDataEvent) event);
+                }
+            }
         });
+
+        // Source state: 500 keys, stamped with versions 1..500
+        final PartitionMap source = new PartitionMap(sourceBus, 256);
+        final List<KeyDataInput> inputs = IntStream.range(0, 500)
+                .mapToObj(i -> new KeyDataInput(UUID.randomUUID().toString(), Map.of("data", new byte[]{'a'})))
+                .collect(Collectors.toList());
+        inputs.forEach(source::setData);
+        final Map<String, DataVersion> capture = source.capture();
+        assertEquals(500, capture.size());
+
+        // Target with a stale key the snapshot's state does not contain
+        final PartitionMap target = new PartitionMap(targetBus, 256);
+        target.setData(new KeyDataInput("stale", Map.of("data", new byte[2])));
+        assertEquals(1, targetSetEvents.size(), "Setup: the stale write should have been observed");
+
+        target.restore(capture);
+
+        // Restore is the silent path: reinstalls state, performs no new state-machine write
+        assertEquals(1, targetSetEvents.size(), "restore must not publish a SetDataEvent");
+        assertEquals(0, targetDeleteEvents.size(), "restore must not publish a DeleteDataEvent");
+
+        // Full replacement: captured keys present with captured data + version, stale key dropped
+        assertTrue(target.getData("stale").isEmpty(), "A key not in the snapshot's state must be dropped");
+        inputs.forEach(input -> {
+            final KeyDataOutput output = target.getData(input.getKey()).orElseThrow();
+            assertEquals(capture.get(input.getKey()).getData(), output.getData());
+            assertEquals(capture.get(input.getKey()).getVersion(), output.getVersion());
+        });
+
+        // Fast-forwarded counter: the next target write is strictly newer than every captured version
+        final long restoredMax = capture.values().stream().mapToLong(DataVersion::getVersion).max().orElseThrow();
+        target.setData(inputs.get(0));
+        assertEquals(restoredMax + 1, target.getData(inputs.get(0).getKey()).orElseThrow().getVersion(),
+                "A write after restore must get a version greater than every captured one");
     }
 
     @Test
