@@ -37,6 +37,17 @@ class RaftNodeImpl implements RaftNode {
     final NodeAddress nodeAddress;
     private RaftNodeBehavior behavior = new RaftNodeBehaviorFollowerInitial(this);
 
+    // Consistent-observation pinning, touched only on the node executor thread.
+    // A behavior conversion (leader step-down, campaign, ...) replaces this single
+    // immutable snapshot, so any individual read of it is valid -- but two SEPARATE
+    // reads (a state task, then a term task on the executor) can bracket a conversion
+    // and fabricate a (LEADER, higher-term) pair that was never true at one moment.
+    // getNodeState() therefore samples (state, term, index) atomically and, when the
+    // node is LEADER, publishes the TermIndex here; the next getCurrentTermIndex() read
+    // returns exactly that sample (and consumes it), so a caller collecting state first
+    // and term after always sees one consistent (state, term, index) observation.
+    private TermIndex pendingLeaderTermIndex;
+
     // Topology and connections
     final TopologyDiscovery topologyDiscovery;
     final ChannelMiddleware channelMiddleware;
@@ -246,9 +257,20 @@ class RaftNodeImpl implements RaftNode {
 
     @Override
     public CompletableFuture<TermIndex> getCurrentTermIndex() {
-        return CompletableFuture.supplyAsync(
-                () -> new TermIndex(behavior.term, logs.getCurrentTermIndex().getIndex()),
-                nodeExecutor);
+        return CompletableFuture.supplyAsync(() -> {
+            // Return the sample pinned by the most recent getNodeState() read if this
+            // node was observed as LEADER at that instant: it is the term/index that
+            // BELONGS to that observation, not whatever the live behavior holds by the
+            // time this task runs (a conversion may have landed between the two tasks).
+            // Consume it so a later standalone read -- which is asked for the LIVE
+            // position, e.g. a catch-up or log-length check -- is not served stale data.
+            final TermIndex pinned = pendingLeaderTermIndex;
+            if (pinned != null) {
+                pendingLeaderTermIndex = null;
+                return pinned;
+            }
+            return new TermIndex(behavior.term, logs.getCurrentTermIndex().getIndex());
+        }, nodeExecutor);
     }
 
     @Override
@@ -268,7 +290,18 @@ class RaftNodeImpl implements RaftNode {
 
     @Override
     public CompletableFuture<NodeStates> getNodeState() {
-        return CompletableFuture.supplyAsync(() -> behavior.state, nodeExecutor);
+        return CompletableFuture.supplyAsync(() -> {
+            final NodeStates state = behavior.state;
+            // Sample the TermIndex in the SAME executor task as the state, so the pair
+            // a reader collects from state + the immediate term read describes one
+            // observation. Only a LEADER sample is pinned: for non-leaders the live
+            // term read is the correct (and expected) answer for catch-up/bookkeeping,
+            // and no assertion derives a term from a non-leader's state.
+            pendingLeaderTermIndex = state == NodeStates.LEADER
+                    ? new TermIndex(behavior.term, logs.getCurrentTermIndex().getIndex())
+                    : null;
+            return state;
+        }, nodeExecutor);
     }
 
     @Override
