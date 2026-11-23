@@ -42,7 +42,7 @@ to done (with commit refs), and the Test-evidence section gains the per-item run
 | 1 DELETE | ✅ done — commit `40700d0`, 213 tests green |
 | 2 TTL/EXPIRE | ✅ done — commit `f8e901d`, 232 tests green |
 | 3 Pre-Vote | ✅ done — commit `f35e60d`, 242 tests green |
-| 4 Snapshots | ✅ investigated — `SNAPSHOTS.md` + this flip (no code; suite still 242 green) |
+| 4 Snapshots | ✅ done (2026-11-23) — investigated 2026-11-21 (`SNAPSHOTS.md`), then every stage implemented: `47d9f9f` → `e9102f1` → `d658475` → `3fd7e6c`/`9f0a705` → `35f4ec0` → `stage 6(b)` (stages 1–6(b)); suite at close: 320 green |
 
 ## Phase status
 
@@ -67,7 +67,7 @@ Flagged deviations / gaps (see Decisions below):
 | ~~Leader's `AppendLog` subscriber was created but **never subscribed**~~ — **fixed in this branch**: subscribed in the leader ctor, so new entries push immediately via the `NEW_LOG` event instead of waiting up to one 50 ms heartbeat | `RaftNodeBehaviorLeader.java` ctor |
 | ~~A 2-node cluster can never commit: majority is computed as `size/2+1` but the leader only counted follower acks~~ — **fixed in this branch**: the leader's own log now counts toward the commit majority | `ClusterTopology.java:34-36`, `RaftNodeBehaviorLeader.updateCommittedIndex` |
 | ~~A 1-node cluster could never elect a leader (and therefore never commit or serve)~~ — **fixed in this branch**: the candidate recognizes its own vote as a majority when it is the only voter | `RaftNodeBehaviorCandidate.java` ctor |
-| No snapshot install / log compaction (Raft §7) — **investigated 2026-11-21 (item 4):** gap analysis + invariants + staged plan in `SNAPSHOTS.md`; implementation still outstanding (Follow-up #5) | `InstallSnapshotExample.java` sketch (do-not-modify); design in `SNAPSHOTS.md` |
+| ~~No snapshot install / log compaction (Raft §7)~~ — **investigated 2026-11-21 (item 4), implemented 2026-11-23:** full Raft §7 delivered per `SNAPSHOTS.md` stages 1→6(b), commits `47d9f9f`…`stage 6(b)`; Follow-up #5 closed | `InstallSnapshotExample.java` sketch (do-not-modify, untouched); plan + evidence in `SNAPSHOTS.md`; implementation in `lib/raft` |
 | `disconnectFrom` throws `UnsupportedOperationException` | `RaftNodeImpl.java:166-169` |
 
 ### Phase 2 — Basic state machine fed by Raft — 🔨 completed in this branch
@@ -104,7 +104,9 @@ test-oriented with fault injection). No real transport, framing, or serializatio
 mutate it, take nodes down/restore them, and run real request/response against it, re-proving
 the behaviors today covered only by mocked (PassThru) tests. Snapshots/log-compaction
 (`SNAPSHOTS.md`) are explicitly **deferred** per the same direction — "we'll do snapshots later"
-— and remain the recorded backlog, not part of this work.
+— and remain the recorded backlog, not part of this work. (That deferral was later lifted: the
+user signed off the full implementation and every stage landed 2026-11-23 — see Decision #8's
+addendum and Follow-up #5.)
 
 The design is documented in **`NETWORKING.md`** (wire format, `SocketChannelMiddleware`,
 fault-injection parity with `PassThruMiddleware`, node take-down/restart semantics, invariants
@@ -140,7 +142,9 @@ behaviors today covered only by the PassThru-mocked `RaftNodeTest` tests over a 
   (7 tests in the class).
 
 Snapshots/log compaction were **explicitly deferred** by the same direction ("we'll do
-snapshots later") and remain the `SNAPSHOTS.md` backlog (Decision #8).
+snapshots later") and remain the `SNAPSHOTS.md` backlog (Decision #8). — deferral lifted 2026-11-23:
+the user signed off all snapshot stages and they were implemented in full (see the Decision #2
+addendum, the Decision #8 addendum, and Follow-up #5; final suite 320 green).
 
 ### Phase 4 — Non-partitioned distributed cache — ✅ client API done in this branch
 
@@ -305,6 +309,25 @@ subsequently decided, fixed, and regression-tested):
    analysis (§2), the five safety invariants S1–S5, and a five-stage implementation plan ordered by
    risk (§3–§4). Per the plan's clause, no partial implementation was taken in the unattended pass;
    Stages 1–2 are recorded as the safe, isolated first implementation step.
+   **Addendum (2026-11-23).** The user signed off the full implementation ("Yes do all of the
+   stages. Test and commit as you go."), so the staged plan was executed in full — each stage
+   committed with a green `mvn -o -B test` (per-stage detail in `SNAPSHOTS.md`'s header table
+   and §7): stage 1 state capture & wholesale replacement — `Snapshot` capture/restore + bridge
+   adopt (`47d9f9f`); stage 2 `RaftLogs` snapshot boundary + `compact()` closing the
+   `containsStartPoint` TODOs (`a96abc8`); stage 3 `InstallSnapshot`/`Response` messages,
+   wire-shaped per `SNAPSHOTS.md` §3 (`e9102f1`); stage 4 follower install behind the S2
+   progress-only guard — single in-progress assembly, on `done` decode → publish
+   `SnapshotInstalled` → `logs.compact` → reply (`d658475`); stage 5 leader laggard
+   `SnapshotTransfer` (pins ONE serialization; `SNAPSHOT_CHUNK_BYTES = 64*1024L`) + compaction
+   trigger behind the S1 bound, with the per-node snapshot-supplier addendum (`3fd7e6c`,
+   `9f0a705`); stage 6(a) chunked transfer — leader resumes at the follower's returned offset
+   (`35f4ec0`); stage 6(b) durable `SnapshotStore` — `save(TermIndex boundary, byte[] payload)`
+   with the boundary IN the API, `InMemorySnapshotStore` and `FileSnapshotStore`
+   (directory-anchored atomic save), save-on-compact (leader) / save-on-install (follower) with
+   a failed save aborting BEFORE the trim, and `RaftNodeImpl` seeding in `startInternal()`
+   before log replay — null/empty/throwing/corrupt stores warn and skip, startup is never
+   blocked (`stage 6(b)`). Final suite: **320 tests green, 0 failed, 1 pre-existing skip**
+   (`/tmp/opencode/mvn-phase4-final.log`). Closes Decision #2 in full and Follow-up #5.
 3. **`disconnectFrom`** — `RaftNodeImpl.java:166-169` throws `UnsupportedOperationException`;
    node removal is not part of phase 2. (Consequence: the downed-follower quorum path — a leader
    with a live follower disconnected — is untestable until this exists; the quorum fix above was
@@ -336,7 +359,7 @@ subsequently decided, fixed, and regression-tested):
    compaction are explicitly pushed later** — the user: "we'll do snapshots later though so don't
    forget about them". `SNAPSHOTS.md` stays the authoritative backlog for that work (Follow-up #5);
    nothing in `NETWORKING.md` implements snapshot transfer — it only records that the wire format
-   is payload-neutral for it. **Resolution (2026-11-21):** all four stages delivered — commits `6dc8a1e`, `7a7eb1f`, `b54199b`, `f9b2fde` — all 7 IT scenarios green over real sockets (**267 tests green, 0 failed, 1 pre-existing skip**, `/tmp/opencode/mvn-net-14.log`); the snapshots deferral stands verbatim and `SNAPSHOTS.md` remains the backlog (Follow-up #5).
+   is payload-neutral for it. **Resolution (2026-11-21):** all four stages delivered — commits `6dc8a1e`, `7a7eb1f`, `b54199b`, `f9b2fde` — all 7 IT scenarios green over real sockets (**267 tests green, 0 failed, 1 pre-existing skip**, `/tmp/opencode/mvn-net-14.log`); the snapshots deferral stands verbatim and `SNAPSHOTS.md` remains the backlog (Follow-up #5). **Addendum (2026-11-23):** the deferral was lifted — the user signed off all snapshot stages and they were implemented in full (stages 1→6(b), commits `47d9f9f`…`stage 6(b)`, see Decisions #2 and Follow-up #5), including `InstallSnapshot`/`Response` over the wire in the payload-neutral format of this design.
 9. **Wire serialization: JDK `java.io.Serializable`, no new dependencies** *(decided with #8)*.
    Offline Maven forbids adding a codec library (nothing beyond the current pom is available), and
    `jackson-databind` in the local repo is not a declared dependency — introducing it is still a
@@ -388,7 +411,7 @@ which stay the detailed record.
    today means taking the cluster down and rolling it over. No join/leave protocol, no joint
    consensus, no member transitions. This also keeps Decisions #3 (`disconnectFrom`) relevant
    until real removal semantics exist.
-5. **Snapshots / log compaction** — *(investigated 2026-11-21, item 4 delivered as design, `SNAPSHOTS.md`)* — Decisions #2, design in `SNAPSHOTS.md`. Ground truth: committed entries are **never** compacted (only the uncommitted tail is trimmed, `RaftLogs.rollback()`), no snapshot message / follower install / leader trigger exists, and `PartitionMap.getSnapshot()` — the exact state a snapshot must capture — is already implemented but never called. Remaining work is the staged plan (`SNAPSHOTS.md` §4): Stage 1 state capture + `replaceState`/`adopt`; Stage 2 `RaftLogs` snapshot boundary + `compact()` (closing the `containsStartPoint` TODOs); Stage 3 `InstallSnapshot`/`Response` messages (sketch-shaped: term, leaderId, lastIncluded index/term, payload, offset/done); Stage 4 follower install behind the S2 progress-only guard; Stage 5 leader laggard detection + send + compaction trigger behind the S1 bound. Stages 1–2 are isolated and testable without protocol risk. `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see Decisions #2).
+5. **Snapshots / log compaction** — **done 2026-11-23** *(investigated 2026-11-21; item 4 first delivered as the design document `SNAPSHOTS.md`, then all implementation stages landed 2026-11-23, commits `47d9f9f` → `stage 6(b)`)* — Decisions #2, design in `SNAPSHOTS.md`. Ground truth: committed entries are **never** compacted (only the uncommitted tail is trimmed, `RaftLogs.rollback()`), no snapshot message / follower install / leader trigger exists, and `PartitionMap.getSnapshot()` — the exact state a snapshot must capture — is already implemented but never called. Remaining work is the staged plan (`SNAPSHOTS.md` §4): Stage 1 state capture + `replaceState`/`adopt`; Stage 2 `RaftLogs` snapshot boundary + `compact()` (closing the `containsStartPoint` TODOs); Stage 3 `InstallSnapshot`/`Response` messages (sketch-shaped: term, leaderId, lastIncluded index/term, payload, offset/done); Stage 4 follower install behind the S2 progress-only guard; Stage 5 leader laggard detection + send + compaction trigger behind the S1 bound. Stages 1–2 are isolated and testable without protocol risk. `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see Decisions #2). The staged plan has since been implemented in full (stages 1→6(b), 2026-11-23, commits `47d9f9f` → `stage 6(b)`; per-stage evidence in `SNAPSHOTS.md`'s header table and §7; final suite 320 green, 0 failed, 1 pre-existing skip) — this follow-up is closed.
 6. **Election up-to-date rule** *(done in this branch)* — Decisions #1. The candidate's
    `VoteRequest` now reports the last log entry's term/index per Raft §5.4.1 (commit
    `6b33a9c`), with the voting path fixed so the rule is honored (`2c4dd89`): no rollback on
@@ -651,4 +674,5 @@ iterations per `@ParameterizedTest`), so the test total moves with it.
 - After Phase 3 **stage B**, `SocketChannelMiddleware` over real sockets (commit `7a7eb1f`): **260 tests green, 0 failed, 1 pre-existing skip** (log `/tmp/opencode/mvn-net-11.log`), adding `SocketChannelMiddlewareTest` (6) — the second, *real* `ChannelMiddleware` implementation: `127.0.0.1`/ephemeral-port channels, 4-byte-BE length framing (payload-neutral for the `Serializable` payloads, so Decision #9's codec-swap escape valve does not re-touch framing), a server-side handshake that resolves the peer's `RaftNode` from its announced address, and PassThru-parity per-node `interrupt`/`restore` (invariants N1–N3: framing integrity, handshake resolution, fault isolation — sealed pairs stay framed and never desynchronize).
 - After Phase 3 **stage C**, `ClusterKit` + ITs 1–6 (commit `b54199b`): **266 tests green, 0 failed, 1 pre-existing skip** (log `/tmp/opencode/mvn-net-13.log`), adding `RealNetworkClusterTest` ITs 1–6 — a production-shaped 3-node cluster (`ClusterKit` gives each node its own middleware on an ephemeral port, own `RaftManager`/`EventBus`, own `PartitionMap`/`DistributedCache`, torn down deterministically): leader election, put/get with apply-then-acknowledge visibility via the facade, delete/expire e2e, and partition-restore of a follower (N4 — the healthy pair keeps committing on a 2-of-3 quorum while the dead connection dead-marks and drops) and of the leader (N5 — the surviving pair elects a new leader at a strictly higher term; after restore the old leader steps down or re-wins at a higher term, and the at-most-one-leader-per-term rule is re-asserted on every poll sample). The `RaftNodeTest` behaviors are thereby re-proven over a real wire.
 - After Phase 3 **stage D**, IT 7 hard-stop/restart (commit `f9b2fde`): **267 tests green, 0 failed, 1 pre-existing skip** (log `/tmp/opencode/mvn-net-14.log`) — the last of `NETWORKING.md`'s 7 scenarios (N6). `ClusterKit.hardStop(i)` stops a slot in crash order (facade unsubscribes → terminal `RaftManager` node stop → idempotent socket close; unlike `interrupt`/`restore` there is nothing to resume), and `restart(i)` brings the *same* slot back with process-restart semantics: a fresh `SocketChannelMiddleware` (new ephemeral wire address), a fresh discovery seeded with the two survivors' current addresses, a fresh `RaftManager` (fresh bus), a fresh node with the same Raft id, started before the slot swap; the survivors keep their bus and state machine, their facades rebuilt over a fresh node list (the old list references the terminal node, whose shut-down executor would reject a leader-routed call). IT 7 then verifies: v1 committed 3/3 and applied on all three state machines → hard-stop a **follower** (no term churn — it is never the leader) → v2 commits on a 2-of-3 quorum on the surviving pair → the stopped node's local view still reads "v1" (frozen state machine behind an unsubscribe-only `close()`) → `restart` → the surviving leader's continuation push replays v1-then-v2 into the fresh node's brand-new map (fresh `globalVersion`, so the two entries re-derive versions 1 and 2, matching the survivors byte-for-byte) → all three local maps hold "v2" at version 2 exactly → exactly one leader, the same pre-stop leader object. **Phase 3 is thereby complete** — the header above is flipped and the Phase 4 note that real transport "follows with phase 3" is delivered by these stages.
+- Item 4 — snapshots / log compaction, signed-off work plan (stages 1→6(b) implemented and committed 2026-11-23 after the user signed off the full implementation; each stage ran the full suite green before commit, final log `/tmp/opencode/mvn-phase4-final.log`): **stage 1** (commit `47d9f9f`) state capture & wholesale replacement — `Snapshot` capture/restore + `StateMachineBridge` adopt; additions in `StateMachineBridgeTest`; **stage 2** (commit `a96abc8`) log boundary + `compact()` in `RaftLogs`; additions in `RaftLogsTest`; **stage 3** (commit `e9102f1`) `InstallSnapshot`/`InstallSnapshotResponse` messages + wire plumbing; additions in `WireSerializationTest`; **stage 4** (commit `d658475`) follower install acceptance + bridge adoption behind the S2 progress-only guard — `RaftNodeBehaviorFollowerInstallSnapshotTest` (16 tests); **stage 5** (commits `3fd7e6c`, `9f0a705`) leader laggard `SnapshotTransfer` with pinned serialization + compaction trigger behind the S1 bound + per-node snapshot-supplier addendum — `RaftNodeBehaviorLeaderInstallSnapshotTest` (8 tests) and the 3-node end-to-end `RaftNodeSnapshotRecoveryTest` (1 test); **stage 6(a)** (commit `35f4ec0`) chunked transfer with offset-cursor resume; additions in `WireSerializationTest`; **stage 6(b)** (commit `stage 6(b)`) durable `SnapshotStore` with save-before-trim and startup seeding — `InMemorySnapshotStoreTest` (7 tests), `FileSnapshotStoreTest` (7 tests, including empty/corrupt-store load skips). Suite at close: **320 tests green, 0 failed, 1 pre-existing skip** (up from 267 at the end of phase 3). All four signed-off work-plan items are now done.
 

@@ -447,6 +447,40 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
         connection.setLastEntriesAcknowledged(Instant.EPOCH);
     }
 
+    // ---- SNAPSHOT STORE (stage 6b): compaction persists the wire bytes before the trim ----
+
+    @Test
+    void allFollowersAtCommittedPoint_snapshotIsPersistedBeforeCompact() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final Object payload = new Snapshot(TERM, LAST_INDEX, Map.of());
+            node.setSnapshotSupplier(() -> payload);
+            final InMemorySnapshotStore store = new InMemorySnapshotStore();
+            node.setSnapshotStore(store);
+
+            // Same gate-satisfaction as the stage-5 test: quorum acks the tail and every live
+            // follower already holds it, so the compaction is triggered.
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection caughtUp = new RecordingConnection("caughtUp", new TermIndex(TERM, LAST_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(caughtUp);
+
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+
+            assertTrue(node.logs.hasStartPointSnapshot(), "sanity: the log compacted");
+            // THE CORE (stage 6b): the compaction persisted the leader's ONE serialization under the
+            // committed boundary, BEFORE trimming the log to it (a failed save would have aborted
+            // before the trim, so reaching this point guarantees the bytes are durable).
+            final SnapshotStore.Stored stored = store.loadLatest()
+                    .orElseThrow(() -> new AssertionError("compaction must persist the snapshot"));
+            assertEquals(new TermIndex(TERM, LAST_INDEX), stored.boundary(), "the boundary is the committed point");
+            assertArrayEquals(chunk(payload), stored.payload(), "the store holds the leader's one serialization");
+            closeCurrent(node);
+        }
+    }
+
     /**
      * A minimal mutable {@link NodeConnectionOutbound}: the leader's send path mutates its
      * term-index and pacing stamps, so (unlike the read-only pre-vote stubs) the accessors

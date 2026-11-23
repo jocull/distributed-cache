@@ -375,9 +375,17 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                         c -> c.getTermIndex().getIndex() >= self.logs.getCommittedTermIndex().getIndex())) {
             final Object snapshotPayload = self.snapshotSupplier().get();
             if (snapshotPayload != null) {
+                final TermIndex boundary = self.logs.getCommittedTermIndex();
+                // SNAPSHOT STORE (stage 6b): persist the exact wire bytes this boundary
+                // reflects BEFORE compacting the log. A save failure must never drop log
+                // entries (the log still holds them), so a failed save aborts before the
+                // trim -- it propagates out of this call and the log stays intact.
+                if (self.snapshotStore() != null) {
+                    self.snapshotStore().save(boundary, serializeSnapshotPayload(snapshotPayload));
+                }
                 LOGGER.info("{} All live followers at committed {} - compacting log to the snapshot boundary",
-                        self.getId(), self.logs.getCommittedTermIndex());
-                self.logs.compact(self.logs.getCommittedTermIndex(), snapshotPayload);
+                        self.getId(), boundary);
+                self.logs.compact(boundary, snapshotPayload);
             } else {
                 LOGGER.warn("{} Follower caught up to {} but no snapshot payload available - cannot compact",
                         self.getId(), self.logs.getCommittedTermIndex());

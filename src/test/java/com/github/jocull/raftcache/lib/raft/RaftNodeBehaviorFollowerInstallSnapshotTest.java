@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -546,6 +547,106 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             assertThrows(IllegalStateException.class,
                     () -> node.currentReceiver().onInstallSnapshot(new RecordingSender("leader"),
                             new InstallSnapshot(1, "leader", 10L, 1, 0L, chunk(new Snapshot(1L, 10L, Map.of("key1", value("v")))), true)));
+        }
+    }
+
+    // ---- SNAPSHOT STORE (stage 6b): a completed install persists the wire bytes ----
+
+    @Test
+    void installSnapshot_isPersistedToTheSnapshotStore() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            final InMemorySnapshotStore store = new InMemorySnapshotStore();
+            follower.setSnapshotStore(store);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            final Snapshot snapshot = new Snapshot(5L, 10L, Map.of("key1", value("value1")));
+            final byte[] wire = chunk(snapshot);
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, wire, true));
+
+            // THE CORE (stage 6b): the completed install persisted the EXACT wire bytes under the
+            // install boundary, before the log was re-anchored on it.
+            assertTrue(follower.logs.hasStartPointSnapshot(), "sanity: the install completed and compacted");
+            final SnapshotStore.Stored stored = store.loadLatest()
+                    .orElseThrow(() -> new AssertionError("the completed install must persist its snapshot"));
+            assertEquals(new TermIndex(5, 10L), stored.boundary(), "the boundary is the install boundary");
+            assertArrayEquals(wire, stored.payload(), "the store holds the exact wire bytes we installed");
+
+            // S4 is undisturbed: the state still adopted, applied position re-anchored.
+            assertTrue(partitionMap.getData("key1").isPresent(), "the adopted state is readable");
+            assertEquals(10L, bridge.getLastAppliedIndex(), "the applied position is re-anchored to the boundary");
+        }
+    }
+
+    // ---- SNAPSHOT STORE (stage 6b): startup re-adopts a seeded snapshot ----
+
+    @Test
+    void startup_seedsAPersistedSnapshotIntoLogAndState() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final InMemorySnapshotStore store = new InMemorySnapshotStore();
+            final Snapshot snapshot = new Snapshot(5L, 10L, Map.of("key1", value("value1")));
+            store.save(new TermIndex(5, 10L), chunk(snapshot));
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            follower.setSnapshotStore(store);
+            wireBridge(follower); // subscribed before start so it catches the seed's adopt event
+            follower.start().join();
+
+            // The log is anchored on the seeded snapshot, with the boundary as its recorded tail.
+            assertTrue(follower.logs.hasStartPointSnapshot(), "the seed anchored the log on the snapshot");
+            assertEquals(new TermIndex(5, 10L), follower.logs.getStartTermIndex());
+            assertEquals(10L, follower.logs.getCurrentTermIndex().getIndex(), "the seeded boundary is the tail");
+
+            // The re-anchored payload is the snapshot we seeded.
+            final Snapshot installed = (Snapshot) follower.logs.getSnapshotPayload();
+            assertEquals(5L, installed.term());
+            assertEquals(10L, installed.index());
+
+            // And the state was re-adopted through the bridge, exactly like a live install.
+            assertTrue(partitionMap.getData("key1").isPresent(), "the seeded state is readable");
+            assertArrayEquals("value1".getBytes(StandardCharsets.UTF_8),
+                    partitionMap.getData("key1").orElseThrow().getData().get("value"));
+            assertEquals(7L, partitionMap.getData("key1").orElseThrow().getVersion(), "the captured version counter is restored");
+            assertEquals(10L, bridge.getLastAppliedIndex(), "the applied position is re-anchored to the boundary");
+            assertEquals(5L, bridge.getLastAppliedTerm());
+        }
+    }
+
+    @Test
+    void startup_aStoreThatFailsToLoad_doesNotPreventStartup() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final SnapshotStore throwing = new SnapshotStore() {
+                @Override
+                public void save(TermIndex boundary, byte[] payload) {
+                    // not used by the seed path
+                }
+
+                @Override
+                public Optional<SnapshotStore.Stored> loadLatest() {
+                    throw new IllegalStateException("simulated corrupt store");
+                }
+            };
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            follower.setSnapshotStore(throwing);
+            // A corrupt/malformed snapshot must never prevent startup (SNAPSHOTS.md): the seed
+            // swallows the load failure and the node comes up on its (fresh) log regardless.
+            follower.start().join();
+
+            assertFalse(follower.logs.hasStartPointSnapshot(), "a failed seed installs no snapshot");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is left untouched");
         }
     }
 

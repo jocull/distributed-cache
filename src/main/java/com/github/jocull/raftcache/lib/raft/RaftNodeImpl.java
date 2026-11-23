@@ -65,6 +65,13 @@ class RaftNodeImpl implements RaftNode {
     // caller's thread); the node executor only reads it afterwards.
     private volatile Supplier<Object> snapshotSupplier = null;
 
+    // Snapshot store (SNAPSHOTS.md stage 6b): durable backing for snapshots. The leader
+    // persists its own capture on compaction, the follower persists the exact wire bytes it
+    // installs, and both reload the latest on startup to re-anchor before log replay.
+    // null = no durable backing (the Raft layer takes no snapshot action at those seams).
+    // volatile: wired from outside the node executor, read on it afterwards.
+    private volatile SnapshotStore snapshotStore = null;
+
     RaftNodeImpl(String id,
                  NodeAddress nodeAddress,
                  TopologyDiscovery topologyDiscovery,
@@ -97,7 +104,57 @@ class RaftNodeImpl implements RaftNode {
     private void startInternal() {
         // All nodes start in FOLLOWER state until they hear from a leader or start an election
         behavior.close();
+
+        // SEED (SNAPSHOTS.md stage 6b): before the follower begins replaying the log,
+        // re-adopt any snapshot we persisted into the state machine (via the same
+        // SnapshotInstalled event the follower install path publishes, so the
+        // state-machine bridge is the single adopter) and compact the log to that
+        // boundary. The order mirrors an install (S4): adopt first, then compact -- and,
+        // as on the install path, a failed reload leaves the log untouched so no entries
+        // are lost. Runs on the node executor (start() schedules us there), before the
+        // follower behavior is constructed, so no replay has started yet.
+        seedFromSnapshotStore();
+
         behavior = new RaftNodeBehaviorFollower(this, 0);
+    }
+
+    /**
+     * Re-adopt the latest persisted snapshot (if any) into the state machine and compact
+     * the log to its boundary. A no-op when no store is installed, the store is empty, or
+     * the saved bytes cannot be decoded (a corrupt snapshot must not prevent startup --
+     * the node falls back to whatever log entries it still has, or an empty one).
+     */
+    private void seedFromSnapshotStore() {
+        final SnapshotStore store = this.snapshotStore;
+        if (store == null) {
+            return;
+        }
+        final SnapshotStore.Stored snap;
+        try {
+            snap = store.loadLatest().orElse(null);
+        } catch (Exception e) {
+            LOGGER.warn("{} Failed to read the persisted snapshot store - starting without it", id, e);
+            return;
+        }
+        if (snap == null) {
+            LOGGER.debug("{} No persisted snapshot to seed from - starting on a fresh log", id);
+            return;
+        }
+        final Object payload;
+        try (java.io.ObjectInputStream ois =
+                     new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(snap.payload()))) {
+            payload = ois.readObject();
+        } catch (Exception e) {
+            LOGGER.warn("{} Failed to decode persisted snapshot {} ({} bytes) - starting without it",
+                    id, snap.boundary(), snap.payload().length, e);
+            return;
+        }
+        // S4 order, exactly as the follower install path: adopt the state first (event),
+        // then compact the log to the boundary (only the saved bytes now carry it).
+        eventBus.publish(new com.github.jocull.raftcache.lib.raft.events.SnapshotInstalled(
+                snap.boundary().getTerm(), snap.boundary().getIndex(), payload));
+        logs.compact(snap.boundary(), payload);
+        LOGGER.info("{} Seeded from persisted snapshot at boundary {} ({} bytes)", id, snap.boundary(), snap.payload().length);
     }
 
     private void stopInternal() {
@@ -384,6 +441,16 @@ class RaftNodeImpl implements RaftNode {
     @Override
     public void setSnapshotSupplier(Supplier<Object> snapshotSupplier) {
         this.snapshotSupplier = snapshotSupplier;
+    }
+
+    @Override
+    public void setSnapshotStore(SnapshotStore snapshotStore) {
+        this.snapshotStore = snapshotStore;
+    }
+
+    @Override
+    public SnapshotStore snapshotStore() {
+        return snapshotStore;
     }
 
     @Override

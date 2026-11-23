@@ -1,10 +1,23 @@
 # Snapshots & Log Compaction — Investigation and Staged Plan (work-plan item 4)
 
-**Status: DELIVERED as investigation + design (2026-11-21).** Per the signed-off plan this item is
-*"look into doing snapshots/log compaction"* — the deliverable is this in-repo investigation plus a
-staged implementation plan. **No code was changed** in this pass; the stages below are the recorded
-implementation backlog (Follow-up #5). `InstallSnapshotExample.java` and the `proto/raft/*` package
-were consulted as working notes only and remain untouched.
+**Status: DONE — investigation + design delivered 2026-11-21, then all implementation stages
+delivered 2026-11-23.** This document began as the sign-off-approved *"look into doing
+snapshots/log compaction"* — the in-repo investigation plus staged implementation plan — and §4's
+plan was subsequently executed in full, each stage committed with a green `mvn -o -B test`:
+
+| Stage (per §4) | Delivered | Commit |
+|---|---|---|
+| 1 — state capture & wholesale replacement | `Snapshot`, capture/restore, bridge adopt | `47d9f9f` |
+| 2 — log boundary and compaction in `RaftLogs` (S2/S3/S5) | snapshot boundary + `compact()` | `a96abc8` |
+| 3 — `InstallSnapshot` protocol messages and wire plumbing | request/response + wire | `e9102f1` |
+| 4 — follower `InstallSnapshot` acceptance and bridge adoption | install handler behind S2 | `d658475` |
+| 5 — leader laggard `InstallSnapshot` + compaction trigger (+ per-node snapshot supplier wiring addendum) | `SnapshotTransfer` + save-before-trim gate | `3fd7e6c`, `9f0a705` |
+| 6(a) | chunked transfer: leader pins one serialization, follower assembles, offset cursor resumes at the returned offset | `35f4ec0` |
+| 6(b) | durable `SnapshotStore` (in-memory + file impls): save-on-compact (leader), save-on-install (follower — a failed save aborts before the trim), seed at startup before log replay; null/empty/corrupt/throwing stores warn and skip, startup is never blocked | `stage 6(b)` |
+
+Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
+(`/tmp/opencode/mvn-phase4-final.log`). `InstallSnapshotExample.java` and the `proto/raft/*`
+package were consulted as working notes only and remain untouched (do-not-modify).
 
 Sources: Raft paper §7 (§7.1 log compaction, §7.2 snapshot transfer) and §5.4.1 (up-to-date rule,
 which snapshots interact with), Ongaro's thesis (log compaction + snapshot chapters), etcd's
@@ -185,8 +198,25 @@ protocol-level changes in one branch, is the risk the plan explicitly declines t
 remain deliberately safe, isolated, and testable for a first implementation pass, with the staged
 test plan above as the acceptance criteria.
 
+> **Postscript (2026-11-23):** the user signed off the full implementation ("Yes do all of the
+> stages. Test and commit as you go."), so this caution was honored by process, not outcome —
+> §4 was executed stage by stage, each stage committed with a green `mvn -o -B test`, and the
+> staged test plan of §4 served as the per-stage acceptance criteria. See the status table in the
+> header for the commits.
+
 ## 7. Verification
 
-This pass changes **no source files**: the full suite remains at **242 tests green, 0 failed, 1
-pre-existing skip** (`mvn -o -B test`, green 2×: `/tmp/opencode/mvn-prevote.log`,
-`/tmp/opencode/mvn-prevote-2.log`, item-3 evidence — item 4 adds no tests, none expected to change).
+**Investigation pass (2026-11-21)** — no source files changed: the full suite stayed at
+**242 tests green, 0 failed, 1 pre-existing skip** (`mvn -o -B test`, green 2×:
+`/tmp/opencode/mvn-prevote.log`, `/tmp/opencode/mvn-prevote-2.log`).
+
+**Implementation pass (2026-11-23)** — each of stages 1→6(b) ran the full suite green before
+commit (`/tmp/opencode/mvn-phase4-*.log`); final state at stage 6(b):
+**320 tests green, 0 failures, 1 pre-existing skip** (`/tmp/opencode/mvn-phase4-final.log`), the
+per-stage tests landing in `RaftLogsTest`, `RaftNodeBehaviorFollowerInstallSnapshotTest`
+(install acceptance + completion save + seed + failing-store no-op, 16 tests),
+`RaftNodeBehaviorLeaderInstallSnapshotTest` (transfer + compaction-persistence, 8 tests),
+`InMemorySnapshotStoreTest` (7), `FileSnapshotStoreTest` (7), and the 3-node end-to-end
+`RaftNodeSnapshotRecoveryTest` (1 — laggard recovers through the snapshot and the leader compacts
+afterwards; stage 5 addendum, `9f0a705`), on top of the per-stage suite additions in
+`StateMachineBridgeTest`, `RaftLogsTest`, and `WireSerializationTest`.

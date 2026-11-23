@@ -82,6 +82,28 @@ public interface RaftNode {
     }
 
     /**
+     * Installs the durable store this node persists snapshots to (SNAPSHOTS.md stage 6b):
+     * a leader saves its capture on compaction, a follower saves the exact wire bytes it
+     * installs, and both reload any saved snapshot on startup to re-anchor state machine
+     * and log before replaying the log.
+     *
+     * <p>Default is a no-op: {@link RaftNode} implementations that carry no durable backing
+     * (test doubles, middleware fakes) simply never persist snapshots.
+     */
+    default void setSnapshotStore(SnapshotStore snapshotStore) {
+        // Intentionally empty: see above.
+    }
+
+    /**
+     * The snapshot store installed via {@link #setSnapshotStore(SnapshotStore)}, or
+     * {@code null} when this node has no durable snapshot backing. Readers must treat
+     * {@code null} as "no store" and take no snapshot action on compaction or install.
+     */
+    default SnapshotStore snapshotStore() {
+        return null;
+    }
+
+    /**
      * The event bus this node publishes its events on (the same instance the
      * {@code RaftManager} that created it exposes via {@code getEventBus()}).
      *

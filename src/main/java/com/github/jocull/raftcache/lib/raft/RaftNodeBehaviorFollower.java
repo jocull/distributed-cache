@@ -519,6 +519,13 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         final long totalBytes = pending.expectedOffset;
         transferInProgress = null;
 
+        // SNAPSHOT STORE (stage 6b): persist the EXACT wire bytes we just assembled (the
+        // leader's one serialization, not a re-serialize) before we adopt or compact.
+        // Byte-stable and save-before-trim, exactly as the leader path.
+        if (self.snapshotStore() != null) {
+            self.snapshotStore().save(boundary, pending.buffer.toByteArray());
+        }
+
         // Advance the state machine FIRST (adopt), then compact the log to the boundary
         // (S4 order: state reflects the boundary before the log is trimmed to it).
         self.eventBus.publish(new SnapshotInstalled(lastIncludedTerm, lastIncludedIndex, payload));
