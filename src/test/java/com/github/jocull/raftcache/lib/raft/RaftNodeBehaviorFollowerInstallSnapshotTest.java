@@ -449,6 +449,52 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
     }
 
     @Test
+    void aNegativeOffsetRefusesWithCursorZero_soTheTransferRestartsFromByteZero() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            final byte[] data = chunk(new Snapshot(5L, 10L, Map.of("key1", value("neg"))));
+            final int split = data.length / 2;
+            final byte[] first = Arrays.copyOfRange(data, 0, split);
+
+            // The transfer is in flight under (5,10): the offset-0 half is accepted.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+            assertEquals((long) split, leader.snapshotResponses().get(0).getOffset(), "chunk 1 accepted; the cursor says 'send me byte split'");
+
+            // A negative offset is not a byte position. It must NOT fall into the
+            // "lost-ack retransmit" branch (which would re-report the in-flight cursor, so the
+            // leader never learns its send was illegal) but be refused with cursor 0 and the
+            // in-flight transfer torn down.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, -1L, first, true));
+            assertEquals(2, leader.snapshotResponses().size(), "the illegal chunk is answered, not dropped");
+            assertEquals(0, leader.snapshotResponses().get(1).getOffset(), "an illegal cursor is answered with a 'restart from byte 0' cursor");
+            assertFalse(follower.logs.hasStartPointSnapshot(), "a refused chunk installs nothing");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "a refused chunk must not move the tail");
+            assertTrue(partitionMap.getData("key1").isEmpty(), "a refused chunk must not touch the state");
+
+            // The escape valve then runs: the leader re-sends byte 0 and the transfer
+            // re-baselines to completion.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+            assertEquals((long) split, leader.snapshotResponses().get(2).getOffset(), "the re-send of byte 0 re-baselines the transfer");
+            final byte[] second = Arrays.copyOfRange(data, split, data.length);
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, split, second, true));
+            assertEquals(new TermIndex(5, 10L), follower.logs.getStartTermIndex());
+            assertArrayEquals("neg".getBytes(StandardCharsets.UTF_8),
+                    partitionMap.getData("key1").orElseThrow().getData().get("value"));
+        }
+    }
+
+    @Test
     void aChunkUnderADifferentBoundary_isRefusedWithCursorZero() {
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
@@ -509,6 +555,18 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             assertFalse(follower.logs.hasStartPointSnapshot());
             assertTrue(partitionMap.getData("key1").isEmpty(), "a refused payload must not touch the state");
         }
+    }
+
+    @Test
+    void aNullPayload_isBlockedAtTheMessageBoundary_soTheFollowerNeverSeesOne() {
+        // The InstallSnapshot constructor null-guards the payload (Objects.requireNonNull),
+        // so a null payload cannot be built or delivered today; the handler's null-payload
+        // branch is defense-in-depth behind that invariant. This pin makes the invariant
+        // test-visible, so a construction path that drops it cannot silently move the guard
+        // from the message boundary down into the handler.
+        assertThrows(NullPointerException.class,
+                () -> new InstallSnapshot(0, "leader", 10L, 5, 0L, null, true),
+                "the message boundary null-guards the payload");
     }
 
     @Test

@@ -385,6 +385,41 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
         }
     }
 
+    // ---- Stage 6e: a reply that arrives with no transfer in flight is treated as a completion ----
+
+    @Test
+    void aSnapshotResponseBeforeAnyTransfer_isTreatedAsCompletion_andResendsNothing() {
+        // Edge of the completion condition (SNAPSHOTS.md 6e): a reply arrives when no transfer
+        // is in flight (snapshotsInFlight is empty -- a duplicated, late, or mis-routed reply).
+        // The leader must handle it exactly like a completed transfer: adopt the reported tail,
+        // attempt no retransmit (there is no pinned capture to re-send), and leave the log alone.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            // No snapshot supplier is registered: even if the commit point lands on a snapshot
+            // gate that fires, the log cannot be trimmed either way -- the log is what we assert.
+
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            node.activeConnections.add(laggard);
+
+            // No ack, no capture: snapshotsInFlight is still empty when the reply arrives. Must
+            // not throw out of the handler and must not fabricate a retransmit of a capture
+            // that was never made.
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, LAST_INDEX));
+
+            assertEquals(new TermIndex(TERM, LAST_INDEX), laggard.getTermIndex(), "a stale reply still adopts the reported tail");
+            assertTrue(laggard.installSnapshotsSent.isEmpty(), "a reply with no transfer in flight must NOT fabricate a retransmit");
+            assertTrue(laggard.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "a follower at our tail only ever receives empty heartbeats");
+            assertEquals(NodeStates.LEADER, stateOf(node), "a same-term reply keeps us the leader");
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex(),
+                    "the install IS the acknowledgement of everything up to the reported tail (Raft \u00a77)");
+            assertFalse(node.logs.hasStartPointSnapshot(), "no supplier was registered, so the log is left untouched");
+            closeCurrent(node);
+        }
+    }
+
     // ---- Chunked transfer (stage 6a): one pinned serialization, byte cursor, idempotent re-sends ----
 
     @Test
@@ -461,6 +496,61 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
             assertTrue(laggard.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
                     "post-completion traffic to the laggard is heartbeats only");
 
+            closeCurrent(node);
+        } finally {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = originalChunkBytes;
+        }
+    }
+
+    @Test
+    void anOverLengthCursorReply_completesTheTransfer_soTheLeaderNeverSeeksPastTheCapture() {
+        // Edge of the completion condition (SNAPSHOTS.md 6e): the follower reports a cursor
+        // PAST the last byte of the pinned capture while its index is still BELOW our boundary,
+        // so the OFFSET (not the index) must trigger completion. Misclassified as in-progress,
+        // the leader would adopt the out-of-bounds cursor as its resume point and the next pass
+        // would throw out of appendEntries (Arrays.copyOfRange with a start past the capture).
+        final Object payload = new Snapshot(TERM, LAST_INDEX,
+                Map.of("key1", new DataVersion(Map.of("big", new byte[1536]), 7)));
+        final long chunkBytes = halfOfSerialized(payload);
+        final long originalChunkBytes = RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES;
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = chunkBytes;
+
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            node.setSnapshotSupplier(() -> payload);
+
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(laggard);
+
+            // Phase 1: the first half-chunk is in flight (offset 0, not done).
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            final byte[] data = chunk(payload);
+            assertEquals(1, laggard.installSnapshotsSent.size());
+            assertEquals(0L, laggard.installSnapshotsSent.get(0).getOffset());
+            assertFalse(laggard.installSnapshotsSent.get(0).isDone());
+
+            // Phase 2: the reply's cursor runs past the capture's last byte while its index stays
+            // below our boundary: it must be treated as COMPLETE -- and must not throw.
+            leader.onInstallSnapshotResponse(laggard,
+                    new InstallSnapshotResponse(TERM, LAGGARD_INDEX, data.length + 1000L));
+            assertEquals(new TermIndex(TERM, LAGGARD_INDEX), laggard.getTermIndex(),
+                    "the reported tail is adopted verbatim (the cursor is a hint, the index is what we trust)");
+            assertEquals(NodeStates.LEADER, stateOf(node), "a same-term reply keeps us the leader");
+
+            // Phase 3: the transfer is torn down and the laggard is below our tail again, so the
+            // next pass is a FRESH install (byte 0, the pinned capture) -- never a "resume" from
+            // the out-of-bounds cursor.
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            assertTrue(laggard.installSnapshotsSent.size() >= 2, "a follower below our tail is installed again");
+            final InstallSnapshot again = laggard.installSnapshotsSent.get(laggard.installSnapshotsSent.size() - 1);
+            assertEquals(0L, again.getOffset(), "the fresh transfer starts at byte 0, not past the capture");
+            assertArrayEquals(Arrays.copyOfRange(data, 0, (int) chunkBytes), (byte[]) again.getPayload(),
+                    "the fresh transfer re-sends the same pinned capture, not a new one");
             closeCurrent(node);
         } finally {
             RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = originalChunkBytes;

@@ -16,11 +16,14 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(b) | durable `SnapshotStore` (in-memory + file impls): save-on-compact (leader), save-on-install (follower — a failed save aborts before the trim), seed at startup before log replay; null/empty/corrupt/throwing stores warn and skip, startup is never blocked | `stage 6(b)` |
 | 6(c) | non-happy-path hardening: failing stores on both roles (leader compaction and follower install fail closed — log left untrimmed, no success reply so the leader retransmits), gap one below the trigger stays on the append-replay path, an exact-divisor chunk size ends cleanly on the last byte with no empty trailer, orphan `.tmp` files are invisible to `loadLatest` even when named for a higher boundary | `stage 6(c)` |
 | 6(d) | non-happy-path hardening (second pass): a throwing snapshot supplier or a payload that cannot be serialized in the laggard path falls back to appends instead of tearing down the heartbeat round (a healthy supplier recovers); a negative offset cursor in `InstallSnapshotResponse` is clamped to 0 (would otherwise AIOOBE the next `Arrays.copyOfRange`); `loadLatest` skips snapshot-shaped files with unparseable names while still recovering a valid one in the same directory, and picks strictly max-by-boundary (term-major) when two valid files coexist; the compaction gate stays fail-closed; a failed store `save` (e.g. read-only directory) is loud and leaves no `.tmp` behind | `stage 6(d)` |
+| 6(e) | non-happy-path hardening (third pass): the follower's `onInstallSnapshot` refuses a **negative `offset` cursor** (a byte position is never < 0) by tearing down the in-progress transfer and answering with the restart-at-byte-0 cursor — previously it would fall into the "duplicate" branch and re-advertise the stale cursor; an **explicit null payload** is refused like a non-`byte[]` one (tear-down + cursor-0 refusal, election timer rescheduled) — previously it NPEd at `chunk.length` and escaped the handler **with no reply at all** (unreachable via the public API: the `InstallSnapshot` constructor already null-guards the payload, a boundary pin now asserts that invariant); the leader's `onInstallSnapshotResponse` needed **no** change — the two untested edges of its completion predicate are pinned instead: a same-term reply that arrives with **no transfer in flight** (late/duplicated/mis-routed) completes cleanly (tail adopted, commit advanced, and nothing fabricated to retransmit, since no capture was ever pinned), and a reply whose **cursor runs past the last byte of the pinned capture** while its index stays below the boundary completes the transfer — the next pass is a FRESH install from byte 0 of the same pinned capture, never a "resume" that would AIOOBE `Arrays.copyOfRange` | `stage 6(e)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
 1 pre-existing skip**; after stage 6(d): **332 tests green, 0 failures, 1
-pre-existing skip**. `InstallSnapshotExample.java` and the `proto/raft/*`
+pre-existing skip**; and after stage 6(e): **336 tests green, 0 failures, 1
+pre-existing skip** (baseline 332 + 4 new pins: 2 follower hardening refusals + 2 leader
+stale/over-length reply pins). `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
 Sources: Raft paper §7 (§7.1 log compaction, §7.2 snapshot transfer) and §5.4.1 (up-to-date rule,
@@ -191,6 +194,15 @@ is a natural *consumer* of the Stage-1 artifact: "state → portable object" alr
 4. **Snapshot retention after all followers catch up** (paper §7.1's "leader discards the snapshot
    when all followers have caught up"). The `RaftLogs` boundary must *stay* (the log still starts
    there); only the byte payload is droppable. Not worth the complexity until Stage 6.
+5. **`InProgressSnapshot` assembly buffer is unbounded — deliberate, deferred.** The follower
+   assembles a chunked capture in a `ByteArrayOutputStream` until the final chunk; nothing caps the
+   total bytes (only the leader's pinned capture length bounds a *well-behaved* sender). A stuck or
+   hostile leader could feed in-order, non-final chunks forever and pin unbounded heap on the
+   follower — a memory-exhaustion DoS surface. Deliberately out of scope for the non-happy-path
+   hardening (it is a resource-policy design call, and the honest bounds are: a max-transfer-size
+   setting, or spilling the in-progress buffer to the durable `SnapshotStore` `.tmp` mechanism, or a
+   transfer TTL / abort-reason in the reply). Recorded 2026-11-23 at stage 6(e) so it stays visible
+   and is not silently "fixed" by a naive size check that would break large-but-legitimate captures.
 
 ## 6. Why no implementation in this pass
 
@@ -272,3 +284,34 @@ resolve to the highest boundary, term-major, so (2,3) wins despite its lower ind
 skip for root CI boxes) is loud (the compaction gate fails closed on exactly this) and leaves no
 `.snap.tmp` behind — the `finally` cleanup ran.
 Final suite: **332 tests green, 0 failures, 1 pre-existing skip** (+7 over the 6(c) baseline).
+
+**Non-happy-path hardening pass, third round (2026-11-23, stage 6(e))** — the remaining
+untouched edges of the two message handlers. Two production hardenings, both on the
+**follower's** `onInstallSnapshot`: an explicit **negative `offset`** is now refused (a byte
+position can never be < 0) — previously, under an in-progress transfer, it would fall into
+the in-order "duplicate" branch at `RaftNodeBehaviorFollower` and *re-advertise the stale
+cursor* `pending.expectedOffset`, so a buggy or misbehaving peer could pin the transfer at
+an old offset forever; now the transfer is torn down, the reply carries the restart-at-byte-0
+cursor, and the leader re-runs the whole install from the same pinned capture. And an
+**explicit null payload** is now refused exactly like a non-`byte[]` one — previously it
+NPEd at `chunk.length` (the in-order append) and escaped the handler with **no reply at
+all**, leaving the transfer hanging with a partial buffer and the leader resuming into
+nowhere. The null path is unreachable through the public message API — the `InstallSnapshot`
+constructor already null-guards the payload (a boundary pin asserts that invariant), so this
+is defensive: it keeps the handler honest against a future serialization gap instead of
+turning a malformed frame into a silent protocol hole. The pinned contracts that already
+covered the follower's failing-store path (`finalChunkWithFailingSnapshotStore_failsClosed_
+stateNotAdopted_noReplySent`) were left untouched — the save-failure→no-reply→leader-retransmits
+behavior is the intended design, and a try/catch-with-reply was explored and reverted. The
+**leader's** `onInstallSnapshotResponse` needed **no change**; its two untested edges of the
+completion predicate were pinned instead: a stale/duplicate reply that arrives with **no
+transfer in flight** (a same-term `InstallSnapshotResponse` with `offset` < capture length
+cannot be "in the middle" of anything, so it is treated as completion: the reported tail —
+already past the compaction boundary — is adopted, commit advances by the majority-count-th
+index, and the pass fabricates nothing to retransmit), and a reply whose cursor **runs past
+the last byte of the pinned capture** while its index stays below the boundary — the leader
+completes the transfer and the next pass is a **FRESH install from byte 0 of the same pinned
+capture**, never a "resume" that would AIOOBE `Arrays.copyOfRange` on a slice past the
+array. Isolated runs of both classes before full-suite confirmation: 17 leader + 19 follower
+pins green. Final suite: **336 tests green, 0 failures, 1 pre-existing skip** (+4 over the
+6(d) baseline: 2 follower pins + 2 leader pins).

@@ -435,6 +435,19 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         final int lastIncludedTerm = installSnapshot.getLastIncludedTerm();
         final TermIndex boundary = new TermIndex(lastIncludedTerm, lastIncludedIndex);
         final long offset = installSnapshot.getOffset();
+        if (offset < 0L) {
+            // A negative offset is not a byte position: a misbehaving or buggy peer sent an
+            // illegal cursor (the leader clamps a negative RESPONSE cursor for the same
+            // reason, SNAPSHOTS.md stage 6d). Without this check a negative offset under an
+            // in-progress transfer would fall into the "duplicate" branch below and re-report
+            // a stale cursor; tear the transfer down instead so the refusal re-baselines it.
+            transferInProgress = null;
+            LOGGER.warn("{} Refusing install-snapshot from {}: negative offset {} (offsets are byte positions >= 0; the transfer restarts from byte 0)",
+                    self.getId(), sender.getRemoteNodeId(), offset);
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
+            scheduleNextElectionTimeout();
+            return;
+        }
         final InProgressSnapshot pending;
         if (offset == 0L) {
             // Fresh start (or a legitimate re-send of byte 0): replace any in-progress
@@ -474,9 +487,22 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             // offset == pending.expectedOffset: in order, fall through and append.
         }
 
+        final Object rawPayload = installSnapshot.getPayload();
+        if (rawPayload == null) {
+            // An explicit null payload is not part of the chunk protocol (a null CAPTURE is
+            // handled on the leader side; the wire always carries a byte[] slice). Left
+            // unchecked it NPEs below (chunk.length) and escapes out of the handler with no
+            // reply at all; refuse exactly like a malformed payload instead.
+            transferInProgress = null;
+            LOGGER.error("{} Refusing snapshot from {}: payload is null (expected a byte[] chunk)",
+                    self.getId(), sender.getRemoteNodeId());
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
+            scheduleNextElectionTimeout();
+            return;
+        }
         final byte[] chunk;
         try {
-            chunk = (byte[]) installSnapshot.getPayload();
+            chunk = (byte[]) rawPayload;
         } catch (ClassCastException e) {
             // Not a chunk payload (a non-byte[] payload is not part of the chunk
             // protocol): the transfer is unusable -- tear it down and refuse.
