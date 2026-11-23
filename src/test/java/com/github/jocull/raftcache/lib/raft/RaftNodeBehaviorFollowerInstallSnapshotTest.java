@@ -37,6 +37,7 @@ import java.util.concurrent.CompletableFuture;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -567,6 +568,51 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
         assertThrows(NullPointerException.class,
                 () -> new InstallSnapshot(0, "leader", 10L, 5, 0L, null, true),
                 "the message boundary null-guards the payload");
+    }
+
+    @Test
+    void aNegativeBoundaryTerm_isRefusedInTheSameShapeAsANegativeOffset() {
+        // (6g) The accept path builds new TermIndex(lastIncludedTerm, lastIncludedIndex)
+        // straight from wire values (the chunk-cursor section below the guard). The index axis
+        // is structurally gated: S2 requires strictly beyond our tail, so it is already >= 0.
+        // The term axis is NOT: a same-term peer with boundary term -1 would IAE out of the
+        // TermIndex constructor AFTER the accept path had recorded that peer as leader. The
+        // negative-offset sibling (SNAPSHOTS.md stage 6e) already refuses with the convention
+        // offset-0 reply + re-armed election + zero state change; this pin demands the same
+        // refusal fire BEFORE the acceptance, i.e. before ANY state change.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager
+                    .newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // Boundary index 10 STRICTLY beyond this fresh follower's tail (0) so it passes S2;
+            // boundary TERM -1 is the hostile axis; offset 0, done true, a legal byte[] payload,
+            // so the handler would reach the accept path if unguarded and IAE mid-change.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, -1, 0L, new byte[]{(byte) 0xAA}, true));
+
+            assertEquals(1, leader.snapshotResponses().size(), "a refused payload is answered, not silently dropped");
+            assertEquals(0, leader.snapshotResponses().get(0).getOffset(),
+                    "the refusal reports offset 0 -- 'start over' -- exactly like the negative-offset refusal");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "a refused payload must not move the tail");
+            assertFalse(follower.logs.hasStartPointSnapshot(), "a refused payload must not leave a capture behind");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "a refused payload must NOT have recorded the sender as leader -- the guard fires before the accept path");
+
+            // And no half-transfer lingers to smuggle the next chunk through: resend the SAME
+            // "transfer" at offset 1 and it must be refused too (offset 0), because nothing was
+            // buffered to place it against.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, -1, 1L, new byte[]{(byte) 0xAB}, false));
+            assertEquals(2, leader.snapshotResponses().size());
+            assertEquals(0, leader.snapshotResponses().get(1).getOffset(),
+                    "offset 1 of a refused transfer has no in-flight record to land on, so it too restarts from byte 0");
+        }
     }
 
     @Test

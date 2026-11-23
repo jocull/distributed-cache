@@ -420,6 +420,22 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             return;
         }
 
+        // (6g) The accept path below builds new TermIndex(lastIncludedTerm, lastIncludedIndex)
+        // straight from wire values. The index axis is already gated by S2 (strictly beyond our
+        // tail, so >= 0); the term axis is NOT: a same-term peer with a negative boundary term
+        // would IAE out of the TermIndex constructor -- after the accept path has already
+        // recorded that peer as leader (stage 6e left the accept paths mutation-first for the
+        // same reason we now guard here). Refuse with the negative-offset contract: offset-0
+        // reply, re-armable election, zero state change.
+        final int lastIncludedTerm = installSnapshot.getLastIncludedTerm();
+        if (lastIncludedTerm < 0) {
+            LOGGER.warn("{} Refusing install-snapshot from {}: boundary term {} is negative (a term is >= 0)",
+                    self.getId(), sender.getRemoteNodeId(), lastIncludedTerm);
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
+            scheduleNextElectionTimeout();
+            return;
+        }
+
         // On the accept path: record the sender as this term's leader (if we don't yet
         // know one) so subsequent heartbeats from it are accepted -- the same ordering
         // as onAppendEntries (all validity checks before any state change).
@@ -432,7 +448,6 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         // of one pinned capture: offset is the chunk's byte position, done marks the
         // final chunk. Our reply's offset is always the next expected byte (0 on
         // conflict = "start over"), which is the leader's resume point.
-        final int lastIncludedTerm = installSnapshot.getLastIncludedTerm();
         final TermIndex boundary = new TermIndex(lastIncludedTerm, lastIncludedIndex);
         final long offset = installSnapshot.getOffset();
         if (offset < 0L) {

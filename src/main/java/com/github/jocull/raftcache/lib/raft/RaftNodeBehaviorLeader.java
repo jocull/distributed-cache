@@ -538,8 +538,8 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
      */
     @Override
     public void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse) {
-        final int responseTerm = installSnapshotResponse.getTerm();
-        final long responseIndex = installSnapshotResponse.getIndex();
+        final int rawResponseTerm = installSnapshotResponse.getTerm();
+        final long rawResponseIndex = installSnapshotResponse.getIndex();
         // A cursor is a byte offset into the pinned capture -- always >= 0, with 0 the contract
         // value for "start over from byte 0". A misbehaving or buggy peer could send a NEGATIVE
         // one; adopting it verbatim would wedge the transfer (the next pass computes
@@ -554,6 +554,32 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             responseOffset = 0L;
         } else {
             responseOffset = rawResponseOffset;
+        }
+
+        // (6g) The sibling of the clamp above, for the other two axes of the SAME reply: term
+        // and index. The completion branch below adopts them verbatim into
+        // new TermIndex(responseTerm, responseIndex), and TermIndex's constructor throws IAE
+        // for a negative term or index (stage 6d covered only the cursor axis). That IAE
+        // would land mid-cleanup -- snapshotsInFlight is already deleted on that branch --
+        // leaving the leader half-processed with an undelivered reply. Only a misbehaving
+        // peer reports a negative value; clamp each axis to the closest legal one: 0. (A
+        // negative term can never exceed ours, so clamping before the step-down check below
+        // changes nothing legitimate.)
+        final int responseTerm;
+        if (rawResponseTerm < 0) {
+            LOGGER.warn("{} Follower {} reported an illegal negative snapshot term {} - a term is >= 0, so treating it as start term 0",
+                    self.getId(), sender.getRemoteNodeId(), rawResponseTerm);
+            responseTerm = 0;
+        } else {
+            responseTerm = rawResponseTerm;
+        }
+        final long responseIndex;
+        if (rawResponseIndex < 0) {
+            LOGGER.warn("{} Follower {} reported an illegal negative snapshot index {} - a log index is >= 0, so treating it as index 0",
+                    self.getId(), sender.getRemoteNodeId(), rawResponseIndex);
+            responseIndex = 0L;
+        } else {
+            responseIndex = rawResponseIndex;
         }
 
         if (responseTerm > term) {

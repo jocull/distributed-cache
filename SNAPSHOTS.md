@@ -18,6 +18,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(d) | non-happy-path hardening (second pass): a throwing snapshot supplier or a payload that cannot be serialized in the laggard path falls back to appends instead of tearing down the heartbeat round (a healthy supplier recovers); a negative offset cursor in `InstallSnapshotResponse` is clamped to 0 (would otherwise AIOOBE the next `Arrays.copyOfRange`); `loadLatest` skips snapshot-shaped files with unparseable names while still recovering a valid one in the same directory, and picks strictly max-by-boundary (term-major) when two valid files coexist; the compaction gate stays fail-closed; a failed store `save` (e.g. read-only directory) is loud and leaves no `.tmp` behind | `stage 6(d)` |
 | 6(e) | non-happy-path hardening (third pass): the follower's `onInstallSnapshot` refuses a **negative `offset` cursor** (a byte position is never < 0) by tearing down the in-progress transfer and answering with the restart-at-byte-0 cursor — previously it would fall into the "duplicate" branch and re-advertise the stale cursor; an **explicit null payload** is refused like a non-`byte[]` one (tear-down + cursor-0 refusal, election timer rescheduled) — previously it NPEd at `chunk.length` and escaped the handler **with no reply at all** (unreachable via the public API: the `InstallSnapshot` constructor already null-guards the payload, a boundary pin now asserts that invariant); the leader's `onInstallSnapshotResponse` needed **no** change — the two untested edges of its completion predicate are pinned instead: a same-term reply that arrives with **no transfer in flight** (late/duplicated/mis-routed) completes cleanly (tail adopted, commit advanced, and nothing fabricated to retransmit, since no capture was ever pinned), and a reply whose **cursor runs past the last byte of the pinned capture** while its index stays below the boundary completes the transfer — the next pass is a FRESH install from byte 0 of the same pinned capture, never a "resume" that would AIOOBE `Arrays.copyOfRange` | `stage 6(e)` |
 | 6(f) | non-happy-path hardening (fourth pass): the other side of the leader's laggard decision — a follower **strictly below** the compacted start point receives the install even when its gap is BELOW `SNAPSHOT_TRIGGER_ENTRIES` (branch (a) has no threshold: an append replay there is a permanent empty stream, `getLogRange` serves nothing at or below the seed), a follower **AT** the boundary gets only empty heartbeats, no install (the "strictly below" edge pinned from the other side), and an `InstallSnapshotResponse` carrying a **lower** term is an ordinary completion on the index axis — leadership kept (step-down only on a *strictly higher* term, `onAcknowledgeEntries` parity), reported tail still adopted (no production change: three pins, and the pins themselves surfaced a test-hygiene gap — send-count assertions must be bounds + per-message properties, never exact counts, because the 50 ms background heartbeat timer legitimately interleaves) | `stage 6(f)` |
+| 6(g) | non-happy-path hardening (fifth pass): the last unguarded escape sites behind the 6d/6e-style guards, sharing one root mechanism — `TermIndex`'s constructor throws IAE on a negative term or index, and two handlers feed wire values into it **without guarding those axes**. Leader: the completion branch of `onInstallSnapshotResponse` adopts the reply's term/index into `new TermIndex(...)` (the 6d clamp covered the cursor axis only) — and *after* `snapshotsInFlight` has already been deleted, so the IAE escaped mid-cleanup, leaving the leader half-processed; each negative axis is now clamped to the closest legal value, 0 (a negative term never exceeds ours, so step-down semantics are unchanged). Follower: the accept path builds `new TermIndex(lastIncludedTerm, lastIncludedIndex)` *after* recording the sender as leader (the index axis is structurally S2-gated — strictly beyond the tail — the term axis is not), so a same-term peer with boundary term `-1` IAEd *post-mutation*; it is now refused before ANY state change, in the exact shape of the negative-offset guard (offset-0 reply + `scheduleNextElectionTimeout`, no half-transfer left to absorb the next chunk) | `stage 6(g)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -25,7 +26,9 @@ Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 pre-existing skip**; after stage 6(e): **336 tests green, 0 failures, 1
 pre-existing skip** (baseline 332 + 4 new pins: 2 follower hardening refusals + 2 leader
 stale/over-length reply pins); and after stage 6(f): **339 tests green, 0 failures, 1
-pre-existing skip** (+3 leader laggard-branch pins). `InstallSnapshotExample.java` and the `proto/raft/*`
+pre-existing skip** (+3 leader laggard-branch pins); and after stage 6(g): **341 tests
+green, 0 failures, 1 pre-existing skip** (+2: one pin per TermIndex IAE escape).
+`InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
 Sources: Raft paper §7 (§7.1 log compaction, §7.2 snapshot transfer) and §5.4.1 (up-to-date rule,
@@ -364,3 +367,61 @@ timing-dependent; the pins settled on the convention the earlier green pins alre
 install has the pinned payload), never exact counts. Isolated class run: 20 leader pins
 green. Final suite: **339 tests green, 0 failures, 1 pre-existing skip** (+3 over the
 6(e) baseline: the three leader laggard-branch pins).
+
+**Non-happy-path hardening pass, fifth round (2026-11-23, stage 6(g))** — the last two
+unguarded entry surfaces shared one root mechanism, found by re-running the 6d/6e
+question over every wire value the handlers feed into `TermIndex`: its constructor throws
+`IllegalArgumentException` for a negative term or index, so any axis that reaches it unguarded
+is an escape — and in both cases the escape was the *post-mutation* kind that stage 6(e)
+already showed to be the dangerous one (state half-changed, no sane cleanup to fall back).
+
+**Leader — `onInstallSnapshotResponse` (production change).** The stage 6(d) guard clamped
+the reply's **cursor axis** (`offset`) only. But the completion branch also adopts the
+reply's **other two axes** verbatim into `new TermIndex(responseTerm, responseIndex)` — and
+that branch has *already* run `snapshotsInFlight.remove(nodeId)` by the time the
+construction happens. A negative index or term in a stale reply from a misbehaving peer
+therefore IAE'd mid-cleanup: the in-flight record deleted, the tail never adopted, no
+acknowledgement, `updateCommittedIndex()` and `appendEntries(CONTINUATION)` never reached,
+the reply never answered. The fix extends the same 6d clamp convention to the two missing
+axes: each negative axis is clamped to the closest legal value, `0` (exactly as 6d reads a
+negative cursor as "restart from byte 0"). Since a negative term can never legitimately
+exceed the leader's own term, clamping it *before* the step-down check preserves
+step-down semantics exactly. Pin
+(`aNegativeTermOrIndexInAReply_isClampedToZero_andAdoptedWithoutEscaping`): a same-term
+reply with index `-5` clamps to `(TERM, 0)` and is adopted exactly as a genuine tail-0
+reply would be; a reply with term `-7` clamps to term 0 and — critically — does **not**
+step the leader down (a negative term is not a higher term). Leadership kept, log
+untouched, nothing fabricated to retransmit (no supplier registered, no transfer in
+flight), and the handler's own CONTINUATION catch-up resumes the slow-appends path — the
+clamped `(0,0)` tail is below every logged entry, so the entries are real. One of the pin's
+own assertions had to be corrected mid-iteration, and the correction is itself a finding:
+the commit point is **not** invariant under a hostile reply. A snapshot reply is itself the
+acknowledgement of everything up to the reported tail (Raft §7 — the 6f pin at
+`lowerTermSnapshotResponse_keepsLeadership_adoptsTail` asserts exactly this contract), so
+a clamped `(TERM, 0)` tail legitimately **advances** the commit point from `(0,0)` to
+`(TERM,0)`. The invariant the pin now states is the direction that must be protected: a
+hostile tail can advance the commit to itself but can never move it back.
+
+**Follower — `onInstallSnapshot` (production change).** The accept path builds
+`new TermIndex(lastIncludedTerm, lastIncludedIndex)` straight from wire values, in the
+chunk-cursor section. The **index axis** is structurally safe — S2 requires the boundary to
+be strictly beyond our tail, so it is already `>= 0`. The **term axis** was not guarded:
+a same-term peer claiming a boundary term of `-1` would IAE out of the `TermIndex`
+constructor *after* the accept path had already recorded that peer as leader
+(`leaderId = sender.getRemoteNodeId()`) — the same "IAE after mutation" failure class that
+stage 6(e) shut down on the follower's null-payload branch, one branch further along this
+very handler. The fix is a refuse-before-mutate guard in the exact shape of the existing
+negative-offset guard two sections below it: `lastIncludedTerm < 0` → offset-0 reply
+(`InstallSnapshotResponse(term, tail, 0)`), `scheduleNextElectionTimeout()`, warn log,
+`return`. Pin (`aNegativeBoundaryTerm_isRefusedInTheSameShapeAsANegativeOffset`): a
+boundary `(term=-1, index=10)` that passes S2 (index 10 strictly beyond the fresh
+follower's tail, 0) is answered with the offset-0 "restart" cursor and leaves **no** trace
+— tail unmoved, no start-point snapshot, and **no `leaderId` recorded** (the guard fires
+before the accept path); a follow-up resend of the same "transfer" at offset 1 also bounces
+to byte 0 because the refusal buffered nothing for it to land against — no half-transfer
+survives to smuggle a later chunk through.
+
+Isolated runs: leader install-snapshot class **21 green**, follower install-snapshot class
+**20 green** (one new pin each). Final suite: **341 tests green, 0 failures, 1 pre-existing
+skip** (+2 over the 6(f) baseline: the leader reply-axes clamp pin and the follower
+negative-boundary-term refusal pin).

@@ -1023,6 +1023,55 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
     }
 
     @Test
+    void aNegativeTermOrIndexInAReply_isClampedToZero_andAdoptedWithoutEscaping() {
+        // (6g) Siblings of the negative-CURSOR pin (6d), aimed at the other two axes of the
+        // same reply: term and index. The completion branch adopts them verbatim into
+        // new TermIndex(responseTerm, responseIndex), whose constructor throws IAE for a
+        // negative value -- 6d covered only the cursor axis. That IAE lands after
+        // snapshotsInFlight has already been deleted, mid-cleanup: a stale reply from a
+        // misbehaving peer could wedge the leader half-processed. A negative value can only
+        // arrive that way, so the only sane reading is the closest legal one -- 0 -- clamped,
+        // adopted, and resumed exactly like a genuine tail-0 reply.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            // No supplier is registered: the reply takes the "no transfer in flight" (i.e.
+            // completion) branch -- the very branch the unguarded TermIndex construction sat
+            // in -- and nothing is fabricated to re-send.
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            node.activeConnections.add(laggard);
+            final TermIndex committedBefore = node.logs.getCommittedTermIndex();
+
+            // The hostile axes, one per reply: first a negative INDEX from a same-term peer ...
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, -5L, 0));
+            assertEquals(new TermIndex(TERM, 0), laggard.getTermIndex(),
+                    "a negative index clamps to 0 and is adopted like that tail");
+            // ... then a negative TERM in the same reply shape (a negative term still never
+            // exceeds ours, so the step-down branch is untouched).
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(-7, 0, 0));
+            assertEquals(new TermIndex(0, 0), laggard.getTermIndex(),
+                    "a negative term clamps to 0 the same way");
+
+            assertEquals(NodeStates.LEADER, stateOf(node), "hostile replies must not disturb leadership");
+            assertEquals(TERM, termOf(node), "a negative term is not a higher one, so step-down never fires");
+            // The commit may legitimately ADVANCE to the clamped tail (a snapshot reply is
+            // itself the acknowledgement of everything up to it, Raft §7 -- the 6f pin below
+            // asserts exactly that). The hostile direction is the one it must never take: back.
+            assertTrue(node.logs.getCommittedTermIndex().compareTo(committedBefore) >= 0,
+                    "a clamped hostile tail can advance the commit to itself but never move it back");
+            assertFalse(node.logs.hasStartPointSnapshot(), "no supplier was registered, so the log is left untouched");
+            assertTrue(laggard.installSnapshotsSent.isEmpty(), "a reply with no transfer in flight must not fabricate a retransmit");
+            // The clamped tail (0,0) is below every logged entry: the catch-up pass that the
+            // handler triggers must deliver REAL entries now -- no IAE out of the handler,
+            // no install (there is no capture to serve).
+            assertTrue(laggard.appendEntriesSent.stream().anyMatch(a -> !a.getEntries().isEmpty()),
+                    "a clamped-to-0 tail resumes the slow appends catch-up path");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
     void compactionWithThrowingSnapshotSupplier_failsClosed_logNotTrimmed_committedStillAdvanced() {
         // (6c-family, supplier half) the compaction gate calls snapshotSupplier.get() directly.
         // A capture that THROWs (as opposed to failing at the store) is pinned to the SAME
