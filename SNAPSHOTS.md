@@ -21,6 +21,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(g) | non-happy-path hardening (fifth pass): the last unguarded escape sites behind the 6d/6e-style guards, sharing one root mechanism — `TermIndex`'s constructor throws IAE on a negative term or index, and two handlers feed wire values into it **without guarding those axes**. Leader: the completion branch of `onInstallSnapshotResponse` adopts the reply's term/index into `new TermIndex(...)` (the 6d clamp covered the cursor axis only) — and *after* `snapshotsInFlight` has already been deleted, so the IAE escaped mid-cleanup, leaving the leader half-processed; each negative axis is now clamped to the closest legal value, 0 (a negative term never exceeds ours, so step-down semantics are unchanged). Follower: the accept path builds `new TermIndex(lastIncludedTerm, lastIncludedIndex)` *after* recording the sender as leader (the index axis is structurally S2-gated — strictly beyond the tail — the term axis is not), so a same-term peer with boundary term `-1` IAEd *post-mutation*; it is now refused before ANY state change, in the exact shape of the negative-offset guard (offset-0 reply + `scheduleNextElectionTimeout`, no half-transfer left to absorb the next chunk) | `stage 6(g)` |
 | 6(h) | non-happy-path hardening (sixth pass): the remaining hostile-wire-tail escapes on the replication path, the 6(g) root mechanism (`TermIndex` constructor IAE/NPE) on the append/ack surface — the follower's `onAppendEntries` feeds three of the wire axes (prev-log pointer, each entry's term/index, the leader commit index) into `new TermIndex(...)` unguarded (a negative or missing field threw mid-handler after the sender was already recorded as leader, and, for the entry/commit axes, after entries were already appended), now **refused** before any state change in the shape of the sibling refusals (false ack carrying our own unchanged tail) — no clamping here, because clamping a mid-log position or match point would manufacture a bogus append or a phantom match; the leader's `onAcknowledgeEntries` feeds the follower's reported tail into `new TermIndex(...)` in **both** branches (the failure-branch rewind, the success-branch adoption), and a negative or missing tail threw before adoption, commit alignment or the catch-up send could run, now **refused as warn + ignore** (no reply exists on the ack path; connection book-keeping, log, and leadership are byte-for-byte untouched) | `stage 6(h)` |
 | 6(i) | non-happy-path hardening (seventh pass): the last two hostile-wire-tail escapes of the 6(g)/6(h) family, now on the vote path — the follower's `onVoteRequest` now **refuses before any mutation** (the term-ladder conversion still runs first, then: warn + re-armed election timer + one explicit false `VoteResponse` carrying our own committed tail, mirroring the handler's own denial shape; `leaderId` never cleared, and a denial deliberately does **not** burn `votedForNodeId`, so a legitimate same-term candidate is still granted afterward) when the request's last-log term/index is a negative or missing wire field; the base-class `isUpToDate` — the single feed-in point all three pre-vote handlers share (follower/candidate/leader) — now refuses with a plain `false` (warn, no state change) on a hostile/missing tail, sealing all three roles with no handler-side change; `isHostileWireTermIndex` lifted to `RaftNodeBehavior` as a shared static (the follower's copy deleted; the three 6(h) append-path call sites resolve via the inherited static, unchanged) | `stage 6(i)` |
+| 6(j) | non-happy-path hardening (eighth pass): the last hostile shape on the append surface, found by the post-6(i) audit sweep — a null slot **inside** the `AppendEntries.entries` list (the 6(h) pins covered a null term/index <i>inside</i> a well-formed entry; the wire ctor's element-blind `unmodifiableList` copy admits null slots, unlike `AnnounceClusterTopology`'s `List.copyOf`, which rejects such lists at construction) — `hasHostileWireTermIndex` now classifies a null slot as hostile, so the follower refuses it in the established shape (false ack carrying our unchanged tail; no leader installed, no append, no commit move, nothing applied) instead of NPE-ing on the very dereference the classification performs (the guard throwing where it exists to catch) — including the tail slot, which the accept path would read FIRST as the new tail, the post-mutation surface 6(h) closed on the other axes; the audit sweep clearing every remaining carrier (`AnnounceClusterTopology`, `VoteResponse`, `Introduction`, `StateResponse`) is recorded in §7 | `stage 6(j)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -35,7 +36,10 @@ follower append-path refusal pins and three leader ack-path refusal pins, closin
 append/ack surface of the 6(g) hostile-wire-tail mechanism; and after stage 6(i): **352
 tests green, 0 failures, 1 pre-existing skip** (+5: two follower vote-path refusal pins
 and three pre-vote role refusal pins, closing the vote surface of the hostile-wire-tail
-mechanism).
+mechanism); and after stage 6(j): **354 tests green, 0 failures, 1 pre-existing
+skip** (+2: two follower append-path refusal pins for the mechanism's last hostile
+shape — a null <i>entry slot</i> in the entries list — closing it after an audit sweep
+that cleared every remaining wire carrier; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -560,3 +564,60 @@ performed. The non-happy-path hardening of the in-memory cache's Raft layer is
 exhausted for the current surface; the next items are the planned structural backlog —
 (A) spill-to-disk durable store, (B) partition ownership, (C) fixed-cluster topology,
 and (D) infra debt.
+
+**Non-happy-path hardening pass, eighth round (2026-11-23, stage 6(j))** — after 6(i)
+sealed the `TermIndex` feed-in family, the audit continued over the rest of the wire
+surface: every list-shaped field and every remaining data-only carrier the term/index
+guards never touched. It cleared four; one last structurally hostile shape survived.
+
+**The audit sweep (cleared carriers).** `AnnounceClusterTopology.nodeIdentifiers` —
+rejected at the boundary: the ctor's `List.copyOf` NPEs on a null slot, so a hostile
+list never reaches the handler (unlike `AppendEntries`, whose `unmodifiableList` copy
+is element-blind). `VoteResponse.committedTermIndex` on the collector side — all three
+consumer handlers (follower/candidate/leader `onVoteResponse`) read only `getTerm()`
+and the grant flag; the reported tail is never dereferenced. `Introduction.lastReceivedTermIndex` —
+a write-only field: `getLastReceivedTermIndex` has zero caller sites outside its own
+class (grep-verified), so nothing feeds it into the domain `TermIndex` ctor.
+`StateResponse`'s term/index fields — constructed from our **own** non-null log values,
+and the one consumer (`RaftNodeImpl.getLeader`) reads only the primitive `int term`.
+None of these can escape as a hostile value.
+
+**The last shape — follower `onAppendEntries` (production change, one line).** A null
+*slot inside* the entries list. The 6(h) pins cover a null term/index *inside a
+well-formed entry*; a null slot is a different shape the wire admits:
+`AppendEntries` copies its list element-blind (`Collections.unmodifiableList`), so
+`Arrays.asList(x, null)` is a constructible, wireable message — and the accept path
+dereferences **every** slot (each entry's term/index at append, the last entry's
+term/index as the new log tail, every entry again in the append loop). Without the
+slot check there is no clean refusal to speak of: a slot mid-list makes the guard
+itself NPE **while classifying** (`entry.getTermIndex()` on null) — the guard throwing
+where it exists to catch — and a slot at the tail is worse, the one the accept path
+reads **first** as its new tail, i.e. the post-mutation surface 6(h) closed on the
+other axes. The fix is one line: `entry == null` is classified hostile in
+`hasHostileWireTermIndex`. The refusal shape is unchanged (the 6(h) convention): one
+false `AcknowledgeEntries` carrying our own unchanged tail, zero state change — and the
+guard's warn now says "invalid term, index or entry slot". The leader's ack path
+needed no change: an acked tail is a *single* wire `TermIndex`, already 6(h)-sealed,
+and there is no list-typed ack field.
+
+**Pins, two total**, in `RaftNodeBehaviorFollowerInstallSnapshotTest` (the 6(h) host),
+immediately after the 6(h) append pins. (1) *null slot first*, then a well-formed
+entry: the classification pass NPEs on the first slot without the check — this pin
+asserts the refusal is answered, false, carrying our unchanged epoch tail (0), with no
+leader installed and the log tail / commit point / applied index all still 0. (2)
+*null slot at the tail*: this is the slot the accept path reads first as its new tail
+(`entries.get(size−1)`) — the post-mutation-order surface — and the same zero-state
+contract is asserted.
+
+Isolated runs, both 6(h) host classes: follower **25 green** (23 → 25), leader
+**24 green** unchanged — the inherited static resolves from the follower's append-path
+guard, regression-verified as in 6(i). Final suite: **354 tests green, 0 failures, 1
+pre-existing skip** (+2 over the 6(i) baseline).
+
+**Closure.** Every wire carrier is now accounted for and the hostile-wire family —
+structurally invalid term/index/entry values that would throw or corrupt mid-handler —
+is exhausted on the current surface, including the one shape that was neither
+guardable by clamping (nothing to clamp to) nor caught by the term/index guards (it
+is the *absence* of an object). The handoff stands as recorded in 6(i): the next
+items on the plan are the structural backlog — (A) spill-to-disk durable store,
+(B) partition ownership, (C) fixed-cluster topology, (D) infra debt.

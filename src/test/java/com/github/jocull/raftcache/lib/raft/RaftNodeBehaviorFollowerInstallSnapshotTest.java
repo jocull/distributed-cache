@@ -424,6 +424,77 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
         }
     }
 
+    // ---- Stage 6j: a null entry slot in the entries list is refused, not thrown on ----
+
+    /**
+     * Stage 6j: one more structurally invalid shape than the 6(h) pins -- a null SLOT
+     * inside the entries list (the 6(h) pins cover a null term/index INSIDE a well-formed
+     * entry). The wire list admits such slots: {@code AppendEntries} copies it without
+     * element checks (unlike {@code AnnounceClusterTopology}'s {@code List.copyOf}, which
+     * rejects them at construction). A null slot would NPE the very dereference this
+     * refusal performs while classifying the entries -- the guard throwing where it is
+     * supposed to catch. The refusal keeps the 6(h) shape: exactly one false ack with our
+     * unchanged tail, zero state change, no leader installed.
+     */
+    @Test
+    void appendCarryingANullEntrySlot_isRefusedWithoutThrowing() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // Null slot first, then a well-formed entry: without the slot check the guard
+            // NPEs on the first classification pass instead of refusing the append.
+            follower.currentReceiver().onAppendEntries(leader,
+                    new AppendEntries(0, wire(0, 0), wire(0, 0),
+                            Arrays.asList((AppendEntries.RaftLog) null, new AppendEntries.RaftLog(wire(0, 1), "ok-entry"))));
+
+            assertEquals(1, leader.acknowledges().size(), "an append carrying a null entry slot must be answered");
+            assertFalse(leader.acknowledges().get(0).isSuccess(), "an append with a null slot must be rejected");
+            assertEquals(0L, leader.acknowledges().get(0).getCurrentTermIndex().getIndex(),
+                    "the refusal carries our unchanged (epoch) tail");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "an append we refuse must not install a leader");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is untouched by the refusal");
+            assertEquals(0L, follower.logs.getCommittedTermIndex().getIndex(), "the commit point is untouched by the refusal");
+            assertEquals(0L, bridge.getLastAppliedIndex(), "nothing is applied to the state machine");
+        }
+    }
+
+    @Test
+    void appendCarryingANullTailEntrySlot_isRefusedWithoutThrowing() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // Null slot at the tail: this is the slot the accept path reads FIRST as its
+            // new tail (last entry's term/index) -- the "throw after mutation" surface the
+            // 6(h) pins closed for the other axes. The refusal must precede that read.
+            follower.currentReceiver().onAppendEntries(leader,
+                    new AppendEntries(0, wire(0, 0), wire(0, 0),
+                            Arrays.asList(new AppendEntries.RaftLog(wire(0, 1), "ok-entry"), null)));
+
+            assertEquals(1, leader.acknowledges().size(), "an append with a null tail slot must be answered");
+            assertFalse(leader.acknowledges().get(0).isSuccess(), "an append with a null tail slot must be rejected");
+            assertEquals(0L, leader.acknowledges().get(0).getCurrentTermIndex().getIndex(),
+                    "the refusal carries our unchanged (epoch) tail");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "an append we refuse must not install a leader");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is untouched by the refusal");
+            assertEquals(0L, follower.logs.getCommittedTermIndex().getIndex(), "the commit point is untouched by the refusal");
+            assertEquals(0L, bridge.getLastAppliedIndex(), "nothing is applied to the state machine");
+        }
+    }
+
     // ---- Chunked transfer (stage 6a): byte[] chunks, byte cursor, in-order assembly ----
 
     @Test

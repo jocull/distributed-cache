@@ -283,6 +283,13 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
      * {@code new TermIndex(...)} — prev-log index, each entry's index, and the leader
      * commit index? A missing field is hostile too: it would NPE out of the wire getters
      * before the constructor's negative IAE even fires.
+     *
+     * <p>Stage 6(j) (SNAPSHOTS.md stage 6(j)): a null <i>entry slot</i> in the list is
+     * hostile too. The wire list admits them — {@link AppendEntries} copies it without
+     * element checks (unlike {@code AnnounceClusterTopology}'s {@code List.copyOf}, whose
+     * construction-time NPE blocks them at the boundary) — and the accept path dereferences
+     * every slot (each entry's term/index, the last entry's tail, the append loop). Without
+     * this check the guard itself would throw while classifying them: refuse, don't throw.
      */
     private static boolean hasHostileWireTermIndex(AppendEntries appendEntries) {
         if (isHostileWireTermIndex(appendEntries.getPreviousLogTermIndex())
@@ -290,7 +297,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             return true;
         }
         for (AppendEntries.RaftLog entry : appendEntries.getEntries()) {
-            if (isHostileWireTermIndex(entry.getTermIndex())) {
+            if (entry == null || isHostileWireTermIndex(entry.getTermIndex())) {
                 return true;
             }
         }
@@ -326,7 +333,8 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         // index, and the leader's commit index -- straight into new TermIndex(...), whose
         // constructor throws IAE for a negative term or index (the stage 6(g) root
         // mechanism, this time on the replication path instead of the snapshot path).
-        // A missing field is hostile too, NPE-ing out of the wire getters first.
+        // A missing field is hostile too, NPE-ing out of the wire getters first, and
+        // (6j) so is a null entry slot in the list: it would NPE that very dereference.
         // None of those three axes is validity-checked before it is consumed: a hostile
         // or corrupted append carrying one would throw out of the constructor AFTER the
         // leaderId mutation below and, for the entries and the commit index, after some
@@ -338,7 +346,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         // did: clamping an entry position or the match point would manufacture a bogus
         // append or a phantom match.
         if (hasHostileWireTermIndex(appendEntries)) {
-            LOGGER.warn("{} Received append entries from {} carrying a negative term or index ({} @ term {}) - refusing",
+            LOGGER.warn("{} Received append entries from {} carrying an invalid term, index or entry slot ({} @ term {}) - refusing",
                     self.getId(), sender.getRemoteNodeId(), appendEntries, term);
             sender.sendAcknowledgeEntries(new AcknowledgeEntries(term, false, currentTermIndexMessage));
             return;
