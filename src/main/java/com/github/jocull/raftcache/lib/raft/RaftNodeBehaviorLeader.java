@@ -12,11 +12,17 @@ import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +42,65 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
      * is normal.
      */
     static final int SNAPSHOT_TRIGGER_ENTRIES = 5;
+
+    /**
+     * Bytes per {@link InstallSnapshot} chunk (SNAPSHOTS.md stage 6a). The snapshot
+     * payload is JDK-serialized ONCE — pinned to a single capture — and then streamed
+     * to the laggard in slices of this size, with the byte cursor exchanged through
+     * the request's {@code offset} and the response's {@code offset}. Large enough
+     * that a snapshot normally needs a handful of round-trips, small enough to stay
+     * well inside a friendly per-frame size on the wire.
+     * <p>Package-visible (and volatile) so same-package unit tests can shrink it to
+     * a few bytes to exercise multi-chunk progress, and restore it in a
+     * try/finally.
+     */
+    static volatile long SNAPSHOT_CHUNK_BYTES = 64 * 1024L;
+
+    /**
+     * In-flight snapshot transfer per laggard, keyed by remote node id. The capture is
+     * pinned to a single {@code snapshotSupplier} acquisition at pin time (see the send
+     * path): re-running the supplier on every laggard pass would let a changing
+     * state machine re-capture between chunks, making the byte cursor meaningless and
+     * re-serializing a potentially large payload for every pacing retry.
+     */
+    private final Map<String, SnapshotTransfer> snapshotsInFlight = new HashMap<>();
+
+    /**
+     * One pinned snapshot transfer (leader side, SNAPSHOTS.md stage 6a).
+     * <ul>
+     *   <li>{@link #data} — the supplier payload, JDK-serialized exactly once;</li>
+     *   <li>{@link #boundaryIndex} / {@link #boundaryTerm} — the snapshot's
+     *       last-included log coordinate, constant for every chunk of the transfer;</li>
+     *   <li>{@link #sentOffset} — the next byte offset to send; it is only ever
+     *       changed BY A FOLLOWER REPLY (the follower's reported next-expected offset
+     *       is authoritative), never by us optimistically;</li>
+     *   <li>{@link #inFlightEnd} — the end of the chunk most recently handed to the
+     *       wire, for which we are still awaiting its offset reply.</li>
+     * </ul>
+     */
+    private static final class SnapshotTransfer {
+        final byte[] data;
+        final long boundaryIndex;
+        final int boundaryTerm;
+        long sentOffset;
+        long inFlightEnd;
+
+        SnapshotTransfer(byte[] data, long boundaryIndex, int boundaryTerm) {
+            this.data = data;
+            this.boundaryIndex = boundaryIndex;
+            this.boundaryTerm = boundaryTerm;
+        }
+    }
+
+    private static byte[] serializeSnapshotPayload(Object payload) {
+        final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (ObjectOutputStream oos = new ObjectOutputStream(out)) {
+            oos.writeObject(payload);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to serialize snapshot payload " + payload, e);
+        }
+        return out.toByteArray();
+    }
 
     private CompletableFuture<?> heartbeatTimeout;
 
@@ -144,27 +209,52 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             if (snapshotSupplier != null
                     && (followerIndex < startPoint.getIndex()
                         || committedTermIndex.getIndex() - followerIndex >= SNAPSHOT_TRIGGER_ENTRIES)) {
-                final Object payload = snapshotSupplier.get();
-                if (payload == null) {
-                    // The state machine refused to capture (e.g. nothing to capture yet):
-                    // fall back to the slow replay path rather than stall this follower.
-                    // (For a below-start-point follower that replay path is empty, but a
-                    // null capture only ever happens while nothing has been applied, which
-                    // is transient as soon as entries exist.)
-                    LOGGER.warn("{} Follower {} is {} behind committed {} but the snapshot source returned null - falling back to appends",
-                            self.id, c.getRemoteNodeId(), committedTermIndex.getIndex() - followerIndex, committedTermIndex);
-                } else {
-                    LOGGER.info("{} Follower {} is {} below committed {} (start point {}) - sending InstallSnapshot instead of appends",
-                            self.id, c.getRemoteNodeId(),
-                            committedTermIndex.getIndex() - followerIndex, committedTermIndex, startPoint);
+                // Pin the capture to ONE byte stream and stream it in chunks (SNAPSHOTS.md
+                // stage 6a). The transfer state survives pacing-gated retries: the
+                // follower's offset reply is authoritative for where we resume from
+                // (onInstallSnapshotResponse), and we never re-run the supplier for a
+                // transfer already in flight.
+                final String nodeId = c.getRemoteNodeId();
+                SnapshotTransfer transfer = snapshotsInFlight.get(nodeId);
+                if (transfer == null) {
+                    final Object payload = snapshotSupplier.get();
+                    if (payload == null) {
+                        // The state machine refused to capture (e.g. nothing to capture yet):
+                        // fall back to the slow replay path rather than stall this follower.
+                        // (For a below-start-point follower that replay path is empty, but a
+                        // null capture only ever happens while nothing has been applied, which
+                        // is transient as soon as entries exist.)
+                        LOGGER.warn("{} Follower {} is {} behind committed {} but the snapshot source returned null - falling back to appends",
+                                self.id, nodeId, committedTermIndex.getIndex() - followerIndex, committedTermIndex);
+                    } else {
+                        transfer = new SnapshotTransfer(
+                                serializeSnapshotPayload(payload),
+                                committedTermIndex.getIndex(),
+                                committedTermIndex.getTerm());
+                        snapshotsInFlight.put(nodeId, transfer);
+                        LOGGER.info("{} Follower {} is {} below committed {} (start point {}) - transferring {} bytes of snapshot in {}-byte chunks",
+                                self.id, nodeId,
+                                committedTermIndex.getIndex() - followerIndex, committedTermIndex, startPoint,
+                                transfer.data.length, SNAPSHOT_CHUNK_BYTES);
+                    }
+                }
+                if (transfer != null) {
+                    final long end = Math.min(transfer.sentOffset + SNAPSHOT_CHUNK_BYTES, transfer.data.length);
+                    final boolean done = end >= transfer.data.length;
+                    final byte[] chunk = transfer.data.length == 0
+                            ? transfer.data
+                            : Arrays.copyOfRange(transfer.data, (int) transfer.sentOffset, (int) end);
+                    LOGGER.debug("{} Sending snapshot chunk [{}..{}) of {} bytes to {} (done={})",
+                            self.id, transfer.sentOffset, end, transfer.data.length, nodeId, done);
                     c.sendInstallSnapshot(new InstallSnapshot(
                             term,
                             self.getId(),
-                            committedTermIndex.getIndex(),
-                            committedTermIndex.getTerm(),
-                            0L,
-                            payload,
-                            true));
+                            transfer.boundaryIndex,
+                            transfer.boundaryTerm,
+                            transfer.sentOffset,
+                            chunk,
+                            done));
+                    transfer.inFlightEnd = end;
                     c.setLastEntriesSent(Instant.now());
                     return; // inside the forEach lambda: this is the "continue" for this connection
                 }
@@ -394,22 +484,40 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     }
 
     /**
-     * A laggard finished installing the snapshot we sent (SNAPSHOTS.md stage 5): adopt the
-     * tail it reports as its new start point (Raft §7 -- its log now begins AT or BEYOND the
-     * boundary we captured to), and resume appending behind that point (the CONTINUATION
-     * path sends zero or more entries exactly as usual, which is the leader half of the
-     * post-snapshot recovery).
+     * A laggard's reply to one of our snapshot chunks (SNAPSHOTS.md stage 6a). The
+     * reply's {@code offset} is the follower's byte cursor — its next expected byte —
+     * and is AUTHORITATIVE: we adopt it verbatim, never advancing past it and never
+     * insisting on our own view.
+     * <ul>
+     *   <li>cursor at or past the end of the pinned capture, or the follower's reported
+     *       index already at/past the capture's boundary — the transfer is complete:
+     *       adopt the reported tail, drop the transfer state, and resume appends behind
+     *       it (Raft §7 post-snapshot recovery, the CONTINUATION path sends any entries
+     *       behind the boundary exactly as the ack path does);</li>
+     *   <li>cursor below that (including 0 — the follower's "start over from byte 0"
+     *       reply) — rewind {@code sentOffset} there; the next laggard pass
+     *       retransmits from that byte over the SAME pinned capture.</li>
+     * </ul>
      *
-     * <p>Term handling mirrors {@link #onAcknowledgeEntries}: a strictly higher term in the
-     * response means we are the laggard, step down. A lower-or-equal term is the normal
-     * reply from the follower we just installed. (The response carries no success flag: a
-     * follower only replies after installing, or with its own term when it refused on the
-     * term rule / S2 progress check -- both answered through the same fields we read here.)
+     * <p>Loop guard: the "index already at/past boundary" completion test catches the
+     * follower that already holds everything we would resend — a lost done-reply over an
+     * already-caught-up follower would otherwise be re-sent forever (refused, replied 0,
+     * re-sent ...). Completing is correct in that case: its tail is at or past our
+     * boundary, which is precisely the post-install state.
+     *
+     * <p>No transfer state (stale reply after completion, or a legacy
+     * two-argument reply from an older build) lands in the completion branch too:
+     * its index IS the follower's tail, the very pre-chunking acceptance semantics.
+     *
+     * <p>Term handling mirrors {@link #onAcknowledgeEntries}: a strictly higher term in
+     * the response means we are the laggard, step down. A lower-or-equal term is the
+     * normal reply from the follower we are installing.
      */
     @Override
     public void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse) {
         final int responseTerm = installSnapshotResponse.getTerm();
         final long responseIndex = installSnapshotResponse.getIndex();
+        final long responseOffset = installSnapshotResponse.getOffset();
 
         if (responseTerm > term) {
             LOGGER.info("{} Received install-snapshot response from {} for term {} above our term {} - stepping down",
@@ -418,23 +526,44 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             return;
         }
 
-        // Normal acceptance: the follower reports its new log tail (>= the boundary we sent).
-        // There is no in-flight marker to release: the laggard condition simply stops holding
-        // once this nextIndex is above the committed point (and a lost reply is retried by
-        // the pacing gate, as the send path documents).
-        final TermIndex previous = sender.getTermIndex();
-        sender.setTermIndex(new TermIndex(responseTerm, responseIndex));
-        LOGGER.info("{} Follower {} installed to {} (was {}) - resuming appends",
-                self.getId(), sender.getRemoteNodeId(), responseIndex, previous);
+        final String nodeId = sender.getRemoteNodeId();
+        final SnapshotTransfer transfer = snapshotsInFlight.get(nodeId);
 
-        // The install is itself an acknowledgement of everything up to the boundary:
-        // recompute the commit point in case the response's index outruns it, and let
-        // the CONTINUATION append path deliver any entries that sit behind the boundary
-        // (Raft §7 recovery). Marking the ack time clears the shouldSendNextEntries gate
-        // so the continuation actually sends on this same tick (the same ordering the
-        // AcknowledgeEntries path uses).
-        updateCommittedIndex();
+        if (transfer == null
+                || responseIndex >= transfer.boundaryIndex
+                || responseOffset >= transfer.data.length) {
+            // Transfer complete (or a stale/legacy reply with no transfer to track):
+            // the follower reports a log tail at or past our capture boundary. Adopt it.
+            snapshotsInFlight.remove(nodeId);
+
+            final TermIndex previous = sender.getTermIndex();
+            sender.setTermIndex(new TermIndex(responseTerm, responseIndex));
+            LOGGER.info("{} Follower {} installed to {} (was {}) - resuming appends",
+                    self.getId(), nodeId, responseIndex, previous);
+
+            // The install is itself an acknowledgement of everything up to the boundary:
+            // recompute the commit point in case the response's index outruns it, and let
+            // the CONTINUATION append path deliver any entries that sit behind the boundary
+            // (Raft §7 recovery). Marking the ack time clears the shouldSendNextEntries gate
+            // so the continuation actually sends on this same tick (the same ordering the
+            // AcknowledgeEntries path uses).
+            updateCommittedIndex();
+            sender.setLastEntriesAcknowledged(Instant.now());
+            appendEntries(AppendEntriesTrigger.CONTINUATION);
+            return;
+        }
+
+        // In-progress: adopt the follower's cursor verbatim (0 = "start over from
+        // byte 0"; a value equal to our inFlightEnd = the chunk we sent was accepted,
+        // keep the cursor and advance next pass; below/above = rewind/jump there).
+        LOGGER.debug("{} Follower {} reported snapshot cursor {} (in-flight end {}) - resuming transfer from byte {}",
+                self.getId(), nodeId, responseOffset, transfer.inFlightEnd, responseOffset);
+        transfer.sentOffset = responseOffset;
+
+        // A reply is proof the follower is live and responsive: open the pacing gate
+        // so the next chunk (re)send need not wait out the heartbeat window.
         sender.setLastEntriesAcknowledged(Instant.now());
+        // Pipeline: send the next chunk now rather than waiting for the next tick.
         appendEntries(AppendEntriesTrigger.CONTINUATION);
     }
 }

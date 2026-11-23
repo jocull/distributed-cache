@@ -11,6 +11,9 @@ import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -29,6 +32,27 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     // (counted as self, exactly as the candidate counts its own vote).
     private final Set<String> preVoteGrants = new HashSet<>();
     private boolean preVoteRoundActive = false;
+
+    // In-progress snapshot transfer from our leader (SNAPSHOTS.md stage 6a). The leader
+    // streams ONE pinned capture in byte-order chunks: the boundary (the
+    // last-included term/index pair) is constant across ALL chunks of the transfer,
+    // and offset/expectedOffset are pure byte cursors, so a single in-progress slot
+    // can never confuse one transfer with another. `expectedOffset` is the next byte
+    // the leader must send; on every reply we report it back, which lets the leader
+    // resume exactly there after any loss or duplicate. Cleared when the final chunk
+    // is installed (and abandoned if a conflicting transfer starts).
+    private InProgressSnapshot transferInProgress;
+
+    private static final class InProgressSnapshot {
+        final TermIndex boundary;
+        final ByteArrayOutputStream buffer;
+        long expectedOffset;
+
+        InProgressSnapshot(TermIndex boundary) {
+            this.boundary = boundary;
+            this.buffer = new ByteArrayOutputStream();
+        }
+    }
 
     public RaftNodeBehaviorFollower(RaftNodeImpl self, int term) {
         super(self, NodeStates.FOLLOWER, term);
@@ -377,7 +401,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             final TermIndex tail = self.logs.getCurrentTermIndex();
             LOGGER.warn("{} Received install-snapshot from {} for term {} below our term {} - refusing",
                     self.getId(), sender.getRemoteNodeId(), incomingTerm, term);
-            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex()));
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
             return;
         }
 
@@ -386,11 +410,13 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         // (lastIncludedIndex > tail index). A snapshot at or behind the tail would replace
         // no newer state (it must never replace newer/committed state with older), and
         // refusing a re-sent, already-installed snapshot is what makes redelivery a no-op.
+        // The boundary is constant across all chunks of one transfer, so this check
+        // applies to every chunk exactly the same way.
         final TermIndex tail = self.logs.getCurrentTermIndex();
         if (lastIncludedIndex <= tail.getIndex()) {
             LOGGER.warn("{} Refusing install-snapshot from {}: boundary index {} is not beyond our tail {} (S2 progress-only)",
                     self.getId(), sender.getRemoteNodeId(), lastIncludedIndex, tail.getIndex());
-            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex()));
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
             return;
         }
 
@@ -402,21 +428,109 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             LOGGER.info("{} Made follower of {} (on install-snapshot)", self.getId(), leaderId);
         }
 
+        // (4) Chunk cursor (SNAPSHOTS.md stage 6a). The payload arrives as byte[] chunks
+        // of one pinned capture: offset is the chunk's byte position, done marks the
+        // final chunk. Our reply's offset is always the next expected byte (0 on
+        // conflict = "start over"), which is the leader's resume point.
+        final int lastIncludedTerm = installSnapshot.getLastIncludedTerm();
+        final TermIndex boundary = new TermIndex(lastIncludedTerm, lastIncludedIndex);
+        final long offset = installSnapshot.getOffset();
+        final InProgressSnapshot pending;
+        if (offset == 0L) {
+            // Fresh start (or a legitimate re-send of byte 0): replace any in-progress
+            // transfer. Re-sending chunk 0 is the follower's idempotency escape valve.
+            pending = new InProgressSnapshot(boundary);
+            transferInProgress = pending;
+        } else {
+            pending = this.transferInProgress;
+            if (pending == null || !pending.boundary.equals(boundary)) {
+                // No transfer in flight under this boundary (it began with a different
+                // capture, or was reset): we cannot place this chunk -- start over.
+                LOGGER.warn("{} Refusing snapshot chunk at offset {} from {} (no in-progress transfer at boundary {})",
+                        self.getId(), offset, sender.getRemoteNodeId(), boundary);
+                sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
+                scheduleNextElectionTimeout();
+                return;
+            }
+            if (offset < pending.expectedOffset) {
+                // Duplicate/overlap (lost-ack retransmit, or re-send of an already-
+                // appended chunk): drop it, and report our cursor so the leader resumes
+                // past it instead of re-feeding bytes we already hold.
+                LOGGER.debug("{} Dropping duplicate snapshot chunk at offset {} from {} (expected {})",
+                        self.getId(), offset, sender.getRemoteNodeId(), pending.expectedOffset);
+                sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), pending.expectedOffset));
+                scheduleNextElectionTimeout();
+                return;
+            }
+            if (offset > pending.expectedOffset) {
+                // Gap: we are missing bytes -- refuse with cursor 0 so the transfer
+                // restarts from byte 0 over the same pinned capture.
+                LOGGER.warn("{} Refusing snapshot chunk at offset {} from {} (expected {}; transfer restarts from byte 0)",
+                        self.getId(), offset, sender.getRemoteNodeId(), pending.expectedOffset);
+                sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
+                scheduleNextElectionTimeout();
+                return;
+            }
+            // offset == pending.expectedOffset: in order, fall through and append.
+        }
+
+        final byte[] chunk;
+        try {
+            chunk = (byte[]) installSnapshot.getPayload();
+        } catch (ClassCastException e) {
+            // Not a chunk payload (a non-byte[] payload is not part of the chunk
+            // protocol): the transfer is unusable -- tear it down and refuse.
+            transferInProgress = null;
+            LOGGER.error("{} Refusing snapshot from {}: payload is {} (expected a byte[] chunk)",
+                    self.getId(), sender.getRemoteNodeId(), String.valueOf(installSnapshot.getPayload()).getClass().getName());
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), 0L));
+            scheduleNextElectionTimeout();
+            return;
+        }
+        pending.buffer.write(chunk, 0, chunk.length);
+        pending.expectedOffset += chunk.length;
+
+        if (!installSnapshot.isDone()) {
+            LOGGER.debug("{} Appended snapshot chunk at offset {} from {} ({} bytes; expected now {})",
+                    self.getId(), offset, sender.getRemoteNodeId(), chunk.length, pending.expectedOffset);
+            // Reply with our cursor (the leader resumes at exactly this byte) -- the
+            // transfer is not yet installable, so the term/index we report is our
+            // CURRENT tail, unchanged.
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tail.getIndex(), pending.expectedOffset));
+            scheduleNextElectionTimeout();
+            return;
+        }
+
+        // Final chunk: the concatenated buffer is now the complete JDK-serialized
+        // capture. Deserialize, then install with the S4 order (adopt state first,
+        // compact the log to the boundary second).
+        final Object payload;
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(pending.buffer.toByteArray()))) {
+            payload = ois.readObject();
+        } catch (Exception e) {
+            transferInProgress = null;
+            final TermIndex tailNow = self.logs.getCurrentTermIndex();
+            LOGGER.error("{} Failed to deserialize the snapshot assembled from {} (last chunk {} from {}) - refusing the transfer",
+                    self.getId(), sender.getRemoteNodeId(), offset, sender.getRemoteNodeId(), e);
+            sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, tailNow.getIndex(), 0L));
+            scheduleNextElectionTimeout();
+            return;
+        }
+        final long totalBytes = pending.expectedOffset;
+        transferInProgress = null;
+
         // Advance the state machine FIRST (adopt), then compact the log to the boundary
         // (S4 order: state reflects the boundary before the log is trimmed to it).
-        final int lastIncludedTerm = installSnapshot.getLastIncludedTerm();
-        final Object payload = installSnapshot.getPayload();
         self.eventBus.publish(new SnapshotInstalled(lastIncludedTerm, lastIncludedIndex, payload));
-        final TermIndex boundary = new TermIndex(lastIncludedTerm, lastIncludedIndex);
         self.logs.compact(boundary, payload);
 
         final TermIndex newTail = self.logs.getCurrentTermIndex();
-        LOGGER.info("{} Installed snapshot from {} (boundary {}, {}) - tail now {} @ term {}",
-                self.getId(), sender.getRemoteNodeId(), lastIncludedTerm, lastIncludedIndex, newTail, term);
-        // Reply with the new tail so the leader can resume append-entries past the
-        // snapshot boundary (stage 5 recovery).
-        sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, newTail.getIndex()));
-        // A leader just spoke: reset the election timeout.
+        LOGGER.info("{} Installed snapshot from {} (boundary {}, {}) over {} bytes - tail now {} @ term {}",
+                self.getId(), sender.getRemoteNodeId(), lastIncludedTerm, lastIncludedIndex, totalBytes, newTail, term);
+        // Reply with the new tail (so the leader can resume append-entries past the
+        // snapshot boundary, stage 5 recovery) and our final cursor (== total bytes);
+        // the leader treats either as "transfer complete".
+        sender.sendInstallSnapshotResponse(new InstallSnapshotResponse(term, newTail.getIndex(), totalBytes));
         scheduleNextElectionTimeout();
     }
 }

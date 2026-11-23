@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.data.DataVersion;
 import com.github.jocull.raftcache.lib.data.Snapshot;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
@@ -19,12 +20,17 @@ import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -73,6 +79,22 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
 
     private static int termOf(RaftNodeImpl node) {
         return ((RaftNodeBehavior) node.currentReceiver()).term;
+    }
+
+    /**
+     * The exact serialization the leader performs on its laggard pass (JDK
+     * {@code ObjectOutputStream} over the supplier payload): tests compare the wire
+     * chunk against this byte stream so they pin the "one serialization, many chunks"
+     * property (SNAPSHOTS.md stage 6a) without depending on object identity.
+     */
+    private static byte[] chunk(Object payload) {
+        final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (final ObjectOutputStream oos = new ObjectOutputStream(out)) {
+            oos.writeObject(payload);
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to serialize test payload", e);
+        }
+        return out.toByteArray();
     }
 
     /**
@@ -130,9 +152,11 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
             assertEquals("node", install.getLeaderId());
             assertEquals(LAST_INDEX, install.getLastIncludedIndex(), "the boundary must be the committed point we captured");
             assertEquals(TERM, install.getLastIncludedTerm());
-            assertEquals(0L, install.getOffset(), "single-chunk form (stage 5) offsets at 0");
-            assertTrue(install.isDone(), "single-chunk form (stage 5) is done");
-            assertSame(payload, install.getPayload());
+            assertEquals(0L, install.getOffset(), "the transfer starts at byte 0");
+            assertTrue(install.isDone(), "below the default 64 KiB chunk size, the whole capture fits one chunk");
+            assertTrue(install.getPayload() instanceof byte[], "stage 6a: the wire payload is a serializable byte[] chunk, not the capture object");
+            assertArrayEquals(chunk(payload), (byte[]) install.getPayload(),
+                    "the chunk IS the leader's single pinned serialization of the capture");
 
             assertEquals(1, laggard.installSnapshotsSent.size(), "one install, not a burst");
             assertTrue(laggard.appendEntriesSent.isEmpty(), "a laggard gets the snapshot, not appends");
@@ -324,6 +348,103 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
             assertTrue(laggard.installSnapshotsSent.isEmpty());
             closeCurrent(node);
         }
+    }
+
+    // ---- Chunked transfer (stage 6a): one pinned serialization, byte cursor, idempotent re-sends ----
+
+    @Test
+    void chunkedSnapshot_restartsFromByteZero_whenTheFollowerRefuses_thenCompletesOnTheFinalChunk() {
+        // The capture's serialized size is unknown in advance (JDK header + map), so split
+        // it into two chunks of exactly half a byte: shrink the chunk size to half the
+        // serialized length and restore it on exit.
+        final Object payload = new Snapshot(TERM, LAST_INDEX,
+                Map.of("key1", new DataVersion(Map.of("big", new byte[1536]), 7)));
+        final long chunkBytes = halfOfSerialized(payload);
+        final long originalChunkBytes = RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES;
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = chunkBytes;
+
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final Object pinned;
+            pinned = payload;
+            node.setSnapshotSupplier(() -> pinned);
+
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(laggard);
+
+            // Phase 1: the commit point moves past the laggard and the FIRST chunk is sent
+            // (byte 0, done=false because the capture is half a chunk larger than the slice).
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            final byte[] data = chunk(payload);
+            final long end1 = chunkBytes;
+            assertEquals(1, laggard.installSnapshotsSent.size());
+            InstallSnapshot c1 = laggard.installSnapshotsSent.get(0);
+            assertEquals(0L, c1.getOffset(), "chunk 1 starts at byte 0");
+            assertEquals(LAST_INDEX, c1.getLastIncludedIndex());
+            assertFalse(c1.isDone(), "a capture larger than one chunk does not end with chunk 1");
+            assertArrayEquals(Arrays.copyOfRange(data, 0, (int) end1), (byte[]) c1.getPayload());
+
+            // Phase 2: the follower REFUSES (reply cursor 0 = "start over"). The leader
+            // retransmits chunk 1 from byte 0 on its next pass over the SAME pinned capture
+            // (the in-progress reply even pipelines the resend before we drive a pass -- an
+            // exact send count is racy, so we assert on the LAST install delivered). The
+            // supplier hands back the SAME object every time, so a byte-for-byte match
+            // proves the retransmit is the original serialization, not a new capture.
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, LAGGARD_INDEX, 0L));
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            assertTrue(laggard.installSnapshotsSent.size() >= 2, "a 'start over' reply must trigger a retransmit");
+            c1 = laggard.installSnapshotsSent.get(laggard.installSnapshotsSent.size() - 1);
+            assertEquals(0L, c1.getOffset(), "the retransmit starts at byte 0");
+            assertArrayEquals(Arrays.copyOfRange(data, 0, (int) end1), (byte[]) c1.getPayload(),
+                    "the retransmitted chunk is the SAME pinned serialization, not a new capture");
+
+            // Phase 3: the follower accepts chunk 1 and reports its cursor (byte end1). Any
+            // further send is chunk 2, the LAST one (done=true), resuming at the cursor.
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, LAGGARD_INDEX, end1));
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            final InstallSnapshot c2 = laggard.installSnapshotsSent.get(laggard.installSnapshotsSent.size() - 1);
+            assertEquals(end1, c2.getOffset(), "chunk 2 resumes where the follower's cursor left off");
+            assertTrue(c2.isDone(), "the final chunk is done");
+            assertArrayEquals(Arrays.copyOfRange(data, (int) end1, data.length), (byte[]) c2.getPayload());
+
+            // Phase 4: the done-reply reports our boundary as the follower's new tail: the
+            // transfer completes, its tail is adopted, and the FOLLOWING pass is plain
+            // heartbeats -- no more installs of a completed capture.
+            final int installsAfterCompletion = laggard.installSnapshotsSent.size();
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, LAST_INDEX, (long) data.length));
+            assertEquals(new TermIndex(TERM, LAST_INDEX), laggard.getTermIndex(), "the installed tail is adopted");
+            assertEquals(NodeStates.LEADER, stateOf(node), "a same-term reply keeps us the leader");
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            assertEquals(installsAfterCompletion, laggard.installSnapshotsSent.size(), "a completed transfer is NOT re-sent");
+            assertTrue(laggard.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "post-completion traffic to the laggard is heartbeats only");
+
+            closeCurrent(node);
+        } finally {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = originalChunkBytes;
+        }
+    }
+
+    private static long halfOfSerialized(Object payload) {
+        final long len = chunk(payload).length;
+        return Math.max(1L, len / 2);
+    }
+
+    /**
+     * Clear the pacing gate for one more send pass: the reply stamps the ack time at
+     * {@code Instant.now()} (millisecond precision), which may not be strictly AFTER the
+     * send stamp, so the gate could still be closed when the test drives the next pass.
+     */
+    private static void openPacingGate(NodeCommunicationState connection) {
+        connection.setLastEntriesSent(Instant.EPOCH);
+        connection.setLastEntriesAcknowledged(Instant.EPOCH);
     }
 
     /**

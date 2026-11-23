@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -190,41 +191,73 @@ class WireSerializationTest {
     }
 
     @Test
-    void installSnapshotRoundTripWithRealSnapshotPayload() throws Exception {
-        // The payload is the same object the state machine captures (lib.data.Snapshot); it must be
-        // Serializable enough for the wire (N2 round-trip fidelity on the stage-3 message).
+    void installSnapshotRoundTripWithSerializedChunkPayload() throws Exception {
+        // Stage 6a: the wire payload is a byte[] chunk -- the leader's pinned JDK
+        // serialization of the state-machine capture. N2 fidelity applies to BOTH layers:
+        // the message round-trips the chunk byte-for-byte, and the chunk decodes to the
+        // captured object.
         Snapshot snapshot = new Snapshot(6, 21, Map.of(
                 "alpha", new DataVersion(Map.of("f1", new byte[]{1, 2}), 7, 1_700_000_000_000L),
                 "beta", new DataVersion(Map.of("f1", new byte[]{9}), 3)));
+        byte[] serialized = serializedBytes(snapshot);
 
-        // Single chunk: offset=0, done=true (offset/done are reserved for chunked sends).
-        InstallSnapshot install = roundTrip(new InstallSnapshot(6, "leader-1", 21, 6, 0L, snapshot, true));
+        // A whole-capture single chunk (the common case for small state machines):
+        // offset=0, done=true.
+        InstallSnapshot install = roundTrip(new InstallSnapshot(6, "leader-1", 21, 6, 0L, serialized, true));
         assertEquals(6, install.getTerm());
         assertEquals("leader-1", install.getLeaderId());
         assertEquals(21, install.getLastIncludedIndex());
         assertEquals(6, install.getLastIncludedTerm());
         assertEquals(0, install.getOffset());
         assertTrue(install.isDone());
-        assertTrue(install.getPayload() instanceof Snapshot, "payload must be the snapshot object itself");
-        Snapshot back = (Snapshot) install.getPayload();
-        assertEquals(6, back.term());
-        assertEquals(21, back.index());
-        assertEquals(snapshot.entries().keySet(), back.entries().keySet());
-        for (String key : snapshot.entries().keySet()) {
-            DataVersion original = snapshot.entries().get(key);
-            DataVersion deserialized = back.entries().get(key);
-            assertEquals(original.getVersion(), deserialized.getVersion());
-            assertEquals(original.getExpiresAtEpochMillis(), deserialized.getExpiresAtEpochMillis());
-            assertEquals(original.getData().keySet(), deserialized.getData().keySet());
-            for (String field : original.getData().keySet()) {
-                assertTrue(Arrays.equals(original.getData().get(field), deserialized.getData().get(field)),
-                        "entry for " + key + "/" + field + " must match byte-for-byte");
+        assertTrue(install.getPayload() instanceof byte[], "stage 6a: the wire payload is a byte[] chunk");
+        assertArrayEquals(serialized, (byte[]) install.getPayload(), "the chunk survives the wire byte-for-byte");
+
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(serialized))) {
+            Snapshot decoded = (Snapshot) ois.readObject();
+            assertEquals(6, decoded.term());
+            assertEquals(21, decoded.index());
+            assertEquals(snapshot.entries().keySet(), decoded.entries().keySet());
+            for (String key : snapshot.entries().keySet()) {
+                DataVersion original = snapshot.entries().get(key);
+                DataVersion deserialized = decoded.entries().get(key);
+                assertEquals(original.getVersion(), deserialized.getVersion());
+                assertEquals(original.getExpiresAtEpochMillis(), deserialized.getExpiresAtEpochMillis());
+                assertEquals(original.getData().keySet(), deserialized.getData().keySet());
+                for (String field : original.getData().keySet()) {
+                    assertTrue(Arrays.equals(original.getData().get(field), deserialized.getData().get(field)),
+                            "entry for " + key + "/" + field + " must match byte-for-byte");
+                }
             }
         }
 
-        InstallSnapshotResponse reply = roundTrip(new InstallSnapshotResponse(6, 21));
-        assertEquals(6, reply.getTerm());
-        assertEquals(21, reply.getIndex());
+        // A mid-transfer chunk (done=false) must round-trip identically: same slice,
+        // same non-zero offset.
+        byte[] half = Arrays.copyOf(serialized, serialized.length / 2);
+        InstallSnapshot mid = roundTrip(new InstallSnapshot(6, "leader-1", 21, 6, half.length, half, false));
+        assertEquals(half.length, mid.getOffset());
+        assertFalse(mid.isDone());
+        assertArrayEquals(half, (byte[]) mid.getPayload());
+
+        // The response carries the follower's next-expected-byte cursor (stage 6a). Its
+        // 2-argument legacy form round-trips with a zero cursor.
+        InstallSnapshotResponse done = roundTrip(new InstallSnapshotResponse(6, 21, (long) serialized.length));
+        assertEquals(6, done.getTerm());
+        assertEquals(21, done.getIndex());
+        assertEquals((long) serialized.length, done.getOffset());
+
+        InstallSnapshotResponse legacy = roundTrip(new InstallSnapshotResponse(6, 21));
+        assertEquals(6, legacy.getTerm());
+        assertEquals(21, legacy.getIndex());
+        assertEquals(0L, legacy.getOffset(), "a legacy 2-arg response reports a zero cursor");
+    }
+
+    private static byte[] serializedBytes(Object value) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (ObjectOutputStream oos = new ObjectOutputStream(out)) {
+            oos.writeObject(value);
+        }
+        return out.toByteArray();
     }
 
     @Test

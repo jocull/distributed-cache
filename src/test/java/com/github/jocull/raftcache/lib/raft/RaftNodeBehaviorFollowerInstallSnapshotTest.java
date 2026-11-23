@@ -22,9 +22,13 @@ import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -67,7 +71,22 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
     /** Install the standard term-0, boundary-(5,10), state {key1 -> v} snapshot. */
     private InstallSnapshot installMessage(RecordingSender leader, String stateValue) {
         final Snapshot snapshot = new Snapshot(5L, 10L, Map.of("key1", value(stateValue)));
-        return new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, snapshot, true);
+        return new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, chunk(snapshot), true);
+    }
+
+    /**
+     * The chunk-protocol form of a capture (SNAPSHOTS.md stage 6a): the leader JDK-serializes
+     * the supplier payload ONCE and the follower receives it as byte[] chunks, so every test
+     * feed below goes through the same serialization the leader performs.
+     */
+    private static byte[] chunk(Snapshot snapshot) {
+        final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (final ObjectOutputStream oos = new ObjectOutputStream(out)) {
+            oos.writeObject(snapshot);
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to serialize test snapshot", e);
+        }
+        return out.toByteArray();
     }
 
     private static com.github.jocull.raftcache.lib.raft.messages.TermIndex wire(long term, long index) {
@@ -145,7 +164,7 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             // must be refused -- even one carrying a wholly different payload.
             final Snapshot stale = new Snapshot(5L, 8L, Map.of("key1", value("stale-state", 9L)));
             follower.currentReceiver().onInstallSnapshot(leader,
-                    new InstallSnapshot(0, leader.getRemoteNodeId(), 8L, 5, 0L, stale, true));
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 8L, 5, 0L, chunk(stale), true));
 
             assertEquals(2, leader.snapshotResponses().size(), "the refusal is answered, not dropped");
             assertEquals(0, leader.snapshotResponses().get(1).getTerm());
@@ -180,7 +199,7 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             final RecordingSender redelivery = new RecordingSender("redelivery");
             final Snapshot redelivered = new Snapshot(5L, 10L, Map.of("key1", value("other-state", 9L)));
             follower.currentReceiver().onInstallSnapshot(redelivery,
-                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, redelivered, true));
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, chunk(redelivered), true));
 
             assertEquals(1, redelivery.snapshotResponses().size(), "the redelivery is refused, not re-applied");
             assertEquals(0, redelivery.snapshotResponses().get(0).getTerm());
@@ -205,7 +224,7 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             final RecordingSender leader = new RecordingSender("leader");
             final Snapshot snapshot = new Snapshot(9L, 20L, Map.of("key1", value("term9-state")));
             follower.currentReceiver().onInstallSnapshot(leader,
-                    new InstallSnapshot(7, leader.getRemoteNodeId(), 20L, 9, 0L, snapshot, true));
+                    new InstallSnapshot(7, leader.getRemoteNodeId(), 20L, 9, 0L, chunk(snapshot), true));
 
             // Stepped down to the leader's term first, with the sender recorded as leader.
             assertEquals(7, ((RaftNodeBehavior) follower.currentReceiver()).term, "the follower adopts the higher term");
@@ -239,7 +258,7 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             // Move the follower to term 5 with an install.
             final Snapshot t5 = new Snapshot(5L, 10L, Map.of("key1", value("term5-state")));
             follower.currentReceiver().onInstallSnapshot(leader,
-                    new InstallSnapshot(5, leader.getRemoteNodeId(), 10L, 5, 0L, t5, true));
+                    new InstallSnapshot(5, leader.getRemoteNodeId(), 10L, 5, 0L, chunk(t5), true));
             assertEquals(5, ((RaftNodeBehavior) follower.currentReceiver()).term, "setup: the follower is at term 5");
             final long installedVersion = partitionMap.getData("key1").orElseThrow().getVersion();
 
@@ -248,7 +267,7 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             final RecordingSender staleLeader = new RecordingSender("staleLeader");
             final Snapshot stale = new Snapshot(2L, 4L, Map.of("key1", value("stale-state", 9L)));
             follower.currentReceiver().onInstallSnapshot(staleLeader,
-                    new InstallSnapshot(3, staleLeader.getRemoteNodeId(), 4L, 2, 0L, stale, true));
+                    new InstallSnapshot(3, staleLeader.getRemoteNodeId(), 4L, 2, 0L, chunk(stale), true));
 
             assertEquals(1, staleLeader.snapshotResponses().size(), "the stale leader must be answered");
             assertEquals(5, staleLeader.snapshotResponses().get(0).getTerm(), "the reply carries our own (higher) term");
@@ -301,6 +320,221 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
         }
     }
 
+    // ---- Chunked transfer (stage 6a): byte[] chunks, byte cursor, in-order assembly ----
+
+    @Test
+    void snapshotArrivingInTwoChunks_isAssembledAndInstalledOnlyOnTheFinalChunk() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            final byte[] data = chunk(new Snapshot(5L, 10L, Map.of("key1", value("chunked"))));
+            final int split = data.length / 2;
+            final byte[] first = Arrays.copyOfRange(data, 0, split);
+            final byte[] second = Arrays.copyOfRange(data, split, data.length);
+
+            // Chunk 1: buffered, NOT installed -- the reply reports the follower's cursor.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+            assertEquals(1, leader.snapshotResponses().size());
+            assertEquals(0, leader.snapshotResponses().get(0).getTerm());
+            assertEquals(0L, leader.snapshotResponses().get(0).getIndex(), "an intermediate reply carries the (unchanged) tail");
+            assertEquals(split, leader.snapshotResponses().get(0).getOffset(), "an intermediate reply reports the next expected byte");
+            // Nothing may be installed mid-transfer.
+            assertFalse(follower.logs.hasStartPointSnapshot(), "an incomplete transfer installs nothing");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the tail is untouched until the final chunk");
+            assertTrue(partitionMap.getData("key1").isEmpty(), "the state machine must not see partial state");
+            assertEquals("leader", ((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "chunk 0 is the accept path, so the sender is recorded as leader");
+
+            // Chunk 2: completes the buffer -- install lands exactly as a single-chunk install.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, split, second, true));
+            assertEquals(2, leader.snapshotResponses().size());
+            assertEquals(10L, leader.snapshotResponses().get(1).getIndex(), "the completion reply carries the new tail");
+            assertEquals((long) data.length, leader.snapshotResponses().get(1).getOffset(), "the completion reply reports the total bytes");
+
+            assertEquals(new TermIndex(5, 10L), follower.logs.getStartTermIndex());
+            assertEquals(10L, follower.logs.getCurrentTermIndex().getIndex());
+            assertArrayEquals("chunked".getBytes(StandardCharsets.UTF_8),
+                    partitionMap.getData("key1").orElseThrow().getData().get("value"));
+            assertEquals(10L, bridge.getLastAppliedIndex(), "the applied position is re-anchored to the boundary");
+        }
+    }
+
+    @Test
+    void resendingAnAlreadyAppendedChunk_isDroppedWithTheCursorReReported() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            final byte[] data = chunk(new Snapshot(5L, 10L, Map.of("key1", value("dup"))));
+            final int split = data.length / 2;
+            final byte[] first = Arrays.copyOfRange(data, 0, split);
+            final byte[] second = Arrays.copyOfRange(data, split, data.length);
+
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+
+            // Lost-ack retransmit: chunk 1 arrives AGAIN. It must be dropped (not buffered
+            // twice) and the reply must re-report our cursor so the leader resumes PAST it.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+            assertEquals(2, leader.snapshotResponses().size(), "a duplicate is answered, not silently dropped");
+            assertEquals(split, leader.snapshotResponses().get(1).getOffset(),
+                    "the duplicate reply re-reports the unchanged cursor");
+
+            // The final chunk then lands exactly once -- a double-buffered first chunk would
+            // make the assembled stream undecodable (or at least mis-sized), so a clean
+            // install here proves the duplicate was discarded.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, split, second, true));
+            assertEquals(10L, leader.snapshotResponses().get(2).getIndex());
+            assertEquals(new TermIndex(5, 10L), follower.logs.getStartTermIndex());
+            assertArrayEquals("dup".getBytes(StandardCharsets.UTF_8),
+                    partitionMap.getData("key1").orElseThrow().getData().get("value"));
+        }
+    }
+
+    @Test
+    void aGapRefusesWithCursorZero_soTheTransferCanRestartFromByteZero() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            final byte[] data = chunk(new Snapshot(5L, 10L, Map.of("key1", value("gap"))));
+            final int split = data.length / 2;
+            final byte[] first = Arrays.copyOfRange(data, 0, split);
+            final byte[] second = Arrays.copyOfRange(data, split, data.length);
+
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+
+            // We are missing the bytes between our cursor and this chunk: refuse with cursor
+            // 0, which tells the leader to restart the transfer from byte 0.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, split + 1L, second, true));
+            assertEquals(2, leader.snapshotResponses().size());
+            assertEquals(0, leader.snapshotResponses().get(1).getOffset(), "a gap is answered with a 'restart from byte 0' cursor");
+            assertFalse(follower.logs.hasStartPointSnapshot(), "a refused chunk installs nothing");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex());
+
+            // The escape valve: the leader re-sends byte 0 and the transfer re-baselines
+            // (offset 0 = fresh start) and runs to completion.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+            assertEquals((long) split, leader.snapshotResponses().get(2).getOffset());
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, split, second, true));
+            assertEquals(new TermIndex(5, 10L), follower.logs.getStartTermIndex());
+            assertArrayEquals("gap".getBytes(StandardCharsets.UTF_8),
+                    partitionMap.getData("key1").orElseThrow().getData().get("value"));
+        }
+    }
+
+    @Test
+    void aChunkUnderADifferentBoundary_isRefusedWithCursorZero() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            final byte[] data = chunk(new Snapshot(5L, 10L, Map.of("key1", value("boundary"))));
+            final int split = data.length / 2;
+            final byte[] first = Arrays.copyOfRange(data, 0, split);
+            final byte[] second = Arrays.copyOfRange(data, split, data.length);
+
+            // In flight under boundary (5,10): chunk 1 accepted.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+
+            // The peer restarts under DIFFERENT capture coordinates (5,12): its cursor is
+            // meaningless to us -- refuse so it re-baselines with a coherent capture.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 12L, 5, split, second, true));
+            assertEquals(2, leader.snapshotResponses().size());
+            assertEquals(0, leader.snapshotResponses().get(1).getOffset(), "a boundary mismatch is answered with 'restart from byte 0'");
+            assertFalse(follower.logs.hasStartPointSnapshot(), "a mismatched chunk installs nothing");
+
+            // ...and the coherent (5,10) capture still runs to completion.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, first, false));
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, split, second, true));
+            assertEquals(new TermIndex(5, 10L), follower.logs.getStartTermIndex());
+            assertArrayEquals("boundary".getBytes(StandardCharsets.UTF_8),
+                    partitionMap.getData("key1").orElseThrow().getData().get("value"));
+        }
+    }
+
+    @Test
+    void aNonByteArrayPayload_isRefusedWithoutTouchingState() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // Not a byte[] chunk: outside the chunk protocol. Refuse, answer the leader,
+            // and change nothing.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, "not-a-chunk", true));
+
+            assertEquals(1, leader.snapshotResponses().size());
+            assertEquals(0, leader.snapshotResponses().get(0).getOffset());
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "a refused payload must not move the tail");
+            assertFalse(follower.logs.hasStartPointSnapshot());
+            assertTrue(partitionMap.getData("key1").isEmpty(), "a refused payload must not touch the state");
+        }
+    }
+
+    @Test
+    void anUndecodableAssembledCapture_isRefusedWithoutTouchingState() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // The assembled buffer decodes into nothing: the transfer must fail OPEN-REFUSAL
+            // (answer with cursor 0, leader retransmits from byte 0) -- never a half-install.
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(0, leader.getRemoteNodeId(), 10L, 5, 0L, new byte[]{1, 2, 3}, true));
+
+            assertEquals(1, leader.snapshotResponses().size());
+            assertEquals(0, leader.snapshotResponses().get(0).getOffset(), "a decode failure is answered with 'restart from byte 0'");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "a decode failure must not move the tail");
+            assertFalse(follower.logs.hasStartPointSnapshot());
+            assertTrue(partitionMap.getData("key1").isEmpty());
+            assertEquals(0L, bridge.getLastAppliedIndex(), "a decode failure must not advance the applied position");
+        }
+    }
+
     @Test
     void unstartedNode_RejectsInstallSnapshot() {
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
@@ -311,7 +545,7 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             // Deliberately NOT started: the initial follower has no state to install into.
             assertThrows(IllegalStateException.class,
                     () -> node.currentReceiver().onInstallSnapshot(new RecordingSender("leader"),
-                            new InstallSnapshot(1, "leader", 10L, 1, 0L, new Snapshot(1L, 10L, Map.of("key1", value("v"))), true)));
+                            new InstallSnapshot(1, "leader", 10L, 1, 0L, chunk(new Snapshot(1L, 10L, Map.of("key1", value("v")))), true)));
         }
     }
 
