@@ -271,6 +271,125 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
         }
     }
 
+    // ---- Branch (a): a follower BELOW the compacted start point has no append replay ----
+
+    @Test
+    void belowStartPoint_gapBelowTrigger_stillReceivesInstallSnapshot() {
+        // Branch (a) of the laggard decision (SNAPSHOTS.md stage 6f): a follower strictly BELOW
+        // the compacted start point cannot be replayed to -- getLogRange never serves records at
+        // or below the seed, and not even the boundary record itself -- so the snapshot is its
+        // ONLY catch-up path. The trigger threshold applies only to branch (b): even a gap of
+        // SNAPSHOT_TRIGGER_ENTRIES - 1 or less must still get an install, because an append
+        // replay here would be a permanent empty stream (a stalled follower).
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final Object payload = new Snapshot(TERM, LAST_INDEX, Map.of());
+            node.setSnapshotSupplier(() -> payload);
+
+            // Phase 1: the log compacts to the committed point the ordinary way (all live
+            // followers are at it), producing the compacted start point branch (a) needs.
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection caughtUp = new RecordingConnection("caughtUp", new TermIndex(TERM, LAST_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(caughtUp);
+
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getStartTermIndex(),
+                    "sanity: the compacted log is the precondition for branch (a)");
+
+            // Precondition branch (a) relies on: a compacted log literally cannot serve the
+            // records a below-boundary follower needs (only its boundary record survives).
+            assertEquals(0, node.logs.getLogRange(new TermIndex(TERM, 4L), 200).size(),
+                    "an append replay could never reach index 4: no record below the start point survives");
+
+            // Phase 2: a re-appeared (re)joiner sits BELOW the start point at index 4 -- gap
+            // 2 < SNAPSHOT_TRIGGER_ENTRIES, so branch (b) does NOT fire; only (a) can install it.
+            final RecordingConnection below = new RecordingConnection("below", new TermIndex(TERM, 4L));
+            node.activeConnections.add(below);
+
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+
+            // A racing heartbeat timer tick may re-send the install (the documented retransmit
+            // path -- the follower never replied, so the cursor never advanced), so bound the
+            // count rather than pin it: at least one install, and the transfer always restarts
+            // from byte 0 while the cursor is still 0.
+            assertFalse(below.installSnapshotsSent.isEmpty(),
+                    "a below-start-point follower gets the snapshot even when its gap is below the trigger threshold");
+            final InstallSnapshot install = below.installSnapshotsSent.get(0);
+            assertEquals(TERM, install.getTerm());
+            assertEquals("node", install.getLeaderId());
+            assertEquals(LAST_INDEX, install.getLastIncludedIndex(), "the boundary is the compacted start point");
+            assertEquals(TERM, install.getLastIncludedTerm());
+            assertEquals(0L, install.getOffset());
+            assertTrue(install.isDone(), "the whole capture fits the default chunk size");
+            assertArrayEquals(chunk(payload), (byte[]) install.getPayload(), "the chunk is the pinned serialization");
+            assertTrue(below.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "nothing is ever appended: a replay cannot bridge a gap with no records left behind the seed");
+            assertEquals(new TermIndex(TERM, 4L), below.getTermIndex(),
+                    "the send does not move the follower's index -- only its reply does");
+
+            // The other followers sit at our tail: whatever reaches them is only ever an
+            // EMPTY append (the quiet CONTINUATION, or a racing heartbeat), never entries.
+            assertTrue(upToDate.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "an up-to-date follower only ever receives empty heartbeats");
+            assertTrue(caughtUp.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "an up-to-date follower only ever receives empty heartbeats");
+
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex());
+            assertEquals(NodeStates.LEADER, stateOf(node));
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void atStartPoint_gapBelowTrigger_heartbeats_notInstall() {
+        // The "strictly below" edge of branch (a) (SNAPSHOTS.md stage 6f): a follower AT the
+        // compacted start point is not below it, so it must NOT be installed from -- it
+        // legitimately sits at the boundary and only ever receives heartbeats there (no
+        // entries remain behind it to replay, so the append path is equally quiet).
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            node.setSnapshotSupplier(() -> new Snapshot(TERM, LAST_INDEX, Map.of()));
+
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection caughtUp = new RecordingConnection("caughtUp", new TermIndex(TERM, LAST_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(caughtUp);
+
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getStartTermIndex(),
+                    "sanity: the compacted log is the precondition for the at-boundary edge");
+
+            // A (re)joiner AT the start point: gap 0, neither branch (a) (not below) nor
+            // branch (b) (below threshold) fires.
+            final RecordingConnection atBoundary = new RecordingConnection("atBoundary", new TermIndex(TERM, LAST_INDEX));
+            node.activeConnections.add(atBoundary);
+
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+
+            assertTrue(atBoundary.installSnapshotsSent.isEmpty(),
+                    "a follower at the start point is not a laggard, so no install");
+            // A racing heartbeat timer tick may add another heartbeat, so bound (>= 1, the
+            // driven INITIAL pass always lands) and pin what every append may contain: nothing.
+            assertTrue(atBoundary.appendEntriesSent.size() >= 1, "the quiet INITIAL heartbeat still reaches it");
+            assertTrue(atBoundary.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "nothing remains behind the boundary, so every append is a bare heartbeat");
+
+            assertTrue(upToDate.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "an up-to-date follower only ever receives empty heartbeats");
+            assertTrue(caughtUp.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "an up-to-date follower only ever receives empty heartbeats");
+
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex());
+            assertEquals(NodeStates.LEADER, stateOf(node));
+            closeCurrent(node);
+        }
+    }
+
     // ---- Compaction: only when every live follower is at the committed point ----
 
     @Test
@@ -381,6 +500,43 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
             assertEquals(TERM + 1, termOf(node), "the term advances to the reported one");
             assertEquals(new TermIndex(TERM, LAGGARD_INDEX), laggard.getTermIndex(), "we step down BEFORE adopting the response's tail");
             assertTrue(laggard.installSnapshotsSent.isEmpty());
+            closeCurrent(node);
+        }
+    }
+
+    // ---- Stage 6f: a lower-term reply is the ordinary case -- no step-down, adopt the tail ----
+
+    @Test
+    void lowerTermSnapshotResponse_keepsLeadership_adoptsTail() {
+        // The other side of the term check (SNAPSHOTS.md stage 6f): the leader steps down only
+        // on a STRICTLY higher term (Raft, and the onAcknowledgeEntries parity). A reply that
+        // carries a LOWER term -- a buggy or misbehaving peer, or an older build echoing a stale
+        // term -- is a normal reply on the index axis: it must not drop our leadership, and it
+        // still adopts the reported tail as the follower's new start point.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            // No supplier is registered: the reply takes the "no transfer in flight" branch and
+            // the compaction gate stays inert either way -- everything we assert is state, not a send.
+
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            node.activeConnections.add(laggard);
+
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(0, LAST_INDEX));
+
+            assertEquals(NodeStates.LEADER, stateOf(node),
+                    "a strictly-lower term must NOT step us down -- only a strictly-higher one does");
+            assertEquals(TERM, termOf(node), "our term is untouched by a lower-term reply");
+            assertEquals(LAST_INDEX, laggard.getTermIndex().getIndex(),
+                    "the reported tail still becomes the follower's new start point -- the index axis is what drives progress");
+            assertTrue(laggard.installSnapshotsSent.isEmpty(), "a reply with no transfer in flight must not fabricate a retransmit");
+            // A racing heartbeat timer tick may still land, so pin only what every append may
+            // contain after the tail is adopted: nothing (a quiet CONTINUATION, or a heartbeat).
+            assertTrue(laggard.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "a follower at our tail only ever receives empty heartbeats");
+            assertEquals(LAST_INDEX, node.logs.getCommittedTermIndex().getIndex(),
+                    "the install IS the acknowledgement of everything up to the reported tail (Raft §7)");
             closeCurrent(node);
         }
     }

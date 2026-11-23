@@ -17,13 +17,15 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(c) | non-happy-path hardening: failing stores on both roles (leader compaction and follower install fail closed — log left untrimmed, no success reply so the leader retransmits), gap one below the trigger stays on the append-replay path, an exact-divisor chunk size ends cleanly on the last byte with no empty trailer, orphan `.tmp` files are invisible to `loadLatest` even when named for a higher boundary | `stage 6(c)` |
 | 6(d) | non-happy-path hardening (second pass): a throwing snapshot supplier or a payload that cannot be serialized in the laggard path falls back to appends instead of tearing down the heartbeat round (a healthy supplier recovers); a negative offset cursor in `InstallSnapshotResponse` is clamped to 0 (would otherwise AIOOBE the next `Arrays.copyOfRange`); `loadLatest` skips snapshot-shaped files with unparseable names while still recovering a valid one in the same directory, and picks strictly max-by-boundary (term-major) when two valid files coexist; the compaction gate stays fail-closed; a failed store `save` (e.g. read-only directory) is loud and leaves no `.tmp` behind | `stage 6(d)` |
 | 6(e) | non-happy-path hardening (third pass): the follower's `onInstallSnapshot` refuses a **negative `offset` cursor** (a byte position is never < 0) by tearing down the in-progress transfer and answering with the restart-at-byte-0 cursor — previously it would fall into the "duplicate" branch and re-advertise the stale cursor; an **explicit null payload** is refused like a non-`byte[]` one (tear-down + cursor-0 refusal, election timer rescheduled) — previously it NPEd at `chunk.length` and escaped the handler **with no reply at all** (unreachable via the public API: the `InstallSnapshot` constructor already null-guards the payload, a boundary pin now asserts that invariant); the leader's `onInstallSnapshotResponse` needed **no** change — the two untested edges of its completion predicate are pinned instead: a same-term reply that arrives with **no transfer in flight** (late/duplicated/mis-routed) completes cleanly (tail adopted, commit advanced, and nothing fabricated to retransmit, since no capture was ever pinned), and a reply whose **cursor runs past the last byte of the pinned capture** while its index stays below the boundary completes the transfer — the next pass is a FRESH install from byte 0 of the same pinned capture, never a "resume" that would AIOOBE `Arrays.copyOfRange` | `stage 6(e)` |
+| 6(f) | non-happy-path hardening (fourth pass): the other side of the leader's laggard decision — a follower **strictly below** the compacted start point receives the install even when its gap is BELOW `SNAPSHOT_TRIGGER_ENTRIES` (branch (a) has no threshold: an append replay there is a permanent empty stream, `getLogRange` serves nothing at or below the seed), a follower **AT** the boundary gets only empty heartbeats, no install (the "strictly below" edge pinned from the other side), and an `InstallSnapshotResponse` carrying a **lower** term is an ordinary completion on the index axis — leadership kept (step-down only on a *strictly higher* term, `onAcknowledgeEntries` parity), reported tail still adopted (no production change: three pins, and the pins themselves surfaced a test-hygiene gap — send-count assertions must be bounds + per-message properties, never exact counts, because the 50 ms background heartbeat timer legitimately interleaves) | `stage 6(f)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
 1 pre-existing skip**; after stage 6(d): **332 tests green, 0 failures, 1
-pre-existing skip**; and after stage 6(e): **336 tests green, 0 failures, 1
+pre-existing skip**; after stage 6(e): **336 tests green, 0 failures, 1
 pre-existing skip** (baseline 332 + 4 new pins: 2 follower hardening refusals + 2 leader
-stale/over-length reply pins). `InstallSnapshotExample.java` and the `proto/raft/*`
+stale/over-length reply pins); and after stage 6(f): **339 tests green, 0 failures, 1
+pre-existing skip** (+3 leader laggard-branch pins). `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
 Sources: Raft paper §7 (§7.1 log compaction, §7.2 snapshot transfer) and §5.4.1 (up-to-date rule,
@@ -315,3 +317,50 @@ capture**, never a "resume" that would AIOOBE `Arrays.copyOfRange` on a slice pa
 array. Isolated runs of both classes before full-suite confirmation: 17 leader + 19 follower
 pins green. Final suite: **336 tests green, 0 failures, 1 pre-existing skip** (+4 over the
 6(d) baseline: 2 follower pins + 2 leader pins).
+
+**Non-happy-path hardening pass, fourth round (2026-11-23, stage 6(f))** — the other side
+of the leader's laggard decision. Until this pass, only branch (b) of the two install
+triggers in `RaftNodeBehaviorLeader.appendEntries` (gap ≥ `SNAPSHOT_TRIGGER_ENTRIES`) had
+been exercised end-to-end with a compacted log in play; branch (a) — a follower **strictly
+below** the compacted start point — and the boundary between the two branches were open on
+the leader side (the follower side was fully inventoried at stage 6c/6e). Three new leader
+pins, all in `RaftNodeBehaviorLeaderInstallSnapshotTest`; **no production change** — the
+code under test (branch (a), the strict `<`, the `>` step-down bound) already existed from
+stage 5 and was now pinned:
+
+1. **`belowStartPoint_gapBelowTrigger_stillReceivesInstallSnapshot`** — a (re)joiner sitting
+   BELOW the start point (1,6), at index 4 (gap 2, well under the threshold of 5), still
+   receives `InstallSnapshot`. That is the whole point of branch (a) having **no threshold**:
+   an append replay for this follower is a permanent empty stream — `getLogRange` serves
+   nothing at or below the seed, the boundary record itself excluded (a pre-test assertion
+   pins exactly that: `getLogRange((1,4))` is empty) — so without (a) the follower would
+   stall forever on "nothing to send". First-install properties are asserted (boundary,
+   offset 0, done, the pinned serialization); the send *count* is bounded, not exact,
+   because the documented retransmit path may legitimately re-send the same chunk while the
+   follower's cursor is still byte 0 (it never replied).
+2. **`atStartPoint_gapBelowTrigger_heartbeats_notInstall`** — the "strictly below" edge,
+   pinned from the other side: a follower AT the start point (index 6 = the boundary)
+   receives **no install** — gap 0 fires neither branch — and only ever empty heartbeats
+   (nothing remains behind the seed to replay, so the append path is quiet too).
+3. **`lowerTermSnapshotResponse_keepsLeadership_adoptsTail`** — the inverse of the
+   already-pinned higher-term step-down: `onInstallSnapshotResponse` steps down only on a
+   *strictly higher* term (parity with `onAcknowledgeEntries`), so a reply carrying a
+   **lower** term — a buggy or older peer echoing a stale term — is an ordinary completion
+   on the index axis: leadership kept, our term untouched, the reported tail still adopted
+   as the follower's new start point, no install fabricated, commit advanced to the
+   reported index. Assertions are deliberately **index-axis only**: a term-0 reply writes
+   term 0 into the follower's connection record and the commit-point term computation
+   (a pre-existing quirk of the completion branch), and asserting exact `TermIndex` values
+   would pin the quirk instead of the contract.
+
+Also recorded: a **test-hygiene finding** that surfaced when these pins first went green in
+isolation but red in the full suite (and vice versa under load). The leader reschedules a
+50 ms background heartbeat timer (its `onHeartbeatTimeout` → `appendEntries(TIMEOUT)` pass)
+on the node executor, and a tick can land mid-test, sending a legitimate extra message —
+the retransmitted install, or an empty heartbeat on an INITIAL/TIMEOUT pass (a CONTINUATION
+with nothing to send stays quiet). Exact send-count assertions are therefore
+timing-dependent; the pins settled on the convention the earlier green pins already use:
+**lower bounds + per-message properties** (every append carries no entries; the first
+install has the pinned payload), never exact counts. Isolated class run: 20 leader pins
+green. Final suite: **339 tests green, 0 failures, 1 pre-existing skip** (+3 over the
+6(e) baseline: the three leader laggard-branch pins).
