@@ -14,9 +14,11 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 5 — leader laggard `InstallSnapshot` + compaction trigger (+ per-node snapshot supplier wiring addendum) | `SnapshotTransfer` + save-before-trim gate | `3fd7e6c`, `9f0a705` |
 | 6(a) | chunked transfer: leader pins one serialization, follower assembles, offset cursor resumes at the returned offset | `35f4ec0` |
 | 6(b) | durable `SnapshotStore` (in-memory + file impls): save-on-compact (leader), save-on-install (follower — a failed save aborts before the trim), seed at startup before log replay; null/empty/corrupt/throwing stores warn and skip, startup is never blocked | `stage 6(b)` |
+| 6(c) | non-happy-path hardening: failing stores on both roles (leader compaction and follower install fail closed — log left untrimmed, no success reply so the leader retransmits), gap one below the trigger stays on the append-replay path, an exact-divisor chunk size ends cleanly on the last byte with no empty trailer, orphan `.tmp` files are invisible to `loadLatest` even when named for a higher boundary | `stage 6(c)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
-(`/tmp/opencode/mvn-phase4-final.log`). `InstallSnapshotExample.java` and the `proto/raft/*`
+(`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
+1 pre-existing skip**. `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
 Sources: Raft paper §7 (§7.1 log compaction, §7.2 snapshot transfer) and §5.4.1 (up-to-date rule,
@@ -220,3 +222,23 @@ per-stage tests landing in `RaftLogsTest`, `RaftNodeBehaviorFollowerInstallSnaps
 `RaftNodeSnapshotRecoveryTest` (1 — laggard recovers through the snapshot and the leader compacts
 afterwards; stage 5 addendum, `9f0a705`), on top of the per-stage suite additions in
 `StateMachineBridgeTest`, `RaftLogsTest`, and `WireSerializationTest`.
+
+**Non-happy-path hardening pass (2026-11-23, stage 6(c))** — the five failing/edge paths that the
+happy-path suite never exercises, verified by isolated class runs first, then a green full suite:
+`RaftNodeBehaviorLeaderInstallSnapshotTest` gains the gap-just-below-trigger case (a follower at
+`SNAPSHOT_TRIGGER_ENTRIES − 1` stays on the append-replay path — four appends replayed starting at
+its index + 1, no install, no compaction), the exact-divisor chunk edge (`SNAPSHOT_CHUNK_BYTES` set
+so the capture is an even multiple of two: the final chunk lands exactly on the last byte, carries
+the done flag and a real payload slice, and no zero-byte trailer is ever emitted nor a chunk after
+completion — `static volatile` restored in `finally`), and the leader compaction with a throwing
+store (fails closed: the exception escapes `onAcknowledgeEntries`, committed is already advanced
+per the commit→save→compact order, no snapshot boundary, the five entries are still
+`getLogRange`-visible — the log is never trimmed on an unpersisted capture).
+`RaftNodeBehaviorFollowerInstallSnapshotTest` mirrors the follower side: the final chunk
+deserializes, the store refuses to persist, and everything after the save in the S4 order must not
+happen — no `InstallSnapshotResponse` (so the leader retransmits), no snapshot boundary, log and
+applied index untouched, the state machine never sees the payload.
+`FileSnapshotStoreTest` proves an orphan `.tmp` left by a crash mid-write is invisible to
+`loadLatest` — deliberately seeded with a HIGHER boundary than the real snapshot, so a
+parse-then-max-by-boundary mistake would recover it and the test fails.
+Final suite: **325 tests green, 0 failures, 1 pre-existing skip** (+5 over the 6(b) baseline).

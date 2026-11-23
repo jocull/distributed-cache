@@ -650,6 +650,45 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
         }
     }
 
+    @Test
+    void finalChunkWithFailingSnapshotStore_failsClosed_stateNotAdopted_noReplySent() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            final SnapshotStore failing = new SnapshotStore() {
+                @Override
+                public void save(TermIndex boundary, byte[] payload) {
+                    throw new IllegalStateException("simulated snapshot-store failure");
+                }
+
+                @Override
+                public Optional<SnapshotStore.Stored> loadLatest() {
+                    return Optional.empty();
+                }
+            };
+            follower.setSnapshotStore(failing);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // THE CORE (6c): the final chunk deserializes cleanly, then the store refuses to
+            // persist it. Everything after the save in the S4 order (adopt, compact, reply)
+            // must NOT happen -- and the error escapes instead of being swallowed, so the
+            // leader never learns of a success it did not get.
+            assertThrows(IllegalStateException.class,
+                    () -> follower.currentReceiver().onInstallSnapshot(leader, installMessage(leader, "value1")),
+                    "a failed save is a hard error, not a silent skip");
+
+            assertTrue(leader.snapshotResponses().isEmpty(),
+                    "the strongest signal: a failed install must NOT acknowledge success, so the leader retransmits");
+            assertFalse(follower.logs.hasStartPointSnapshot(), "fail-safe: the log is not re-anchored on a failed install");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "fail-safe: the log is untouched");
+            assertTrue(partitionMap.getData("key1").isEmpty(), "fail-safe: the state machine never adopted the payload");
+            assertEquals(0L, bridge.getLastAppliedIndex(), "fail-safe: the applied position is not advanced");
+        }
+    }
+
     /**
      * A minimal {@link NodeConnectionOutbound} that identifies itself as the sender and
      * records the {@link InstallSnapshotResponse}/{@link AcknowledgeEntries} it is asked to

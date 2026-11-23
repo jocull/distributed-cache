@@ -28,12 +28,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -232,6 +234,38 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
 
             assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex());
             assertFalse(node.logs.hasStartPointSnapshot(), "no compaction while a follower lags");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void gapJustBelowTrigger_staysOnTheAppendPath() {
+        // Branch (b) of the laggard decision needs the FULL gap (committed - followerIndex
+        // >= SNAPSHOT_TRIGGER_ENTRIES): one entry short of it, the follower is merely
+        // behind, not a laggard -- it gets the slow (but correct) append replay, no install.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            node.setSnapshotSupplier(() -> new Snapshot(TERM, LAST_INDEX, Map.of()));
+
+            // Laggard at index 2 of 6: once quorum acks the tail, the commit point is 6 and
+            // the gap is 4 -- exactly SNAPSHOT_TRIGGER_ENTRIES - 1, short of the trigger.
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, 2L));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(laggard);
+
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex());
+            assertTrue(laggard.installSnapshotsSent.isEmpty(), "gap < trigger: this follower is behind, not a laggard, so no install");
+            assertEquals(1, laggard.appendEntriesSent.size(), "the missing range is still delivered");
+            final List<AppendEntries.RaftLog> entries = laggard.appendEntriesSent.get(0).getEntries();
+            assertEquals((int) (LAST_INDEX - 2L), entries.size(), "the replay carries exactly the entries the follower lacks");
+            assertEquals(3L, entries.get(0).getTermIndex().getIndex(), "the replay starts where the follower's log ends");
+            assertEquals(LAST_INDEX, entries.get(entries.size() - 1).getTermIndex().getIndex());
+            assertFalse(node.logs.hasStartPointSnapshot(), "S1: no compaction while a live follower lags behind the commit point");
             closeCurrent(node);
         }
     }
@@ -447,6 +481,71 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
         connection.setLastEntriesAcknowledged(Instant.EPOCH);
     }
 
+    @Test
+    void chunkSizeAnExactDivisor_endsOnTheLastByte_doneWithoutAnEmptyTrailer() {
+        // Edge of the chunking loop (SNAPSHOTS.md 6a, end = min(sentOffset + chunk, data.length)):
+        // when the serialized capture is an EVEN multiple of two, the second chunk lands EXACTLY
+        // on the last byte. done must fire on that final chunk — with a FULL payload slice, a
+        // naive "while (sentOffset < length)" loop would emit a spurious third, zero-byte chunk.
+        final Object payload = new Snapshot(TERM, LAST_INDEX,
+                Map.of("key1", new DataVersion(Map.of("big", new byte[256]), 7)));
+        final byte[] data = chunk(payload);
+        final long chunkBytes = (data.length + 1) / 2; // chunk 1 full-size; chunk 2 reaches the last byte exactly
+        final long originalChunkBytes = RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES;
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = chunkBytes;
+
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final Object pinned = payload;
+            node.setSnapshotSupplier(() -> pinned);
+
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(laggard);
+
+            // Chunk 1: a FULL chunkBytes slice starting at byte 0, not done (it does not reach the end).
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            assertEquals(1, laggard.installSnapshotsSent.size(), "one chunk per pass");
+            final InstallSnapshot c1 = laggard.installSnapshotsSent.get(0);
+            assertEquals(0L, c1.getOffset());
+            assertFalse(c1.isDone());
+            assertArrayEquals(Arrays.copyOfRange(data, 0, (int) chunkBytes), (byte[]) c1.getPayload());
+
+            // Chunk 2: the reply cursor is chunkBytes, so the next send resumes there and ends
+            // EXACTLY on the last byte: done=true on the chunk that carries the trailing slice.
+            // (An in-progress reply may pipeline a resend before we drive a pass, so the count
+            // is not exact here -- the LAST delivered install carries the properties.)
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, LAGGARD_INDEX, chunkBytes));
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            final InstallSnapshot c2 = laggard.installSnapshotsSent.get(laggard.installSnapshotsSent.size() - 1);
+            assertEquals(chunkBytes, c2.getOffset(), "the final chunk resumes at the follower's cursor");
+            assertTrue(c2.isDone(), "the chunk that reaches the last byte carries the done flag");
+            assertArrayEquals(Arrays.copyOfRange(data, (int) chunkBytes, data.length), (byte[]) c2.getPayload(),
+                    "the done chunk is a real slice of the capture, not an empty terminator");
+
+            // No empty trailer: nothing in the transfer so far is zero-byte, and once the
+            // done-reply completes the transfer, no further pass may emit another chunk at all.
+            assertTrue(laggard.installSnapshotsSent.stream().allMatch(i -> ((byte[]) i.getPayload()).length > 0),
+                    "a capture of exactly two chunks carries no zero-byte chunk");
+            final int installsBeforeCompletion = laggard.installSnapshotsSent.size();
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, LAST_INDEX, (long) data.length));
+            assertEquals(new TermIndex(TERM, LAST_INDEX), laggard.getTermIndex(), "the installed boundary is adopted as the follower's new tail");
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            assertEquals(installsBeforeCompletion, laggard.installSnapshotsSent.size(), "a completed transfer emits NO further chunk, empty or otherwise");
+            assertTrue(laggard.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "post-completion traffic to the laggard is heartbeats only");
+
+            closeCurrent(node);
+        } finally {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = originalChunkBytes;
+        }
+    }
+
     // ---- SNAPSHOT STORE (stage 6b): compaction persists the wire bytes before the trim ----
 
     @Test
@@ -477,6 +576,52 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
                     .orElseThrow(() -> new AssertionError("compaction must persist the snapshot"));
             assertEquals(new TermIndex(TERM, LAST_INDEX), stored.boundary(), "the boundary is the committed point");
             assertArrayEquals(chunk(payload), stored.payload(), "the store holds the leader's one serialization");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void compactionWithFailingSnapshotStore_failsClosed_logNotTrimmed_committedStillAdvanced() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            node.setSnapshotSupplier(() -> new Snapshot(TERM, LAST_INDEX, Map.of()));
+            final SnapshotStore failing = new SnapshotStore() {
+                @Override
+                public void save(TermIndex boundary, byte[] payload) {
+                    throw new IllegalStateException("simulated snapshot-store failure");
+                }
+
+                @Override
+                public Optional<SnapshotStore.Stored> loadLatest() {
+                    return Optional.empty();
+                }
+            };
+            node.setSnapshotStore(failing);
+
+            // Same gate-satisfaction as the stage-6b test: quorum at the committed point,
+            // every live follower there, supplier set -- compaction is triggered.
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection caughtUp = new RecordingConnection("caughtUp", new TermIndex(TERM, LAST_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(caughtUp);
+
+            // THE CORE (6c): the failing save aborts the compaction BEFORE the trim and the
+            // error escapes to the caller instead of being swallowed -- the leader fails
+            // closed: the commit advanced (happening first) but the log is left fully intact
+            // and no snapshot is recorded in it, so the next ack retries the capture.
+            assertThrows(IllegalStateException.class,
+                    () -> leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX))),
+                    "a failed save is a hard error, not a silent skip");
+
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex(),
+                    "the commit advance happens before the compaction gate and is not rolled back");
+            assertFalse(node.logs.hasStartPointSnapshot(), "fail-safe: no snapshot is recorded in the log");
+            // UN-trimmed: every entry behind the commit point is still addressable. Had the
+            // trim run, only the boundary record would remain and this range would be empty.
+            assertEquals(LAST_INDEX - LAGGARD_INDEX, node.logs.getLogRange(new TermIndex(TERM, LAGGARD_INDEX), 10).size(),
+                    "fail-safe: the log was not trimmed while the snapshot save failed");
             closeCurrent(node);
         }
     }

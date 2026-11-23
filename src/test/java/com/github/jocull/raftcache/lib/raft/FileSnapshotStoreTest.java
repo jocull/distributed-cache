@@ -84,6 +84,28 @@ class FileSnapshotStoreTest {
     }
 
     @Test
+    void orphanTempFiles_areInvisibleToLoadLatest(@TempDir Path dir) {
+        // A save that dies mid-write (the process crashes between temp-file creation and the
+        // atomic move) leaves a .tmp behind in the directory: loadLatest must never read it
+        // as a snapshot, whatever boundary it would nominally claim.
+        final FileSnapshotStore store = new FileSnapshotStore(dir);
+        store.save(new TermIndex(5, 10L), PAYLOAD_A);
+
+        try {
+            // Deliberately name the orphan for a HIGHER boundary than the real snapshot: if
+            // .tmp files were parsed, max-by-boundary would "recover" it and this test fails.
+            Files.write(dir.resolve("raft-snapshot-99-99.tmp"), new byte[]{0x01, 0x02});
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to simulate an orphan .tmp", e);
+        }
+
+        assertEquals(2, files(dir).size(), "sanity: the orphan physically exists next to the real snapshot");
+        final SnapshotStore.Stored stored = store.loadLatest().orElseThrow();
+        assertEquals(new TermIndex(5, 10L), stored.boundary(), "a .tmp file is not a snapshot, even when named for a later boundary");
+        assertArrayEquals(PAYLOAD_A, stored.payload(), "loadLatest returns the real snapshot's bytes");
+    }
+
+    @Test
     void epochBoundary_roundTrips(@TempDir Path dir) {
         final FileSnapshotStore store = new FileSnapshotStore(dir);
         store.save(new TermIndex(0, 0L), PAYLOAD_A);
