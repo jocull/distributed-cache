@@ -1112,6 +1112,92 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
         }
     }
 
+    // ---- Stage 6h: a hostile acked tail is refused before adoption, commit or send ----
+
+    /**
+     * Stage 6h: the leader's ack path is the mirror image of the follower's append path
+     * (same 6(h) surface): both of its branches feed the follower's reported tail
+     * straight into {@code new TermIndex(...)} -- the rewind on the failure branch
+     * ({@code setTermIndex}) and the adoption on the success branch -- whose constructor
+     * throws IAE for a negative index (the stage 6(g) root mechanism, this time on the
+     * ack path). Without a guard either pin below would IAE out of the handler before
+     * anything else could run: no adoption, no commit alignment, no catch-up send, no
+     * pacing update -- but the throw itself escapes to the caller, which is the hazard.
+     * An ack has no reply to send (the follower already spoke), so the refusal is the
+     * sibling of the 6(g) follower-side one in shape, not in wording: a warn and an
+     * ignore -- the connection's book-keeping, the log, and the leadership state must be
+     * byte-for-byte untouched, and the next legitimate ack or heartbeat moves the
+     * replication along. Each pin drives one branch so both constructions are covered.
+     */
+    @Test
+    void negativeAckedTail_successAck_isRefusedBeforeAnyAdoption() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final RecordingConnection follower = new RecordingConnection("follower");
+
+            leader.onAcknowledgeEntries(follower, new AcknowledgeEntries(TERM, true, ti(TERM, -1)));
+
+            assertEquals(new TermIndex(0, 0L), follower.getTermIndex(),
+                    "a refused ack must not adopt the follower's reported tail");
+            assertEquals(0L, node.logs.getCommittedTermIndex().getIndex(),
+                    "a refused ack must not run commit alignment");
+            assertTrue(follower.appendEntriesSent.isEmpty(),
+                    "a refused ack must not trigger the continuation catch-up send");
+            assertEquals(Instant.EPOCH, follower.getLastEntriesAcknowledged(),
+                    "a refused ack must not touch the pacing stamps");
+            assertEquals(NodeStates.LEADER, stateOf(node), "refusal is not a step-down");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void negativeAckedTail_failureAck_isRefusedBeforeTheRewind() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final RecordingConnection follower = new RecordingConnection("follower");
+
+            leader.onAcknowledgeEntries(follower, new AcknowledgeEntries(TERM, false, ti(TERM, -1)));
+
+            // The failure branch's first mutation is the rewind to the reported tail --
+            // the very construction that would IAE without the guard.
+            assertEquals(new TermIndex(0, 0L), follower.getTermIndex(),
+                    "a refused ack must not rewind the connection to the hostile tail");
+            assertEquals(0L, node.logs.getCommittedTermIndex().getIndex(),
+                    "a refused ack must not move the commit point");
+            assertTrue(follower.appendEntriesSent.isEmpty(),
+                    "a refused ack must not send anything");
+            assertEquals(NodeStates.LEADER, stateOf(node), "refusal is not a step-down");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void nullAckedTail_isRefusedWithoutThrowing() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final RecordingConnection follower = new RecordingConnection("follower");
+
+            // A wire field is absent (null): equally hostile -- both branches call the
+            // tail's getters, so without the guard this NPEs out of the handler.
+            leader.onAcknowledgeEntries(follower, new AcknowledgeEntries(TERM, true, null));
+
+            assertEquals(new TermIndex(0, 0L), follower.getTermIndex(),
+                    "a refused ack must not adopt the follower's reported tail");
+            assertEquals(0L, node.logs.getCommittedTermIndex().getIndex(),
+                    "a refused ack must not run commit alignment");
+            assertTrue(follower.appendEntriesSent.isEmpty(),
+                    "a refused ack must not send anything");
+            assertEquals(NodeStates.LEADER, stateOf(node), "refusal is not a step-down");
+            closeCurrent(node);
+        }
+    }
+
     /**
      * A minimal mutable {@link NodeConnectionOutbound}: the leader's send path mutates its
      * term-index and pacing stamps, so (unlike the read-only pre-vote stubs) the accessors

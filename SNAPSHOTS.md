@@ -19,6 +19,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(e) | non-happy-path hardening (third pass): the follower's `onInstallSnapshot` refuses a **negative `offset` cursor** (a byte position is never < 0) by tearing down the in-progress transfer and answering with the restart-at-byte-0 cursor — previously it would fall into the "duplicate" branch and re-advertise the stale cursor; an **explicit null payload** is refused like a non-`byte[]` one (tear-down + cursor-0 refusal, election timer rescheduled) — previously it NPEd at `chunk.length` and escaped the handler **with no reply at all** (unreachable via the public API: the `InstallSnapshot` constructor already null-guards the payload, a boundary pin now asserts that invariant); the leader's `onInstallSnapshotResponse` needed **no** change — the two untested edges of its completion predicate are pinned instead: a same-term reply that arrives with **no transfer in flight** (late/duplicated/mis-routed) completes cleanly (tail adopted, commit advanced, and nothing fabricated to retransmit, since no capture was ever pinned), and a reply whose **cursor runs past the last byte of the pinned capture** while its index stays below the boundary completes the transfer — the next pass is a FRESH install from byte 0 of the same pinned capture, never a "resume" that would AIOOBE `Arrays.copyOfRange` | `stage 6(e)` |
 | 6(f) | non-happy-path hardening (fourth pass): the other side of the leader's laggard decision — a follower **strictly below** the compacted start point receives the install even when its gap is BELOW `SNAPSHOT_TRIGGER_ENTRIES` (branch (a) has no threshold: an append replay there is a permanent empty stream, `getLogRange` serves nothing at or below the seed), a follower **AT** the boundary gets only empty heartbeats, no install (the "strictly below" edge pinned from the other side), and an `InstallSnapshotResponse` carrying a **lower** term is an ordinary completion on the index axis — leadership kept (step-down only on a *strictly higher* term, `onAcknowledgeEntries` parity), reported tail still adopted (no production change: three pins, and the pins themselves surfaced a test-hygiene gap — send-count assertions must be bounds + per-message properties, never exact counts, because the 50 ms background heartbeat timer legitimately interleaves) | `stage 6(f)` |
 | 6(g) | non-happy-path hardening (fifth pass): the last unguarded escape sites behind the 6d/6e-style guards, sharing one root mechanism — `TermIndex`'s constructor throws IAE on a negative term or index, and two handlers feed wire values into it **without guarding those axes**. Leader: the completion branch of `onInstallSnapshotResponse` adopts the reply's term/index into `new TermIndex(...)` (the 6d clamp covered the cursor axis only) — and *after* `snapshotsInFlight` has already been deleted, so the IAE escaped mid-cleanup, leaving the leader half-processed; each negative axis is now clamped to the closest legal value, 0 (a negative term never exceeds ours, so step-down semantics are unchanged). Follower: the accept path builds `new TermIndex(lastIncludedTerm, lastIncludedIndex)` *after* recording the sender as leader (the index axis is structurally S2-gated — strictly beyond the tail — the term axis is not), so a same-term peer with boundary term `-1` IAEd *post-mutation*; it is now refused before ANY state change, in the exact shape of the negative-offset guard (offset-0 reply + `scheduleNextElectionTimeout`, no half-transfer left to absorb the next chunk) | `stage 6(g)` |
+| 6(h) | non-happy-path hardening (sixth pass): the remaining hostile-wire-tail escapes on the replication path, the 6(g) root mechanism (`TermIndex` constructor IAE/NPE) on the append/ack surface — the follower's `onAppendEntries` feeds three of the wire axes (prev-log pointer, each entry's term/index, the leader commit index) into `new TermIndex(...)` unguarded (a negative or missing field threw mid-handler after the sender was already recorded as leader, and, for the entry/commit axes, after entries were already appended), now **refused** before any state change in the shape of the sibling refusals (false ack carrying our own unchanged tail) — no clamping here, because clamping a mid-log position or match point would manufacture a bogus append or a phantom match; the leader's `onAcknowledgeEntries` feeds the follower's reported tail into `new TermIndex(...)` in **both** branches (the failure-branch rewind, the success-branch adoption), and a negative or missing tail threw before adoption, commit alignment or the catch-up send could run, now **refused as warn + ignore** (no reply exists on the ack path; connection book-keeping, log, and leadership are byte-for-byte untouched) | `stage 6(h)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -27,7 +28,10 @@ pre-existing skip**; after stage 6(e): **336 tests green, 0 failures, 1
 pre-existing skip** (baseline 332 + 4 new pins: 2 follower hardening refusals + 2 leader
 stale/over-length reply pins); and after stage 6(f): **339 tests green, 0 failures, 1
 pre-existing skip** (+3 leader laggard-branch pins); and after stage 6(g): **341 tests
-green, 0 failures, 1 pre-existing skip** (+2: one pin per TermIndex IAE escape).
+green, 0 failures, 1 pre-existing skip** (+2: one pin per TermIndex IAE escape); and
+after stage 6(h): **347 tests green, 0 failures, 1 pre-existing skip** (+6: three
+follower append-path refusal pins and three leader ack-path refusal pins, closing the
+append/ack surface of the 6(g) hostile-wire-tail mechanism).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -425,3 +429,61 @@ Isolated runs: leader install-snapshot class **21 green**, follower install-snap
 **20 green** (one new pin each). Final suite: **341 tests green, 0 failures, 1 pre-existing
 skip** (+2 over the 6(f) baseline: the leader reply-axes clamp pin and the follower
 negative-boundary-term refusal pin).
+
+**Non-happy-path hardening pass, sixth round (2026-11-23, stage 6(h))** — the last two
+unguarded sites of the 6(g) mechanism, on the replication path: the append and ack wire
+values still feed `new TermIndex(...)` without guarding their axes, and both are the
+*post-mutation* throw kind stage 6(e) showed to be the dangerous one.
+
+**Follower — `onAppendEntries` (production change).** The accept path feeds three wire
+axes into `new TermIndex(...)`: the previous-log pointer, every entry's term/index, and
+the leader's commit index (the catch-all debug line builds one too). None of the axes is
+validity-checked before consumption, so a hostile or corrupted append carrying one of
+them would reach the throw AFTER the accept path had already recorded the sender as
+leader — and, for the entry and commit axes, after some entries were already appended.
+The guard (a `hasHostileWireTermIndex` check on all three axes: null, negative term, or
+negative index) is placed after the term ladder (a strictly higher term still steps us
+down, a strictly lower term still refuses) and before every mutation site below. The
+refusal takes the exact shape of the sibling refusals in this handler: a false ack
+carrying our own (unchanged) tail, zero state change — `leaderId` still null, log and
+commit point at the epoch, nothing applied. A null wire field is hostile for the same
+family: it NPEs out of the wire getter before the negative IAE even fires. Clamping is
+deliberately **not** the tool here the way it was in 6(g): clamping an entry position
+or a match point would manufacture a bogus append or a phantom match, converting a
+refusal into corruption.
+
+**Leader — `onAcknowledgeEntries` (production change).** The mirror image on the ack
+path: both branches feed the follower's reported tail into `new TermIndex(...)` — the
+failure branch's rewind (`setTermIndex`, its first mutation) and the success branch's
+adoption (ahead of `updateCommittedIndex()`, the pacing stamps, and the
+CONTINUATION catch-up send). A null or negative tail would IAE/NPE out of the handler
+before any of that ran; the throw itself escaping to the caller is the hazard. The guard
+sits between the step-down check (a strictly higher term still steps the leader down)
+and the branches. The refusal is a warn and an ignore: there is no reply to send on the
+ack path (the follower already spoke), so the contract is zero side effect — no tail
+adopted, no rewind, no commit move, no pacing update, nothing sent, and no step-down
+(equally, a refusal must not be misread as a higher-term claim). The next legitimate ack
+or the heartbeat moves replication along.
+
+**Pins, one per axis per branch (six total).** Follower: a negative entry index; a
+negative leader-commit index (entries empty, so the commit-alignment site is the one
+reached); a null entry term/index (the NPE-before-IAE family). Each keeps the
+previous-log pointer valid — the epoch, which a fresh log holds — so `containsStartPoint`
+passes and the guard, not another check, is what the pin proves. Leader: a negative-index
+ack on the success branch, a negative-index ack on the failure branch, a null acked
+tail. All assert the refusal contract: the zero-state-change shape (follower `leaderId`
+still null; leader tail still `(0,0)`, commit still index 0, pacing still the epoch) and
+leadership undisturbed (a refusal is not a step-down). Exact empty-send assertions are
+safe on these pins in a way the 6(f) bound convention would not have allowed: the guard
+fires before the send paths, and the leader pins run with no connection in
+`activeConnections`, so nothing — not even the 50 ms heartbeat timer — is scheduled to
+send.
+
+Isolated runs: leader install-snapshot class **24 green**, follower install-snapshot
+class **23 green** (three new pins each). Final suite: **347 tests green, 0 failures,
+1 pre-existing skip** (+6 over the 6(g) baseline: three follower append-path refusals
+and three leader ack-path refusals). The append/ack surface of the 6(g) mechanism is now
+exhausted; the same question over the vote path still open (recorded here, not yet
+pinned): `onVoteRequest` and `onPreVoteRequest` compare the last log entry's term/index
+against the incoming request's term/index — two more sites where a hostile wire value
+meets the same unguarded constructors and comparators, and the natural 6(i) candidate.

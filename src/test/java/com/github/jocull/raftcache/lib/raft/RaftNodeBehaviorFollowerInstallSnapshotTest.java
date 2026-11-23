@@ -322,6 +322,108 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
         }
     }
 
+    // ---- Stage 6h: hostile wire term/indexes on the append path are refused before any mutation ----
+
+    /**
+     * Stage 6h: the accept path feeds the append's wire axes -- each entry's term/index,
+     * the previous-log pointer, and the leader's commit index -- straight into
+     * {@code new TermIndex(...)}, whose constructor throws for a negative term or index
+     * (the stage 6(g) root mechanism, this time on the replication path). None of those
+     * axes is validity-checked first, so a hostile or corrupted append carrying one would
+     * throw mid-handler AFTER the sender was already recorded as leader (and, for the
+     * entries and the commit index, after some entries are already appended) -- the
+     * "throw after mutation" class stage 6(g) closed on the snapshot path. A missing
+     * field is hostile too: it NPEs out of the wire getters first. The refusal below must
+     * therefore precede ALL of that: one false ack carrying our own tail, zero state
+     * change. These pins keep the previous-log pointer valid (the epoch, which a fresh
+     * log holds) so each one isolates exactly the axis being refused.
+     */
+    @Test
+    void appendCarryingANegativeEntryIndex_isRefusedBeforeAnyMutation() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // Without the guard this append sails past containsStartPoint (the epoch IS
+            // held), records the sender as leader, and THEN throws IAE out of the entry's
+            // term-index. The pin asserts that never happens: a clean refusal instead.
+            follower.currentReceiver().onAppendEntries(leader,
+                    new AppendEntries(0, wire(0, 0), wire(0, 0),
+                            List.of(new AppendEntries.RaftLog(wire(0, -1), "hostile-entry"))));
+
+            assertEquals(1, leader.acknowledges().size(), "an append carrying a hostile index must be answered");
+            assertFalse(leader.acknowledges().get(0).isSuccess(), "structurally invalid entries must be rejected");
+            assertEquals(0L, leader.acknowledges().get(0).getCurrentTermIndex().getIndex(),
+                    "the refusal carries our unchanged (epoch) tail");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "an append we refuse must not install a leader");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is untouched by the refusal");
+            assertEquals(0L, follower.logs.getCommittedTermIndex().getIndex(), "the commit point is untouched by the refusal");
+            assertEquals(0L, bridge.getLastAppliedIndex(), "nothing is applied to the state machine");
+        }
+    }
+
+    @Test
+    void appendCarryingANegativeLeaderCommitIndex_isRefusedBeforeAnyMutation() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // The commit-alignment axis: without the guard the append would be accepted
+            // (no entries to append) and the IAE would only fire when the commit advanced,
+            // again after the leaderId mutation.
+            follower.currentReceiver().onAppendEntries(leader,
+                    new AppendEntries(0, wire(0, 0), wire(0, -1), List.of()));
+
+            assertEquals(1, leader.acknowledges().size(), "an append carrying a hostile commit index must be answered");
+            assertFalse(leader.acknowledges().get(0).isSuccess(), "a structurally invalid commit index must be rejected");
+            assertEquals(0L, leader.acknowledges().get(0).getCurrentTermIndex().getIndex(),
+                    "the refusal carries our unchanged (epoch) tail");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "an append we refuse must not install a leader");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is untouched by the refusal");
+            assertEquals(0L, follower.logs.getCommittedTermIndex().getIndex(), "the commit point is untouched by the refusal");
+        }
+    }
+
+    @Test
+    void appendCarryingANullEntryTermIndex_isRefusedWithoutThrowing() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // A wire field is absent (null): equally hostile -- without the guard it would
+            // NPE out of the getters on the accept path, again after the leaderId mutation.
+            follower.currentReceiver().onAppendEntries(leader,
+                    new AppendEntries(0, wire(0, 0), wire(0, 0),
+                            List.of(new AppendEntries.RaftLog(null, "hostile-entry"))));
+
+            assertEquals(1, leader.acknowledges().size(), "an append carrying a missing term/index must be answered");
+            assertFalse(leader.acknowledges().get(0).isSuccess(), "a structurally invalid entry must be rejected");
+            assertEquals(0L, leader.acknowledges().get(0).getCurrentTermIndex().getIndex(),
+                    "the refusal carries our unchanged (epoch) tail");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "an append we refuse must not install a leader");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is untouched by the refusal");
+            assertEquals(0L, follower.logs.getCommittedTermIndex().getIndex(), "the commit point is untouched by the refusal");
+        }
+    }
+
     // ---- Chunked transfer (stage 6a): byte[] chunks, byte cursor, in-order assembly ----
 
     @Test

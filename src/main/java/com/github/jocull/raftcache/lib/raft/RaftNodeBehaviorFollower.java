@@ -257,6 +257,30 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         }
     }
 
+    /**
+     * Stage 6(h) (SNAPSHOTS.md stage 6(h)): does this append carry a structurally invalid
+     * term/index in any of the three wire fields the accept path feeds into
+     * {@code new TermIndex(...)} — prev-log index, each entry's index, and the leader
+     * commit index? A missing field is hostile too: it would NPE out of the wire getters
+     * before the constructor's negative IAE even fires.
+     */
+    private static boolean hasHostileWireTermIndex(AppendEntries appendEntries) {
+        if (isHostileWireTermIndex(appendEntries.getPreviousLogTermIndex())
+                || isHostileWireTermIndex(appendEntries.getLeaderCommitTermIndex())) {
+            return true;
+        }
+        for (AppendEntries.RaftLog entry : appendEntries.getEntries()) {
+            if (isHostileWireTermIndex(entry.getTermIndex())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isHostileWireTermIndex(com.github.jocull.raftcache.lib.raft.messages.TermIndex wire) {
+        return wire == null || wire.getTerm() < 0 || wire.getIndex() < 0;
+    }
+
     @Override
     public void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries) {
         // A live leader just spoke: any in-flight pre-vote round is moot. Invalidate it
@@ -277,6 +301,29 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
                 currentTermIndex.getTerm(), currentTermIndex.getIndex());
         if (appendEntries.getTerm() < term) {
             LOGGER.warn("{} Received append entries from {} for a term lower than current term: {} vs {}", self.getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term);
+            sender.sendAcknowledgeEntries(new AcknowledgeEntries(term, false, currentTermIndexMessage));
+            return;
+        }
+
+        // (6h) Fail-closed structural guard (SNAPSHOTS.md stage 6h): the accept path below
+        // feeds three of this message's wire values -- the prev-log index, every entry's
+        // index, and the leader's commit index -- straight into new TermIndex(...), whose
+        // constructor throws IAE for a negative term or index (the stage 6(g) root
+        // mechanism, this time on the replication path instead of the snapshot path).
+        // A missing field is hostile too, NPE-ing out of the wire getters first.
+        // None of those three axes is validity-checked before it is consumed: a hostile
+        // or corrupted append carrying one would throw out of the constructor AFTER the
+        // leaderId mutation below and, for the entries and the commit index, after some
+        // entries are already appended -- the same "throw after mutation" class stage
+        // 6(g) closed on the snapshot path. Reject the whole append
+        // before any state change, in the exact shape of the sibling refusals above
+        // (a false ack answering the message, zero state change; the leader's next
+        // heartbeat retries). A clamp cannot be used here the way 6(g)'s tail adoption
+        // did: clamping an entry position or the match point would manufacture a bogus
+        // append or a phantom match.
+        if (hasHostileWireTermIndex(appendEntries)) {
+            LOGGER.warn("{} Received append entries from {} carrying a negative term or index ({} @ term {}) - refusing",
+                    self.getId(), sender.getRemoteNodeId(), appendEntries, term);
             sender.sendAcknowledgeEntries(new AcknowledgeEntries(term, false, currentTermIndexMessage));
             return;
         }

@@ -481,6 +481,23 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             self.convertToFollower(acknowledgeEntries.getTerm(), Function.identity());
             return;
         }
+        // (6h) Fail-closed structural guard (SNAPSHOTS.md stage 6h): both branches below
+        // feed the ack's reported tail straight into new TermIndex(...) (the stage 6(g)
+        // root mechanism, this time on the ack path). A null or negative term or index
+        // there would NPE/IAE out mid-handler, leaving the follower's ack unacted on and
+        // the commit reconciliation never run. A missing field is hostile for the same
+        // reason. The reported tail is book-keeping adopted by setTermIndex and (on the
+        // success branch) drives updateCommittedIndex, so an ack carrying such a tail is
+        // simply not acted on: not adopted, no commit, nothing sent. There is no reply to
+        // send on the ack path (the follower has already spoken), so the refusal is a
+        // warn + ignore -- the next legitimate ack or heartbeat moves on.
+        final com.github.jocull.raftcache.lib.raft.messages.TermIndex ackedTail =
+                acknowledgeEntries.getCurrentTermIndex();
+        if (ackedTail == null || ackedTail.getTerm() < 0 || ackedTail.getIndex() < 0) {
+            LOGGER.warn("{} Received AcknowledgeEntries from {} reporting a negative tail ({} @ term {}) - refusing",
+                    self.getId(), sender.getRemoteNodeId(), ackedTail, term);
+            return;
+        }
         if (!acknowledgeEntries.isSuccess()) {
             LOGGER.warn("{} Received AcknowledgeEntries without success from {}: {}, {} @ term {}", self.getId(), sender.getRemoteNodeId(), acknowledgeEntries.getTerm(), acknowledgeEntries.getCurrentTermIndex(), acknowledgeEntries.getTerm());
             final TermIndex previous = sender.getTermIndex();
