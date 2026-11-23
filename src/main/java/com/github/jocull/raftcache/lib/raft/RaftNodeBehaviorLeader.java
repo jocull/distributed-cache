@@ -5,6 +5,8 @@ import com.github.jocull.raftcache.lib.raft.events.AppendLog;
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshot;
+import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshotResponse;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.VoteRequest;
@@ -19,16 +21,29 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     private final int heartbeatTimeoutMillis = 50;
 
+    /**
+     * A follower this far (by index) below the committed point is a "laggard" (SNAPSHOTS.md
+     * stage 5): resending log entries to it is exactly the slow path the snapshot exists to
+     * skip, so it is switched to {@link InstallSnapshot} until acknowledged. Small on
+     * purpose -- this is a low-write cache workload, not a bulk-replication log, so a few
+     * missed entries already qualify; a single entry can never trigger it while progress
+     * is normal.
+     */
+    static final int SNAPSHOT_TRIGGER_ENTRIES = 5;
+
     private CompletableFuture<?> heartbeatTimeout;
 
     private final EventSubscriber entriesSubscriber;
 
-    private enum AppendEntriesTrigger {
+    // Package-visible (not private) so same-package unit tests can drive the send path
+    // deterministically without waiting on the node executor.
+    enum AppendEntriesTrigger {
         INITIAL,
         TIMEOUT,
         CONTINUATION,
@@ -85,7 +100,9 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
         appendEntries(AppendEntriesTrigger.TIMEOUT);
     }
 
-    private void appendEntries(AppendEntriesTrigger trigger) {
+    // Package-visible so same-package unit tests can drive the send path directly
+    // (otherwise appendEntries is only reachable through the event bus / executor).
+    void appendEntries(AppendEntriesTrigger trigger) {
         final TermIndex committedTermIndex = self.logs.getCommittedTermIndex();
         final com.github.jocull.raftcache.lib.raft.messages.TermIndex committedTermIndexMessage =
                 new com.github.jocull.raftcache.lib.raft.messages.TermIndex(committedTermIndex.getTerm(), committedTermIndex.getIndex());
@@ -94,6 +111,46 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             if (!c.shouldSendNextEntries(heartbeatTimeoutMillis)) {
                 LOGGER.debug("{} Still waiting for ack before send entries to {} - last send {}, receive {}", self.id, c.getRemoteNodeId(), c.getLastEntriesSent(), c.getLastEntriesAcknowledged());
                 return;
+            }
+
+            // Laggard switch (SNAPSHOTS.md stage 5, Raft §7): this follower is far enough
+            // behind the committed point that replaying them one by one is the slow path --
+            // install a snapshot instead, then resume appends behind its boundary. Only
+            // when a snapshot source is available (a plain raft cluster with no state
+            // machine keeps the old behavior: appends, forever).
+            //
+            // The send above is gated by the same pacing/ack rule as appends, which makes
+            // this a natural RETRANSMIT: if the InstallSnapshot or its reply is lost, the
+            // follower's nextIndex never advances, the laggard condition still holds on the
+            // next tick, and this branch sends the install again instead of stalling. That
+            // is safe because delivery is idempotent -- a follower refuses (or no-ops) a
+            // snapshot that makes no progress beyond its tail (S2) and answers with its own
+            // term + tail either way (RaftNodeBehaviorFollower#onInstallSnapshot), so the
+            // leader's nextIndex converges to the truth on the first reply that lands.
+            final Supplier<Object> snapshotSupplier = self.snapshotSupplier();
+            if (snapshotSupplier != null
+                    && committedTermIndex.getIndex() - c.getTermIndex().getIndex() >= SNAPSHOT_TRIGGER_ENTRIES) {
+                final Object payload = snapshotSupplier.get();
+                if (payload == null) {
+                    // The state machine refused to capture (e.g. nothing applied yet):
+                    // fall back to the slow replay path rather than stall this follower.
+                    LOGGER.warn("{} Follower {} is {} behind committed {} but the snapshot source returned null - falling back to appends",
+                            self.id, c.getRemoteNodeId(), committedTermIndex.getIndex() - c.getTermIndex().getIndex(), committedTermIndex);
+                } else {
+                    LOGGER.info("{} Follower {} is {} below committed {} - sending InstallSnapshot instead of appends",
+                            self.id, c.getRemoteNodeId(),
+                            committedTermIndex.getIndex() - c.getTermIndex().getIndex(), committedTermIndex);
+                    c.sendInstallSnapshot(new InstallSnapshot(
+                            term,
+                            self.getId(),
+                            committedTermIndex.getIndex(),
+                            committedTermIndex.getTerm(),
+                            0L,
+                            payload,
+                            true));
+                    c.setLastEntriesSent(Instant.now());
+                    return; // inside the forEach lambda: this is the "continue" for this connection
+                }
             }
 
             final List<AppendEntries.RaftLog> entries = self.logs.getLogRange(c.getTermIndex(), 200, this::transformLog);
@@ -187,6 +244,26 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                 // as committed before it has taken effect.
                 self.eventBus.publish(new LogsCommitted(committedLogs));
                 self.logs.notifyCommitted(committedLogs);
+                // SNAPSHOT: now that the state machine has just observed exactly this
+                // boundary (S4: the snapshot is a pure function of the applied state),
+                // compact the log behind it -- but only if every live replica already
+                // holds it (S1: the new start point must not outrun any live follower's
+                // nextIndex; compact() itself still enforces the committed-index bound).
+                // A single-node cluster has no live followers to serve, so there is
+                // nothing to compact for and the state machine is the only consumer.
+                if (!self.getActiveConnections().isEmpty() && self.snapshotSupplier() != null
+                        && self.getActiveConnections().stream().allMatch(
+                                c -> c.getTermIndex().getIndex() >= majorityMinimumIndex.getIndex())) {
+                    final Object snapshotPayload = self.snapshotSupplier().get();
+                    if (snapshotPayload != null) {
+                        LOGGER.info("{} All live followers at committed {} - compacting snapshot payload",
+                                self.getId(), majorityMinimumIndex);
+                        self.logs.compact(majorityMinimumIndex, snapshotPayload);
+                    } else {
+                        LOGGER.warn("{} Follower caught up to {} but no snapshot payload available - cannot compact",
+                                self.getId(), majorityMinimumIndex);
+                    }
+                }
             }
         } else {
             LOGGER.debug("{} Not a majority to commit with {} (need {})", self.getId(), currentIndices, majorityCount);
@@ -288,6 +365,51 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
         sender.setLastEntriesAcknowledged(Instant.now());
 
         // Are there more entries to send? Go ahead and send them!
+        appendEntries(AppendEntriesTrigger.CONTINUATION);
+    }
+
+    /**
+     * A laggard finished installing the snapshot we sent (SNAPSHOTS.md stage 5): adopt the
+     * tail it reports as its new start point (Raft §7 -- its log now begins AT or BEYOND the
+     * boundary we captured to), and resume appending behind that point (the CONTINUATION
+     * path sends zero or more entries exactly as usual, which is the leader half of the
+     * post-snapshot recovery).
+     *
+     * <p>Term handling mirrors {@link #onAcknowledgeEntries}: a strictly higher term in the
+     * response means we are the laggard, step down. A lower-or-equal term is the normal
+     * reply from the follower we just installed. (The response carries no success flag: a
+     * follower only replies after installing, or with its own term when it refused on the
+     * term rule / S2 progress check -- both answered through the same fields we read here.)
+     */
+    @Override
+    public void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse) {
+        final int responseTerm = installSnapshotResponse.getTerm();
+        final long responseIndex = installSnapshotResponse.getIndex();
+
+        if (responseTerm > term) {
+            LOGGER.info("{} Received install-snapshot response from {} for term {} above our term {} - stepping down",
+                    self.getId(), sender.getRemoteNodeId(), responseTerm, term);
+            self.convertToFollower(responseTerm, Function.identity());
+            return;
+        }
+
+        // Normal acceptance: the follower reports its new log tail (>= the boundary we sent).
+        // There is no in-flight marker to release: the laggard condition simply stops holding
+        // once this nextIndex is above the committed point (and a lost reply is retried by
+        // the pacing gate, as the send path documents).
+        final TermIndex previous = sender.getTermIndex();
+        sender.setTermIndex(new TermIndex(responseTerm, responseIndex));
+        LOGGER.info("{} Follower {} installed to {} (was {}) - resuming appends",
+                self.getId(), sender.getRemoteNodeId(), responseIndex, previous);
+
+        // The install is itself an acknowledgement of everything up to the boundary:
+        // recompute the commit point in case the response's index outruns it, and let
+        // the CONTINUATION append path deliver any entries that sit behind the boundary
+        // (Raft §7 recovery). Marking the ack time clears the shouldSendNextEntries gate
+        // so the continuation actually sends on this same tick (the same ordering the
+        // AcknowledgeEntries path uses).
+        updateCommittedIndex();
+        sender.setLastEntriesAcknowledged(Instant.now());
         appendEntries(AppendEntriesTrigger.CONTINUATION);
     }
 }

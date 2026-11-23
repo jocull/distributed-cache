@@ -8,6 +8,7 @@ import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 public interface RaftNode {
     String getId();
@@ -55,4 +56,28 @@ public interface RaftNode {
     CompletableFuture<List<StateResponse>> getClusterNodeStates();
 
     <T> CompletableFuture<RaftLog<T>> submit(T entry);
+
+    /**
+     * Supplies the portable state this node's leader behavior would install on a laggard
+     * follower (SNAPSHOTS.md stage 5, Raft §7): a state-machine snapshot object the
+     * receiver's state machine understands, crossing the wire as a loose {@link Object}.
+     *
+     * <p>Default is a no-op: {@link RaftNode} implementations that carry no state machine
+     * to snapshot (test doubles, middleware fakes) simply never have their
+     * {@link #snapshotSupplier() supplier} consulted. A leader whose supplier is absent
+     * (or yields {@code null}) continues to recover laggards with plain {@link AppendEntries}
+     * only.
+     */
+    default void setSnapshotSupplier(Supplier<Object> snapshotSupplier) {
+        // Intentionally empty: see above.
+    }
+
+    /**
+     * The snapshot supplier installed via {@link #setSnapshotSupplier(Supplier)}, or
+     * {@code null} when this node carries no snapshot source. Readers treat {@code null}
+     * as "no snapshots" and fall back to log appends.
+     */
+    default Supplier<Object> snapshotSupplier() {
+        return null;
+    }
 }

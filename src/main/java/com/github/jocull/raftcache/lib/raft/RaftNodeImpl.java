@@ -20,6 +20,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 class RaftNodeImpl implements RaftNode {
@@ -56,6 +57,13 @@ class RaftNodeImpl implements RaftNode {
 
     // Log management
     final RaftLogs logs;
+
+    // Snapshot source (SNAPSHOTS.md stage 5): the state-machine snapshot the leader
+    // behavior would install on a laggard follower, captured through a loose Object so the
+    // Raft layer never names a state-machine type. null = no snapshots (plain appends only).
+    // volatile: wired from outside the node executor (the cache constructor reads on the
+    // caller's thread); the node executor only reads it afterwards.
+    private volatile Supplier<Object> snapshotSupplier = null;
 
     RaftNodeImpl(String id,
                  NodeAddress nodeAddress,
@@ -371,6 +379,16 @@ class RaftNodeImpl implements RaftNode {
                                 return stateResponses;
                             }, nodeExecutor);
                 }, nodeExecutor);
+    }
+
+    @Override
+    public void setSnapshotSupplier(Supplier<Object> snapshotSupplier) {
+        this.snapshotSupplier = snapshotSupplier;
+    }
+
+    @Override
+    public Supplier<Object> snapshotSupplier() {
+        return snapshotSupplier;
     }
 
     @Override
