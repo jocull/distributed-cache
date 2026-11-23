@@ -278,7 +278,13 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
 
             assertEquals(new TermIndex(TERM, LAST_INDEX), laggard.getTermIndex(), "the response's tail becomes the follower's new start point (Raft §7)");
             assertEquals(1, laggard.installSnapshotsSent.size(), "an accepted response must not re-send the snapshot");
-            assertTrue(laggard.appendEntriesSent.isEmpty(), "a follower at our tail has nothing further to receive (zero-entry CONTINUATION stays quiet)");
+            // Whatever reaches the laggard now (the zero-entry CONTINUATION, or a background
+            // heartbeat tick that re-armed and raced our assertions -- the 50 ms timer is
+            // rescheduled at the end of every send pass) must be an EMPTY append, never
+            // real entries: a strict isEmpty() here is racy for the same reason as the
+            // same-named assertion in allFollowersAtCommittedPoint_logCompactsToSnapshot.
+            assertTrue(laggard.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
+                    "a follower at our tail only ever receives empty heartbeats");
             // upToDate is at our tail: anything that reaches it (the quiet CONTINUATION, or a
             // background heartbeat tick) must be an EMPTY append -- never entries.
             assertTrue(upToDate.appendEntriesSent.stream().allMatch(a -> a.getEntries().isEmpty()),
@@ -286,7 +292,11 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
 
             assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex());
             assertEquals(NodeStates.LEADER, stateOf(node), "our own term in the response keeps us the leader");
-            assertFalse(node.logs.hasStartPointSnapshot(), "compaction waits until every live follower is at the point (the install is not yet acknowledged by the log)");
+            // The response already put the laggard at the committed point (the install IS the
+            // acknowledgement of everything up to it), so the compaction gate -- evaluated on
+            // every updateCommittedIndex call -- fires here and the log compacts now.
+            assertTrue(node.logs.hasStartPointSnapshot(), "every live follower is at the committed point after the install response, so the log compacts");
+            assertSame(payload, node.logs.getSnapshotPayload(), "the captured state becomes the portable start point");
             closeCurrent(node);
         }
     }

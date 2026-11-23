@@ -86,7 +86,15 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
                     Snapshot.class.getSimpleName());
             return;
         }
-        adopt((Snapshot) payload);
+        // The event's boundary is the authoritative one: it is the sender leader's
+        // lastIncludedTerm/lastIncludedIndex (Raft §7) -- the exact start point our own log
+        // was re-anchored on when the follower accepted the install. Rebind the payload's
+        // data to it before adopting, so a payload carrying a stale *internal* boundary
+        // (e.g. captured after a restart by a state machine whose applied position did not
+        // survive) cannot leave this node's applied position stranded at (0, 0); the data
+        // is whatever the sender's state machine held at that boundary.
+        final Snapshot source = (Snapshot) payload;
+        adopt(new Snapshot(snapshotInstalled.getTerm(), snapshotInstalled.getIndex(), source.entries()));
     }
 
     private void applyLog(RaftLog<?> raftLog) {

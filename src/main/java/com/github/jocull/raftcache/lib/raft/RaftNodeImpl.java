@@ -387,6 +387,11 @@ class RaftNodeImpl implements RaftNode {
     }
 
     @Override
+    public EventBus getEventBus() {
+        return eventBus;
+    }
+
+    @Override
     public Supplier<Object> snapshotSupplier() {
         return snapshotSupplier;
     }

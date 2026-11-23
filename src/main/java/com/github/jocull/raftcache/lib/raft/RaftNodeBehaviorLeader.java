@@ -113,11 +113,22 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                 return;
             }
 
-            // Laggard switch (SNAPSHOTS.md stage 5, Raft §7): this follower is far enough
-            // behind the committed point that replaying them one by one is the slow path --
-            // install a snapshot instead, then resume appends behind its boundary. Only
-            // when a snapshot source is available (a plain raft cluster with no state
-            // machine keeps the old behavior: appends, forever).
+            // Laggard switch (SNAPSHOTS.md stage 5, Raft §7): appends alone can no longer
+            // catch this follower up -- install a snapshot instead, then resume appends
+            // ahead of its boundary. Only when a snapshot source is available (a plain
+            // raft cluster with no state machine keeps the old behavior: appends, forever).
+            //
+            // Two triggers; either of them sends the install:
+            //   (a) BELOW THE START POINT -- the follower's index is strictly below the
+            //       log's compacted boundary, so it needs at least one entry the leader
+            //       has already dropped. getLogRange never serves records at or below the
+            //       seed, so no append sequence can bridge the gap: the snapshot is the
+            //       ONLY catch-up path (Raft §7.2 -- the leader "sends the snapshot if
+            //       the follower is missing entries"). No threshold applies here. Strictly
+            //       below, because the boundary record itself survives and a follower AT
+            //       the boundary replays the entries behind it normally.
+            //   (b) BEYOND A THRESHOLD GAP -- the committed gap is large enough that
+            //       replay is the slow path; the snapshot is the fast path.
             //
             // The send above is gated by the same pacing/ack rule as appends, which makes
             // this a natural RETRANSMIT: if the InstallSnapshot or its reply is lost, the
@@ -128,18 +139,24 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             // term + tail either way (RaftNodeBehaviorFollower#onInstallSnapshot), so the
             // leader's nextIndex converges to the truth on the first reply that lands.
             final Supplier<Object> snapshotSupplier = self.snapshotSupplier();
+            final long followerIndex = c.getTermIndex().getIndex();
+            final TermIndex startPoint = self.logs.getStartTermIndex();
             if (snapshotSupplier != null
-                    && committedTermIndex.getIndex() - c.getTermIndex().getIndex() >= SNAPSHOT_TRIGGER_ENTRIES) {
+                    && (followerIndex < startPoint.getIndex()
+                        || committedTermIndex.getIndex() - followerIndex >= SNAPSHOT_TRIGGER_ENTRIES)) {
                 final Object payload = snapshotSupplier.get();
                 if (payload == null) {
-                    // The state machine refused to capture (e.g. nothing applied yet):
+                    // The state machine refused to capture (e.g. nothing to capture yet):
                     // fall back to the slow replay path rather than stall this follower.
+                    // (For a below-start-point follower that replay path is empty, but a
+                    // null capture only ever happens while nothing has been applied, which
+                    // is transient as soon as entries exist.)
                     LOGGER.warn("{} Follower {} is {} behind committed {} but the snapshot source returned null - falling back to appends",
-                            self.id, c.getRemoteNodeId(), committedTermIndex.getIndex() - c.getTermIndex().getIndex(), committedTermIndex);
+                            self.id, c.getRemoteNodeId(), committedTermIndex.getIndex() - followerIndex, committedTermIndex);
                 } else {
-                    LOGGER.info("{} Follower {} is {} below committed {} - sending InstallSnapshot instead of appends",
+                    LOGGER.info("{} Follower {} is {} below committed {} (start point {}) - sending InstallSnapshot instead of appends",
                             self.id, c.getRemoteNodeId(),
-                            committedTermIndex.getIndex() - c.getTermIndex().getIndex(), committedTermIndex);
+                            committedTermIndex.getIndex() - followerIndex, committedTermIndex, startPoint);
                     c.sendInstallSnapshot(new InstallSnapshot(
                             term,
                             self.getId(),
@@ -244,29 +261,37 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                 // as committed before it has taken effect.
                 self.eventBus.publish(new LogsCommitted(committedLogs));
                 self.logs.notifyCommitted(committedLogs);
-                // SNAPSHOT: now that the state machine has just observed exactly this
-                // boundary (S4: the snapshot is a pure function of the applied state),
-                // compact the log behind it -- but only if every live replica already
-                // holds it (S1: the new start point must not outrun any live follower's
-                // nextIndex; compact() itself still enforces the committed-index bound).
-                // A single-node cluster has no live followers to serve, so there is
-                // nothing to compact for and the state machine is the only consumer.
-                if (!self.getActiveConnections().isEmpty() && self.snapshotSupplier() != null
-                        && self.getActiveConnections().stream().allMatch(
-                                c -> c.getTermIndex().getIndex() >= majorityMinimumIndex.getIndex())) {
-                    final Object snapshotPayload = self.snapshotSupplier().get();
-                    if (snapshotPayload != null) {
-                        LOGGER.info("{} All live followers at committed {} - compacting snapshot payload",
-                                self.getId(), majorityMinimumIndex);
-                        self.logs.compact(majorityMinimumIndex, snapshotPayload);
-                    } else {
-                        LOGGER.warn("{} Follower caught up to {} but no snapshot payload available - cannot compact",
-                                self.getId(), majorityMinimumIndex);
-                    }
-                }
             }
         } else {
             LOGGER.debug("{} Not a majority to commit with {} (need {})", self.getId(), currentIndices, majorityCount);
+        }
+
+        // SNAPSHOT: evaluate compaction on EVERY update, not only on the commit-advancing
+        // call. The commit point only ever grows, but "every live follower is at or past it"
+        // is a property we ACQUIRE over time: a lagging follower converges on the point as
+        // it installs the snapshot (install-response path) or acks the replay (ack path),
+        // and both are exactly updateCommittedIndex calls. Checking only the commit-advancing
+        // call would test the condition the moment the commit passes the laggard's stale
+        // index (the check fails, as it must, while the follower lags) and never re-evaluate
+        // once the follower converges -- leaving the log uncompacted forever.
+        // The invariants are otherwise unchanged: compact only when every live replica
+        // already holds the committed point (S1: the new start point must not outrun any
+        // live follower), a snapshot is actually available (S4: a pure function of the
+        // applied state), and only when there is something behind the start point to drop
+        // (compact() itself still re-enforces the forward-only / committed-bound guards, S5).
+        if (!self.getActiveConnections().isEmpty() && self.snapshotSupplier() != null
+                && self.logs.getCommittedTermIndex().getIndex() > self.logs.getStartTermIndex().getIndex()
+                && self.getActiveConnections().stream().allMatch(
+                        c -> c.getTermIndex().getIndex() >= self.logs.getCommittedTermIndex().getIndex())) {
+            final Object snapshotPayload = self.snapshotSupplier().get();
+            if (snapshotPayload != null) {
+                LOGGER.info("{} All live followers at committed {} - compacting log to the snapshot boundary",
+                        self.getId(), self.logs.getCommittedTermIndex());
+                self.logs.compact(self.logs.getCommittedTermIndex(), snapshotPayload);
+            } else {
+                LOGGER.warn("{} Follower caught up to {} but no snapshot payload available - cannot compact",
+                        self.getId(), self.logs.getCommittedTermIndex());
+            }
         }
     }
 

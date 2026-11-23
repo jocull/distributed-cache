@@ -80,4 +80,18 @@ public interface RaftNode {
     default Supplier<Object> snapshotSupplier() {
         return null;
     }
+
+    /**
+     * The event bus this node publishes its events on (the same instance the
+     * {@code RaftManager} that created it exposes via {@code getEventBus()}).
+     *
+     * <p>State-machine facades use this to pick out the node they own when wiring their
+     * {@link #setSnapshotSupplier(Supplier) snapshot supplier}: a facade supplies the
+     * state of exactly one node (its local state machine), never one it does not own.
+     * Implementations that carry no event bus (test doubles) may keep the default,
+     * which supplies no snapshots at all.
+     */
+    default com.github.jocull.raftcache.lib.event.EventBus getEventBus() {
+        return null;
+    }
 }

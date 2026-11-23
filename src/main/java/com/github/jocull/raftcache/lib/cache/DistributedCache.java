@@ -62,12 +62,16 @@ public class DistributedCache implements AutoCloseable {
         this.nodes = List.copyOf(nodes);
         this.partitionMap = partitionMap;
         this.stateMachineBridge = new StateMachineBridge(clusterEventBus, partitionMap);
-        // Wire the snapshot source (SNAPSHOTS.md stage 5): each node's leader behavior can
-        // now install this shared cache's point-in-time state on a laggard follower. The
-        // supplier is stateful-free (a pure function of the bridge's applied state, S4),
-        // so the same bridge can back every node. Nodes without a state machine (plain raft
-        // clusters) keep the interface default (null supplier, plain appends only).
-        nodes.forEach(node -> node.setSnapshotSupplier(stateMachineBridge::getSnapshot));
+        // Wire the snapshot source (SNAPSHOTS.md stage 5) on the node this facade OWNS:
+        // the node living on the event bus this cache's bridge subscribes to. A facade
+        // supplies the state of exactly that node's state machine -- wiring every node in
+        // the list let each later-constructed facade overwrite the suppliers of every
+        // node (last-wins), so a leader would have sent another node's state bound to a
+        // stale (or freshly-restarted, (0,0)) applied position. Nodes the facade does not
+        // own keep whatever supplier their own facade installed.
+        nodes.stream()
+                .filter(node -> clusterEventBus.equals(node.getEventBus()))
+                .forEach(node -> node.setSnapshotSupplier(stateMachineBridge::getSnapshot));
     }
 
     /**
