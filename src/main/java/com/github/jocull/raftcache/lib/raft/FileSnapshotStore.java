@@ -9,7 +9,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
 
@@ -115,13 +117,27 @@ public class FileSnapshotStore implements SnapshotStore {
     @Override
     public Optional<Stored> loadLatest() {
         try (Stream<Path> files = Files.list(directory)) {
-            final Optional<Path> latest = files
-                    .filter(p -> isSnapshotFile(p))
-                    .max(Comparator.comparing(FileSnapshotStore::parseBoundary, Comparator.naturalOrder()));
-            if (latest.isEmpty()) {
+            // A file that LOOKS like a snapshot (name shape) but does not NAME a boundary --
+            // e.g. raft-snapshot-foo.snap from a crashed writer or a foreign tool -- is ignored
+            // with a warning rather than allowed to blow up an otherwise clean load: every
+            // VALID snapshot in the directory must still be recoverable (stage 6d).
+            final List<Path> snapshots = new ArrayList<>();
+            files.filter(this::isSnapshotFile).forEach(p -> {
+                try {
+                    parseBoundary(p);
+                } catch (RuntimeException e) {
+                    LOGGER.warn("Ignoring snapshot file {} in {}: its name does not name a valid boundary ({})",
+                            p.getFileName(), directory, e.getMessage());
+                    return;
+                }
+                snapshots.add(p);
+            });
+            if (snapshots.isEmpty()) {
                 return Optional.empty();
             }
-            final Path file = latest.get();
+            final Path file = snapshots.stream()
+                    .max(Comparator.comparing(FileSnapshotStore::parseBoundary, Comparator.naturalOrder()))
+                    .get();
             final byte[] payload = Files.readAllBytes(file);
             return Optional.of(new Stored(parseBoundary(file), payload));
         } catch (IOException e) {

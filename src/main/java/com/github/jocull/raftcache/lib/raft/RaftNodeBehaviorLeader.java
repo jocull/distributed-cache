@@ -217,25 +217,40 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
                 final String nodeId = c.getRemoteNodeId();
                 SnapshotTransfer transfer = snapshotsInFlight.get(nodeId);
                 if (transfer == null) {
-                    final Object payload = snapshotSupplier.get();
-                    if (payload == null) {
-                        // The state machine refused to capture (e.g. nothing to capture yet):
-                        // fall back to the slow replay path rather than stall this follower.
-                        // (For a below-start-point follower that replay path is empty, but a
-                        // null capture only ever happens while nothing has been applied, which
-                        // is transient as soon as entries exist.)
-                        LOGGER.warn("{} Follower {} is {} behind committed {} but the snapshot source returned null - falling back to appends",
-                                self.id, nodeId, committedTermIndex.getIndex() - followerIndex, committedTermIndex);
-                    } else {
-                        transfer = new SnapshotTransfer(
-                                serializeSnapshotPayload(payload),
-                                committedTermIndex.getIndex(),
-                                committedTermIndex.getTerm());
-                        snapshotsInFlight.put(nodeId, transfer);
-                        LOGGER.info("{} Follower {} is {} below committed {} (start point {}) - transferring {} bytes of snapshot in {}-byte chunks",
-                                self.id, nodeId,
-                                committedTermIndex.getIndex() - followerIndex, committedTermIndex, startPoint,
-                                transfer.data.length, SNAPSHOT_CHUNK_BYTES);
+                    try {
+                        final Object payload = snapshotSupplier.get();
+                        if (payload == null) {
+                            // The state machine refused to capture (e.g. nothing to capture yet):
+                            // fall back to the slow replay path rather than stall this follower.
+                            // (For a below-start-point follower that replay path is empty, but a
+                            // null capture only ever happens while nothing has been applied, which
+                            // is transient as soon as entries exist.)
+                            LOGGER.warn("{} Follower {} is {} behind committed {} but the snapshot source returned null - falling back to appends",
+                                    self.id, nodeId, committedTermIndex.getIndex() - followerIndex, committedTermIndex);
+                        } else {
+                            transfer = new SnapshotTransfer(
+                                    serializeSnapshotPayload(payload),
+                                    committedTermIndex.getIndex(),
+                                    committedTermIndex.getTerm());
+                            snapshotsInFlight.put(nodeId, transfer);
+                            LOGGER.info("{} Follower {} is {} below committed {} (start point {}) - transferring {} bytes of snapshot in {}-byte chunks",
+                                    self.id, nodeId,
+                                    committedTermIndex.getIndex() - followerIndex, committedTermIndex, startPoint,
+                                    transfer.data.length, SNAPSHOT_CHUNK_BYTES);
+                        }
+                    } catch (RuntimeException e) {
+                        // A capture that THROWS (a flaky state machine, a payload that is not
+                        // Serializable) must fail exactly the way a declined capture does: this
+                        // follower falls back to the append path and the supplier is simply
+                        // re-run on a later pass. Left uncaught, the exception would abandon the
+                        // rest of this pass -- appendEntries iterates every live connection in one
+                        // lambda, so the connections queued after this laggard would lose this
+                        // tick's send -- and on reply-driven passes it would escape straight out
+                        // of the message handler (stage 6d). No transfer state is touched, so
+                        // nothing lingers for the next pass to trip over.
+                        LOGGER.warn("{} Follower {} is {} behind committed {} but the snapshot capture failed ({}: {}) - falling back to appends",
+                                self.id, nodeId, committedTermIndex.getIndex() - followerIndex, committedTermIndex,
+                                e.getClass().getSimpleName(), e.getMessage(), e);
                     }
                 }
                 if (transfer != null) {
@@ -525,7 +540,21 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
     public void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse) {
         final int responseTerm = installSnapshotResponse.getTerm();
         final long responseIndex = installSnapshotResponse.getIndex();
-        final long responseOffset = installSnapshotResponse.getOffset();
+        // A cursor is a byte offset into the pinned capture -- always >= 0, with 0 the contract
+        // value for "start over from byte 0". A misbehaving or buggy peer could send a NEGATIVE
+        // one; adopting it verbatim would wedge the transfer (the next pass computes
+        // end = min(sentOffset + chunk, length) with a negative start and throws out of
+        // Arrays.copyOfRange, and the bad cursor would be re-adopted on every reply). Clamp it
+        // to the closest legal cursor: 0 (stage 6d).
+        final long rawResponseOffset = installSnapshotResponse.getOffset();
+        final long responseOffset;
+        if (rawResponseOffset < 0) {
+            LOGGER.warn("{} Follower {} reported an illegal negative snapshot cursor {} - a cursor is a byte offset >= 0, so treating it as a restart from byte 0",
+                    self.getId(), sender.getRemoteNodeId(), rawResponseOffset);
+            responseOffset = 0L;
+        } else {
+            responseOffset = rawResponseOffset;
+        }
 
         if (responseTerm > term) {
             LOGGER.info("{} Received install-snapshot response from {} for term {} above our term {} - stepping down",

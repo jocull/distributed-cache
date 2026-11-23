@@ -15,10 +15,12 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(a) | chunked transfer: leader pins one serialization, follower assembles, offset cursor resumes at the returned offset | `35f4ec0` |
 | 6(b) | durable `SnapshotStore` (in-memory + file impls): save-on-compact (leader), save-on-install (follower — a failed save aborts before the trim), seed at startup before log replay; null/empty/corrupt/throwing stores warn and skip, startup is never blocked | `stage 6(b)` |
 | 6(c) | non-happy-path hardening: failing stores on both roles (leader compaction and follower install fail closed — log left untrimmed, no success reply so the leader retransmits), gap one below the trigger stays on the append-replay path, an exact-divisor chunk size ends cleanly on the last byte with no empty trailer, orphan `.tmp` files are invisible to `loadLatest` even when named for a higher boundary | `stage 6(c)` |
+| 6(d) | non-happy-path hardening (second pass): a throwing snapshot supplier or a payload that cannot be serialized in the laggard path falls back to appends instead of tearing down the heartbeat round (a healthy supplier recovers); a negative offset cursor in `InstallSnapshotResponse` is clamped to 0 (would otherwise AIOOBE the next `Arrays.copyOfRange`); `loadLatest` skips snapshot-shaped files with unparseable names while still recovering a valid one in the same directory, and picks strictly max-by-boundary (term-major) when two valid files coexist; the compaction gate stays fail-closed; a failed store `save` (e.g. read-only directory) is loud and leaves no `.tmp` behind | `stage 6(d)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
-1 pre-existing skip**. `InstallSnapshotExample.java` and the `proto/raft/*`
+1 pre-existing skip**; after stage 6(d): **332 tests green, 0 failures, 1
+pre-existing skip**. `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
 Sources: Raft paper §7 (§7.1 log compaction, §7.2 snapshot transfer) and §5.4.1 (up-to-date rule,
@@ -242,3 +244,31 @@ applied index untouched, the state machine never sees the payload.
 `loadLatest` — deliberately seeded with a HIGHER boundary than the real snapshot, so a
 parse-then-max-by-boundary mistake would recover it and the test fails.
 Final suite: **325 tests green, 0 failures, 1 pre-existing skip** (+5 over the 6(b) baseline).
+
+**Non-happy-path hardening pass, second round (2026-11-23, stage 6(d))** — the paths 6(c) left
+open: the leader's laggard supplier path, the offset-cursor contract, and the store's loader.
+Three production hardenings: `RaftNodeBehaviorLeader` wraps the laggard path's
+`snapshotSupplier.get()` + `serializeSnapshotPayload` in a `RuntimeException` guard (WARN,
+transfer stays null, the heartbeat round falls back to per-entry appends — the same
+null-fallback precedent `onAcknowledgeEntries` already follows); `onInstallSnapshotResponse`
+clamps a negative `offset` cursor to 0 before the branch logic (an unclamped negative cursor
+sets `sentOffset` negative and AIOOBEs `Arrays.copyOfRange` on the next pass); and
+`FileSnapshotStore.loadLatest` skips snapshot-shaped files whose names do not parse (WARN)
+instead of escaping the max-by-boundary comparator, so a valid snapshot in the same directory
+still recovers.
+`RaftNodeBehaviorLeaderInstallSnapshotTest` gains four tests: a throwing supplier falls back
+to appends, the pass survives, and a healthy supplier recovers on the next pass; a payload that
+cannot be serialized (probed raw against `ObjectOutputStream` to pin the
+`NotSerializableException`, since the production wrapper converts it to `IllegalStateException`)
+fails the same soft way with nothing escaping; a negative cursor reply is treated as a start
+over from byte 0 of the same pinned capture; and the compaction gate with a throwing supplier
+stays fail-closed (exception escapes, committed already advanced, log untrimmed, store
+untouched) — the 6(c) pin re-verified under the new laggard guard.
+`FileSnapshotStoreTest` gains three: a stray `raft-snapshot-foo.snap` beside a valid
+`raft-snapshot-5-10.snap` is skipped — and left in place — while the valid one still loads (load
+is read-only); two coexisting valid files `raft-snapshot-1-5.snap` / `raft-snapshot-2-3.snap`
+resolve to the highest boundary, term-major, so (2,3) wins despite its lower index; and a
+`save` into a directory whose owner write bit was revoked (POSIX-permissions probe + `Assumptions`
+skip for root CI boxes) is loud (the compaction gate fails closed on exactly this) and leaves no
+`.snap.tmp` behind — the `finally` cleanup ran.
+Final suite: **332 tests green, 0 failures, 1 pre-existing skip** (+7 over the 6(c) baseline).

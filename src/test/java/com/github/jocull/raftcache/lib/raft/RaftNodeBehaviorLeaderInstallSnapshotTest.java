@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.NotSerializableException;
 import java.io.ObjectOutputStream;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -622,6 +623,196 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
             // trim run, only the boundary record would remain and this range would be empty.
             assertEquals(LAST_INDEX - LAGGARD_INDEX, node.logs.getLogRange(new TermIndex(TERM, LAGGARD_INDEX), 10).size(),
                     "fail-safe: the log was not trimmed while the snapshot save failed");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void snapshotSupplierThatThrows_fallsBackToAppends_thePassSurvives_andAHealthySupplierRecovers() {
+        // (6d) capture side of the laggard path: snapshotSupplier.get() and the serialization
+        // that follows it can THROW (a flaky state machine), not merely return null. This pass
+        // iterates every live connection inside one lambda, so an uncaught exception would
+        // leave the connections queued AFTER this laggard unserved for this tick, and on
+        // reply-driven passes it would escape the message handler. A thrown capture must fail
+        // exactly the way a declined one does (the null-payload contract): this follower drops
+        // to the appends, the remaining connections are served, no transfer lingers, and the
+        // very next pass retries the supplier cleanly.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            node.setSnapshotSupplier(() -> {
+                throw new IllegalStateException("simulated state-machine capture failure");
+            });
+
+            // Order carries the "the pass survives" assertion: needsMore (index LAST_INDEX-1,
+            // just below the trigger) sits AFTER the laggard, so an abandoned pass would leave
+            // it unserved. On a live pass it receives the appends for the entries past index 5.
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            final RecordingConnection needsMore = new RecordingConnection("needsMore", new TermIndex(TERM, LAST_INDEX - 1));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(laggard);
+            node.activeConnections.add(needsMore);
+
+            // THE CORE (6d): a throwing capture degrades to the appends path WITHOUT escaping
+            // the ack handler and WITHOUT abandoning the rest of the connection pass.
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            assertEquals(0, laggard.installSnapshotsSent.size(), "a failed capture must not start a snapshot transfer");
+            assertTrue(laggard.appendEntriesSent.stream().anyMatch(a -> a.getEntries().size() >= 1),
+                    "the failed follower falls back to the slow appends path");
+            assertTrue(needsMore.appendEntriesSent.stream().anyMatch(a -> a.getEntries().size() >= 1),
+                    "the pass is not abandoned after the failed capture: the next connection still gets served");
+            assertEquals(NodeStates.LEADER, stateOf(node), "a failed capture must not disturb leadership");
+
+            // RECOVERY: a healthy supplier turns the very next pass into a clean transfer —
+            // nothing lingers from the failed one (the snapshotsInFlight map was never touched).
+            final Object payload = new Snapshot(TERM, LAST_INDEX, Map.of());
+            node.setSnapshotSupplier(() -> payload);
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            assertEquals(1, laggard.installSnapshotsSent.size(), "a healthy supplier resumes the snapshot transfer on the next pass");
+            assertEquals(0L, laggard.installSnapshotsSent.get(0).getOffset(), "the resumed transfer starts at byte 0");
+            assertEquals(LAST_INDEX, laggard.installSnapshotsSent.get(0).getLastIncludedIndex(), "the boundary is the committed point");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void snapshotPayloadThatCantBeSerialized_fallsBackToAppends_withoutEscaping() {
+        // (6d) sibling of the previous test, aimed at the SERIALIZATION step: a supplier that
+        // hands out a payload that is NOT Serializable blows up inside
+        // serializeSnapshotPayload (NotSerializableException) -- the capture never reaches the
+        // "transfer started" state. Same contract as a null or throwing supplier: the follower
+        // falls back to appends, the pass continues, the leader keeps its position.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            // Deliberately a bare Object: not Serializable, so the leader's exact JDK
+            // serialization of it MUST fail (sanity-check the precondition the same way the
+            // leader serializes -- a raw ObjectOutputStream, since chunk() swallows the exact
+            // exception type into an IllegalStateException).
+            final Object payload = new Object() {
+            };
+            assertThrows(NotSerializableException.class, () -> {
+                final ByteArrayOutputStream probe = new ByteArrayOutputStream();
+                try (final ObjectOutputStream oos = new ObjectOutputStream(probe)) {
+                    oos.writeObject(payload);
+                    oos.flush();
+                }
+            }, "a bare Object must fail JDK serialization the way the leader serializes");
+
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            node.setSnapshotSupplier(() -> payload);
+
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            final RecordingConnection needsMore = new RecordingConnection("needsMore", new TermIndex(TERM, LAST_INDEX - 1));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(laggard);
+            node.activeConnections.add(needsMore);
+
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            assertEquals(0, laggard.installSnapshotsSent.size(), "a non-serializable payload must not start a snapshot transfer");
+            assertTrue(laggard.appendEntriesSent.stream().anyMatch(a -> a.getEntries().size() >= 1),
+                    "the failed follower still falls back to the slow appends path");
+            assertTrue(needsMore.appendEntriesSent.stream().anyMatch(a -> a.getEntries().size() >= 1),
+                    "the pass is not abandoned after the failed capture");
+            assertEquals(NodeStates.LEADER, stateOf(node), "a failed capture must not disturb leadership");
+            closeCurrent(node);
+        }
+    }
+
+    @Test
+    void aNegativeCursorReply_isTreatedAsStartOverFromByteZero() {
+        // (6d) Edge of the reply handling: the cursor on the wire is contractually a byte
+        // offset (0 = "start over"), so a NEGATIVE value can only arrive from a misbehaving
+        // peer. Adopting one verbatim would wedge the transfer: the leader stores it as the
+        // in-progress sentinel and the next chunking pass throws out of Arrays.copyOfRange
+        // (end = min(negative + chunk, length), from > to). The only sane reading of a
+        // negative cursor is the closest legal one -- 0, restart from byte 0 of the SAME
+        // pinned capture.
+        final Object payload = new Snapshot(TERM, LAST_INDEX,
+                Map.of("key1", new DataVersion(Map.of("big", new byte[1536]), 7)));
+        final long chunkBytes = halfOfSerialized(payload);
+        final long originalChunkBytes = RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES;
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = chunkBytes;
+            final byte[] data = chunk(payload);
+
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            final Object pinned = payload;
+            node.setSnapshotSupplier(() -> pinned);
+
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection laggard = new RecordingConnection("laggard", new TermIndex(TERM, LAGGARD_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(laggard);
+
+            // Chunk 1 is out (byte 0, not done) and the transfer is in progress.
+            leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX)));
+            assertEquals(1, laggard.installSnapshotsSent.size());
+            assertEquals(0L, laggard.installSnapshotsSent.get(0).getOffset());
+            assertFalse(laggard.installSnapshotsSent.get(0).isDone());
+
+            // THE CORE (6d): an illegal negative cursor reply is treated as "start over from
+            // byte 0" -- no exception, and the retransmit picks up again at byte 0 of the same
+            // pinned capture (the reply's index is the laggard's unchanged tail, below the
+            // boundary, so completion is out of the question).
+            leader.onInstallSnapshotResponse(laggard, new InstallSnapshotResponse(TERM, LAGGARD_INDEX, -1L));
+            openPacingGate(laggard);
+            leader.appendEntries(RaftNodeBehaviorLeader.AppendEntriesTrigger.INITIAL);
+            assertTrue(laggard.installSnapshotsSent.size() >= 2, "a start-over reply must trigger a retransmit");
+            final InstallSnapshot resend = laggard.installSnapshotsSent.get(laggard.installSnapshotsSent.size() - 1);
+            assertEquals(0L, resend.getOffset(), "a negative cursor is clamped to the restart cursor 0");
+            assertArrayEquals(Arrays.copyOfRange(data, 0, (int) chunkBytes), (byte[]) resend.getPayload(),
+                    "the retransmit is byte 0 of the SAME pinned capture, not a new one");
+            assertEquals(NodeStates.LEADER, stateOf(node), "an illegal reply must not disturb leadership");
+            closeCurrent(node);
+        } finally {
+            RaftNodeBehaviorLeader.SNAPSHOT_CHUNK_BYTES = originalChunkBytes;
+        }
+    }
+
+    @Test
+    void compactionWithThrowingSnapshotSupplier_failsClosed_logNotTrimmed_committedStillAdvanced() {
+        // (6c-family, supplier half) the compaction gate calls snapshotSupplier.get() directly.
+        // A capture that THROWs (as opposed to failing at the store) is pinned to the SAME
+        // fail-closed contract as the failing-store case (compactionWithFailingSnapshotStore_...):
+        // the error escapes to the caller unswallowed, the commit advance has already happened
+        // (it precedes the gate) and is not rolled back, the log is left fully intact with no
+        // snapshot recorded, so the next ack retries the capture -- and nothing reached the
+        // store, because the failure is upstream of it.
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newLeader(raftManager);
+            final RaftNodeBehaviorLeader leader = (RaftNodeBehaviorLeader) node.currentReceiver();
+            node.setSnapshotSupplier(() -> {
+                throw new IllegalStateException("simulated state-machine capture failure");
+            });
+            final InMemorySnapshotStore store = new InMemorySnapshotStore();
+            node.setSnapshotStore(store);
+
+            // Same gate satisfaction as the stage-6b tests: quorum at the committed point,
+            // every live follower there, supplier set -- compaction is triggered.
+            final RecordingConnection upToDate = new RecordingConnection("upToDate", new TermIndex(TERM, LAST_INDEX));
+            final RecordingConnection caughtUp = new RecordingConnection("caughtUp", new TermIndex(TERM, LAST_INDEX));
+            node.activeConnections.add(upToDate);
+            node.activeConnections.add(caughtUp);
+
+            assertThrows(IllegalStateException.class,
+                    () -> leader.onAcknowledgeEntries(upToDate, new AcknowledgeEntries(TERM, true, ti(TERM, LAST_INDEX))),
+                    "a failed capture is a hard error, not a silent skip");
+
+            assertEquals(new TermIndex(TERM, LAST_INDEX), node.logs.getCommittedTermIndex(),
+                    "the commit advance happens before the compaction gate and is not rolled back");
+            assertFalse(node.logs.hasStartPointSnapshot(), "fail-safe: no snapshot is recorded in the log");
+            assertEquals(LAST_INDEX - LAGGARD_INDEX, node.logs.getLogRange(new TermIndex(TERM, LAGGARD_INDEX), 10).size(),
+                    "fail-safe: the log was not trimmed while the supplier failed");
+            assertTrue(store.loadLatest().isEmpty(),
+                    "the supplier failed before the store was ever consulted");
             closeCurrent(node);
         }
     }

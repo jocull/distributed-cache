@@ -1,11 +1,13 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Optional;
 
@@ -131,5 +133,105 @@ class FileSnapshotStoreTest {
     @Test
     void constructor_rejectsANullDirectory() {
         assertThrows(IllegalArgumentException.class, () -> new FileSnapshotStore((Path) null));
+    }
+
+    @Test
+    void aSnapshotNameThatNamesNoBoundary_isSkippedAndTheValidOneStillLoads(@TempDir Path dir) {
+        // (6d) The directory may hold a file that has a snapshot's NAME SHAPE but not a boundary —
+        // e.g. raft-snapshot-foo.snap left by a crashed writer or a foreign tool working in a shared
+        // directory. Before (6d) the parse failure inside the max-by-boundary comparator escaped
+        // loadLatest and NO snapshot in the directory was recoverable; after, the valid snapshot
+        // still loads and the stray file is left alone (recovery must be side-effect-free).
+        final FileSnapshotStore store = new FileSnapshotStore(dir);
+        store.save(new TermIndex(5, 10L), PAYLOAD_A);
+
+        try {
+            // Deliberately named for a HIGHER boundary than the real snapshot: if the loader
+            // ever treated the stray as parseable, max-by-boundary would "recover" it.
+            Files.write(dir.resolve("raft-snapshot-foo.snap"), new byte[]{0x01});
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to seed the stray snapshot name", e);
+        }
+
+        assertEquals(2, files(dir).size(), "sanity: the stray physically sits next to the real snapshot");
+        final SnapshotStore.Stored stored = store.loadLatest().orElseThrow();
+        assertEquals(new TermIndex(5, 10L), stored.boundary(),
+                "an unparseable name is skipped, not allowed to blow up an otherwise clean load");
+        assertArrayEquals(PAYLOAD_A, stored.payload(), "loadLatest returns the REAL snapshot's bytes");
+        assertTrue(Files.exists(dir.resolve("raft-snapshot-foo.snap")),
+                "load is read-only: a file it does not understand is left in place");
+    }
+
+    @Test
+    void twoCoexistingValidSnapshots_loadLatestPicksTheHighestBoundary(@TempDir Path dir) {
+        // (6d) save() deletes superseded files, so two valid files can only coexist if one was
+        // written by something other than this save pass (a crashed mid-rename, a manual seed).
+        // loadLatest must pick strictly by boundary, term-major then index (TermIndex ordering):
+        // (1,5) versus (2,3) — an index-first or first-come comparison would recover the WRONG one.
+        try {
+            Files.write(dir.resolve("raft-snapshot-1-5.snap"), PAYLOAD_A);
+            Files.write(dir.resolve("raft-snapshot-2-3.snap"), PAYLOAD_B);
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to seed two snapshots", e);
+        }
+
+        assertEquals(2, files(dir).size(), "sanity: both files coexist");
+        final SnapshotStore.Stored stored = new FileSnapshotStore(dir).loadLatest().orElseThrow();
+        assertEquals(new TermIndex(2, 3L), stored.boundary(),
+                "the highest boundary wins: term-major, so (2,3) beats (1,5) despite the lower index");
+        assertArrayEquals(PAYLOAD_B, stored.payload(), "the winner is the file the winner is named for");
+    }
+
+    @Test
+    void saveIntoAReadOnlyDirectory_failsLoudlyAndLeavesNoTempFile(@TempDir Path dir) throws IOException {
+        // (6d) A save can fail MID-WRITE (a revoked permission, a disk fulling, a read-only mount
+        // landing mid-lifetime). Two contracts the node relies on: the failure is LOUD (the
+        // leader's compaction gate is fail-closed on exactly this), and the temp-file cleanup
+        // still runs — no stray raft-snapshot-*.snap.tmp left in the directory. Note the read-only
+        // premise does not hold for root (POSIX permissions are bypassed); the probe below turns
+        // that into a clean skip instead of a false failure.
+        final FileSnapshotStore store = new FileSnapshotStore(dir);
+        store.save(new TermIndex(5, 10L), PAYLOAD_A);
+
+        try {
+            setPermissions(dir, false);
+            boolean readOnly = true;
+            try {
+                final Path probe = Files.createTempFile(dir, "probe", ".txt");
+                Files.deleteIfExists(probe);
+                readOnly = false;
+            } catch (IOException expected) {
+                // good: this user really cannot write here
+            }
+            Assumptions.assumeTrue(readOnly, "this user can write a read-only directory (root); the premise does not hold");
+
+            assertThrows(IllegalStateException.class,
+                    () -> store.save(new TermIndex(6, 20L), PAYLOAD_B),
+                    "a failed write is a loud error the caller can fail-closed on, not a silent drop");
+
+            final List<Path> survivors = files(dir);
+            assertEquals(1, survivors.size(), "a failed save leaves the last good snapshot exactly where it was");
+            assertTrue(survivors.stream().noneMatch(p -> p.getFileName().toString().endsWith(".tmp")),
+                    "a failed save leaves no temp file behind (the cleanup pass ran)");
+
+            final SnapshotStore.Stored stored = store.loadLatest().orElseThrow();
+            assertEquals(new TermIndex(5, 10L), stored.boundary(), "loadLatest returns the last successful one");
+            assertArrayEquals(PAYLOAD_A, stored.payload());
+        } finally {
+            try {
+                setPermissions(dir, true);
+            } catch (IOException restoreFailed) {
+                throw new IllegalStateException("failed to restore directory permissions after the test", restoreFailed);
+            }
+        }
+    }
+
+    private static void setPermissions(Path dir, boolean writable) throws IOException {
+        // Owner bits are what matter: the test process is the owner. Keep the EXECUTE bit
+        // both ways — POSIX directories need it for traversal (listing, deleting, path
+        // resolution), and a directory that lost it breaks even JUnit's temp-dir cleanup.
+        // The WRITE bit is the only thing toggled (execute stays set for both): the
+        // 9-character POSIX form, writable "rwxrwxrwx", read-only "r-xr-xr-x".
+        Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString(writable ? "rwxrwxrwx" : "r-xr-xr-x"));
     }
 }
