@@ -89,6 +89,110 @@ class RaftNodeBehaviorFollowerVoteTest {
         }
     }
 
+    // ---- Stage 6(i): a hostile wire tail on the vote path is refused before any mutation ----
+
+    /**
+     * Stage 6(i): the vote-request tail (1, -1) is constructible in the bare wire carrier, but its
+     * negative axis would IAE out of the domain build in {@code onVoteRequest} (the stage 6(g)
+     * root mechanism, this time on the vote path) — and that build happens AFTER the accept path
+     * has already cleared the leader. The refusal must precede all of that: exactly one explicit
+     * DENIAL carrying the voter's own committed tail, and (discriminator at the end) the voter's
+     * single per-term vote must NOT be burned by the denial.
+     */
+    @Test
+    void hostileTail_refusedBeforeMutation_negativeIndexTail() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl voter = (RaftNodeImpl) raftManager.newNode("voter", new NodeAddress("voterAddress"));
+            middleware.addNode(voter);
+
+            for (int i = 1; i <= VOTER_LAST_INDEX; i++) {
+                voter.logs.appendLog(TERM, "entry-" + i);
+            }
+            voter.start().join(); // started FOLLOWER of term 0
+
+            // The denial's committed tail must be the voter's OWN tail, read BEFORE the request
+            // (robust to whatever commit state appendLog leaves the log in).
+            final TermIndex committedBefore = voter.logs.getCommittedTermIndex();
+
+            final RecordingSender hostile = new RecordingSender("hostileCandidate");
+            voter.currentReceiver().onVoteRequest(hostile,
+                    new VoteRequest(TERM, "hostileCandidate", new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, -1L)));
+
+            // Exactly one explicit denial — not an IAE out of the domain build, not silence.
+            assertEquals(1, hostile.voteResponses().size(), "a hostile tail must be refused with an explicit response, not silence");
+            assertFalse(hostile.voteResponses().get(0).isVoteGranted(), "a hostile tail must never be granted");
+            assertEquals(TERM, hostile.voteResponses().get(0).getTerm(), "the denial must echo the accepted term");
+            assertEquals(committedBefore.getTerm(), hostile.voteResponses().get(0).getCommittedTermIndex().getTerm(),
+                    "the denial must carry the voter's own committed tail");
+            assertEquals(committedBefore.getIndex(), hostile.voteResponses().get(0).getCommittedTermIndex().getIndex(),
+                    "the denial must carry the voter's own committed tail");
+
+            // The hostile request carried a higher term: term recognition still happens FIRST —
+            // the 0 -> 1 conversion precedes the refusal — and nothing else about the voter changed.
+            assertEquals(NodeStates.FOLLOWER, ((RaftNodeBehavior) voter.currentReceiver()).state, "the refusal must not change the role");
+            assertEquals(TERM, ((RaftNodeBehavior) voter.currentReceiver()).term, "a higher-term request must still advance the term (conversion before refusal)");
+
+            // THE DISCRIMINATOR: the refusal must NOT have burned votedForNodeId — a legitimate
+            // up-to-date candidate in the SAME term must still be granted. (If the refusal had
+            // set votedForNodeId, the same-term guard at the top of onVoteRequest would silence
+            // this response entirely, so this assertion fails against a vote-burning refusal.)
+            final RecordingSender legitimate = new RecordingSender("legitimateCandidate");
+            voter.currentReceiver().onVoteRequest(legitimate,
+                    new VoteRequest(TERM, "legitimateCandidate", new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, VOTER_LAST_INDEX)));
+            assertEquals(1, legitimate.voteResponses().size(),
+                    "a denial must not burn the vote: the legitimate same-term candidate must still receive a response");
+            assertTrue(legitimate.voteResponses().get(0).isVoteGranted(), "a legitimate up-to-date same-term candidate must be granted");
+        }
+    }
+
+    /**
+     * Stage 6(i): the null-tail variant of the hostile vote path — the wire field is missing
+     * entirely, which would NPE out of the wire getters before the domain constructor's IAE
+     * could even fire. Same contract as the negative-axis pin: one explicit DENIAL carrying the
+     * voter's own committed tail, term conversion intact, and the single per-term vote unburned.
+     */
+    @Test
+    void hostileTail_refusedBeforeMutation_nullTail() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl voter = (RaftNodeImpl) raftManager.newNode("voter", new NodeAddress("voterAddress"));
+            middleware.addNode(voter);
+
+            for (int i = 1; i <= VOTER_LAST_INDEX; i++) {
+                voter.logs.appendLog(TERM, "entry-" + i);
+            }
+            voter.start().join(); // started FOLLOWER of term 0
+
+            final TermIndex committedBefore = voter.logs.getCommittedTermIndex();
+
+            final RecordingSender hostile = new RecordingSender("nullTailCandidate");
+            voter.currentReceiver().onVoteRequest(hostile,
+                    new VoteRequest(TERM, "nullTailCandidate", null));
+
+            // Exactly one explicit denial — not an NPE out of the wire getters, not silence.
+            assertEquals(1, hostile.voteResponses().size(), "a null tail must be refused with an explicit response, not silence");
+            assertFalse(hostile.voteResponses().get(0).isVoteGranted(), "a null tail must never be granted");
+            assertEquals(TERM, hostile.voteResponses().get(0).getTerm(), "the denial must echo the accepted term");
+            assertEquals(committedBefore.getTerm(), hostile.voteResponses().get(0).getCommittedTermIndex().getTerm(),
+                    "the denial must carry the voter's own committed tail");
+            assertEquals(committedBefore.getIndex(), hostile.voteResponses().get(0).getCommittedTermIndex().getIndex(),
+                    "the denial must carry the voter's own committed tail");
+
+            assertEquals(NodeStates.FOLLOWER, ((RaftNodeBehavior) voter.currentReceiver()).state, "the refusal must not change the role");
+            assertEquals(TERM, ((RaftNodeBehavior) voter.currentReceiver()).term, "a higher-term request must still advance the term (conversion before refusal)");
+
+            final RecordingSender legitimate = new RecordingSender("legitimateCandidate");
+            voter.currentReceiver().onVoteRequest(legitimate,
+                    new VoteRequest(TERM, "legitimateCandidate", new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, VOTER_LAST_INDEX)));
+            assertEquals(1, legitimate.voteResponses().size(),
+                    "a denial must not burn the vote: the legitimate same-term candidate must still receive a response");
+            assertTrue(legitimate.voteResponses().get(0).isVoteGranted(), "a legitimate up-to-date same-term candidate must be granted");
+        }
+    }
+
     /**
      * A minimal {@link NodeConnectionOutbound} that identifies itself as a given candidate and
      * records the {@link VoteResponse}s it is asked to send. Everything else is inert.

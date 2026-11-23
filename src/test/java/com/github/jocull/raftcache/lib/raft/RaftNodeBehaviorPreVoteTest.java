@@ -158,6 +158,40 @@ class RaftNodeBehaviorPreVoteTest {
     }
 
     @Test
+    void follower_voter_deniesHostileTail_andStillResponds() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl voter = (RaftNodeImpl) raftManager.newNode("voter", new NodeAddress("voter-addr"));
+            middleware.addNode(voter);
+            appendLog(voter, OWN_LAST_INDEX);
+            voter.start().join();
+
+            // Stage 6(i): term 1 passes the follower's term gate (1 >= 0) in BOTH requests below,
+            // so the denials must come from the HOSTILE TAIL and nothing else: a null tail would
+            // NPE out of the wire getters and a negative index would IAE out of the domain build
+            // in RaftNodeBehavior.isUpToDate — mid-handler. The refusal must be a plain denial.
+            final RecordingSender nullTail = new RecordingSender("nullTail");
+            voter.currentReceiver().onPreVoteRequest(nullTail, new PreVoteRequest(1, "other", null));
+            nullTail.assertOnePreVoteDenied();
+            assertEquals(1, nullTail.preVoteResponses().get(0).getTerm(), "the denial must echo the request term");
+
+            final RecordingSender negativeTail = new RecordingSender("negativeTail");
+            voter.currentReceiver().onPreVoteRequest(negativeTail, new PreVoteRequest(1, "other", ti(OWN_TERM, -1L)));
+            negativeTail.assertOnePreVoteDenied();
+            assertEquals(1, negativeTail.preVoteResponses().get(0).getTerm(), "the denial must echo the request term");
+
+            // THE DISCRIMINATOR: the refusals must not have latched the handler into a broken
+            // state — a legitimate up-to-date pre-vote in the same term must still be granted.
+            final RecordingSender legitimate = new RecordingSender("legitimate");
+            voter.currentReceiver().onPreVoteRequest(legitimate, new PreVoteRequest(1, "other", ti(OWN_TERM, OWN_LAST_INDEX)));
+            legitimate.assertOnePreVoteGranted();
+
+            assertEquals(NodeStates.FOLLOWER, stateOf(voter), "a hostile-tail refusal must not change the role");
+            assertEquals(0, termOf(voter), "a hostile-tail refusal must not advance the term");
+        }
+    }
+
+    @Test
     void preVoteMustNotBurnTheRealVote_andTheRealVoteStillBurnsOnGrant() {
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
@@ -233,6 +267,46 @@ class RaftNodeBehaviorPreVoteTest {
     }
 
     @Test
+    void candidate_voter_deniesHostileTail_neverChangesState() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = (RaftNodeImpl) raftManager.newNode("node", new NodeAddress("node-addr"));
+            middleware.addNode(node);
+            appendLog(node, OWN_LAST_INDEX);
+            // Two peers -> majority 2, so the candidate below will NOT self-elect.
+            registerPeer(node, "peerA");
+            registerPeer(node, "peerB");
+            node.start().join();
+            node.convertToCandidate(1); // deterministic CANDIDATE of term 1
+            assertEquals(NodeStates.CANDIDATE, stateOf(node));
+            assertEquals(1, termOf(node));
+
+            // Stage 6(i): term 2 passes the candidate's strictly-higher gate in BOTH requests
+            // below, so the denials must come from the HOSTILE TAIL: a null tail would NPE out
+            // of the wire getters and a negative index would IAE out of the domain build —
+            // mid-handler. The refusal must be a plain denial.
+            final RecordingSender nullTail = new RecordingSender("nullTail");
+            node.currentReceiver().onPreVoteRequest(nullTail, new PreVoteRequest(2, "other", null));
+            nullTail.assertOnePreVoteDenied();
+            assertEquals(2, nullTail.preVoteResponses().get(0).getTerm(), "the denial must echo the request term");
+
+            final RecordingSender negativeTail = new RecordingSender("negativeTail");
+            node.currentReceiver().onPreVoteRequest(negativeTail, new PreVoteRequest(2, "other", ti(OWN_TERM, -1L)));
+            negativeTail.assertOnePreVoteDenied();
+            assertEquals(2, negativeTail.preVoteResponses().get(0).getTerm(), "the denial must echo the request term");
+
+            // THE DISCRIMINATOR: the refusals must not have latched the handler — a legitimate
+            // higher-term up-to-date pre-vote must still be granted.
+            final RecordingSender legitimate = new RecordingSender("legitimate");
+            node.currentReceiver().onPreVoteRequest(legitimate, new PreVoteRequest(2, "other", ti(OWN_TERM, OWN_LAST_INDEX)));
+            legitimate.assertOnePreVoteGranted();
+
+            assertEquals(NodeStates.CANDIDATE, stateOf(node), "a hostile-tail refusal must not change the role");
+            assertEquals(1, termOf(node), "a hostile-tail refusal must not advance the term");
+        }
+    }
+
+    @Test
     void leader_voter_deniesSameTerm_grantsStrictlyHigher_neverChangesState() {
         try (final PassThruMiddleware middleware = new PassThruMiddleware();
              final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
@@ -263,6 +337,48 @@ class RaftNodeBehaviorPreVoteTest {
             node.currentReceiver().onPreVoteResponse(inquirer, new PreVoteResponse(99, true));
             assertEquals(NodeStates.LEADER, stateOf(node), "pre-vote response must not demote the leader");
             assertEquals(1, termOf(node), "pre-vote response must not advance the term");
+        }
+    }
+
+    @Test
+    void leader_voter_deniesHostileTail_neverChangesState() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = (RaftNodeImpl) raftManager.newNode("node", new NodeAddress("node-addr"));
+            middleware.addNode(node);
+            appendLog(node, OWN_LAST_INDEX);
+            // Two peers -> majority 2, so the candidate does NOT self-elect and we can
+            // deterministically step it up to leader.
+            registerPeer(node, "peerA");
+            registerPeer(node, "peerB");
+            node.start().join();
+            node.convertToCandidate(1);
+            node.convertToLeader(); // deterministic LEADER of term 1
+            assertEquals(NodeStates.LEADER, stateOf(node));
+            assertEquals(1, termOf(node));
+
+            // Stage 6(i): term 2 passes the leader's strictly-higher gate in BOTH requests
+            // below, so the denials must come from the HOSTILE TAIL: a null tail would NPE out
+            // of the wire getters and a negative index would IAE out of the domain build —
+            // mid-handler. The refusal must be a plain denial.
+            final RecordingSender nullTail = new RecordingSender("nullTail");
+            node.currentReceiver().onPreVoteRequest(nullTail, new PreVoteRequest(2, "other", null));
+            nullTail.assertOnePreVoteDenied();
+            assertEquals(2, nullTail.preVoteResponses().get(0).getTerm(), "the denial must echo the request term");
+
+            final RecordingSender negativeTail = new RecordingSender("negativeTail");
+            node.currentReceiver().onPreVoteRequest(negativeTail, new PreVoteRequest(2, "other", ti(OWN_TERM, -1L)));
+            negativeTail.assertOnePreVoteDenied();
+            assertEquals(2, negativeTail.preVoteResponses().get(0).getTerm(), "the denial must echo the request term");
+
+            // THE DISCRIMINATOR: a legitimate higher-term up-to-date pre-vote must still be
+            // granted after the refusals.
+            final RecordingSender legitimate = new RecordingSender("legitimate");
+            node.currentReceiver().onPreVoteRequest(legitimate, new PreVoteRequest(2, "other", ti(OWN_TERM, OWN_LAST_INDEX)));
+            legitimate.assertOnePreVoteGranted();
+
+            assertEquals(NodeStates.LEADER, stateOf(node), "a hostile-tail refusal must not demote the leader");
+            assertEquals(1, termOf(node), "a hostile-tail refusal must not advance the term");
         }
     }
 

@@ -73,6 +73,19 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     }
 
     /**
+     * Stage 6(i) (SNAPSHOTS.md stage 6(i)): is this wire term/index structurally hostile —
+     * {@code null}, or carrying a negative term or index? The wire {@code messages.TermIndex}
+     * is a bare carrier: none of those can be constructed into it, and feeding one into a
+     * domain comparison would NPE out of the wire getters or IAE out of the domain
+     * constructor (the stage 6(g) root mechanism), mid-handler after any side effects the
+     * accept path already performed. Every accept path checks its wire tails with this
+     * BEFORE use and refuses on a hit.
+     */
+    static boolean isHostileWireTermIndex(com.github.jocull.raftcache.lib.raft.messages.TermIndex wire) {
+        return wire == null || wire.getTerm() < 0 || wire.getIndex() < 0;
+    }
+
+    /**
      * Raft §5.4.2 up-to-date rule evaluated against a candidate's last log entry from a
      * Pre-Vote request: grant iff the candidate's last entry is at least as up-to-date as
      * our own (higher term, or equal term and higher-or-equal index).
@@ -81,8 +94,17 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
      * the vote-grant path requires (see {@code convertToFollowerForVote}). The term/index
      * comparison deliberately excludes any state mutation; pre-vote handling must never
      * change term, {@code votedFor}, or timers.
+     *
+     * <p>Fails closed (stage 6(i)): a hostile/missing tail is a denial, not an exception —
+     * this is the single feed-in point all three pre-vote handlers use, so all of them
+     * refuse such a request without any handler-side change.
      */
     boolean isUpToDate(PreVoteRequest preVoteRequest) {
+        if (isHostileWireTermIndex(preVoteRequest.getLastLogTermIndex())) {
+            LOGGER.warn("{} Pre-vote request from {} carries a hostile or missing last-log term/index ({}) - refusing",
+                    self.getId(), preVoteRequest.getCandidateId(), preVoteRequest.getLastLogTermIndex());
+            return false;
+        }
         final TermIndex incomingTermIndex = new TermIndex(
                 preVoteRequest.getLastLogTermIndex().getTerm(),
                 preVoteRequest.getLastLogTermIndex().getIndex());

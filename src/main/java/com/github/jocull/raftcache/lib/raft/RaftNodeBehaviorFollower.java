@@ -146,6 +146,26 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             return;
         }
 
+        // Stage 6(i) (SNAPSHOTS.md stage 6(i)): a hostile or missing wire tail (null field, or a
+        // negative term/index axis) would NPE out of the wire getters or IAE out of the domain
+        // build below (the stage 6(g) root mechanism), mid-handler AFTER leaderId had been
+        // cleared. Refuse before any of that — the same shape as the ordinary denial below:
+        // one explicit false VoteResponse carrying our own committed tail, and a re-armed
+        // election timer. Term recognition already happened (the conversion above advanced
+        // us), so this refusal is not a step-down, and votedForNodeId stays untouched: the
+        // denial must not burn the node's single per-term vote (only a grant below sets it).
+        if (isHostileWireTermIndex(voteRequest.getLastLogTermIndex())) {
+            LOGGER.warn("{} Received vote request from {} for term {} carrying a hostile or missing last-log term/index ({}) - refusing",
+                    self.getId(), sender.getRemoteNodeId(), voteRequest.getTerm(), voteRequest.getLastLogTermIndex());
+            scheduleNextElectionTimeout();
+            final TermIndex committedTail = self.logs.getCommittedTermIndex();
+            sender.sendVoteResponse(new VoteResponse(
+                    voteRequest.getTerm(),
+                    new com.github.jocull.raftcache.lib.raft.messages.TermIndex(committedTail.getTerm(), committedTail.getIndex()),
+                    false));
+            return;
+        }
+
         // If the receiving node hasn't voted yet in this term then it votes for the candidate...
         // ...and the node resets its election timeout. Per Raft §5.4.2 (up-to-date rule) the
         // vote is granted only if the candidate's last log entry is at least as up-to-date as
@@ -275,10 +295,6 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             }
         }
         return false;
-    }
-
-    private static boolean isHostileWireTermIndex(com.github.jocull.raftcache.lib.raft.messages.TermIndex wire) {
-        return wire == null || wire.getTerm() < 0 || wire.getIndex() < 0;
     }
 
     @Override

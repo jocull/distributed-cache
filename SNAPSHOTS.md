@@ -20,6 +20,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(f) | non-happy-path hardening (fourth pass): the other side of the leader's laggard decision — a follower **strictly below** the compacted start point receives the install even when its gap is BELOW `SNAPSHOT_TRIGGER_ENTRIES` (branch (a) has no threshold: an append replay there is a permanent empty stream, `getLogRange` serves nothing at or below the seed), a follower **AT** the boundary gets only empty heartbeats, no install (the "strictly below" edge pinned from the other side), and an `InstallSnapshotResponse` carrying a **lower** term is an ordinary completion on the index axis — leadership kept (step-down only on a *strictly higher* term, `onAcknowledgeEntries` parity), reported tail still adopted (no production change: three pins, and the pins themselves surfaced a test-hygiene gap — send-count assertions must be bounds + per-message properties, never exact counts, because the 50 ms background heartbeat timer legitimately interleaves) | `stage 6(f)` |
 | 6(g) | non-happy-path hardening (fifth pass): the last unguarded escape sites behind the 6d/6e-style guards, sharing one root mechanism — `TermIndex`'s constructor throws IAE on a negative term or index, and two handlers feed wire values into it **without guarding those axes**. Leader: the completion branch of `onInstallSnapshotResponse` adopts the reply's term/index into `new TermIndex(...)` (the 6d clamp covered the cursor axis only) — and *after* `snapshotsInFlight` has already been deleted, so the IAE escaped mid-cleanup, leaving the leader half-processed; each negative axis is now clamped to the closest legal value, 0 (a negative term never exceeds ours, so step-down semantics are unchanged). Follower: the accept path builds `new TermIndex(lastIncludedTerm, lastIncludedIndex)` *after* recording the sender as leader (the index axis is structurally S2-gated — strictly beyond the tail — the term axis is not), so a same-term peer with boundary term `-1` IAEd *post-mutation*; it is now refused before ANY state change, in the exact shape of the negative-offset guard (offset-0 reply + `scheduleNextElectionTimeout`, no half-transfer left to absorb the next chunk) | `stage 6(g)` |
 | 6(h) | non-happy-path hardening (sixth pass): the remaining hostile-wire-tail escapes on the replication path, the 6(g) root mechanism (`TermIndex` constructor IAE/NPE) on the append/ack surface — the follower's `onAppendEntries` feeds three of the wire axes (prev-log pointer, each entry's term/index, the leader commit index) into `new TermIndex(...)` unguarded (a negative or missing field threw mid-handler after the sender was already recorded as leader, and, for the entry/commit axes, after entries were already appended), now **refused** before any state change in the shape of the sibling refusals (false ack carrying our own unchanged tail) — no clamping here, because clamping a mid-log position or match point would manufacture a bogus append or a phantom match; the leader's `onAcknowledgeEntries` feeds the follower's reported tail into `new TermIndex(...)` in **both** branches (the failure-branch rewind, the success-branch adoption), and a negative or missing tail threw before adoption, commit alignment or the catch-up send could run, now **refused as warn + ignore** (no reply exists on the ack path; connection book-keeping, log, and leadership are byte-for-byte untouched) | `stage 6(h)` |
+| 6(i) | non-happy-path hardening (seventh pass): the last two hostile-wire-tail escapes of the 6(g)/6(h) family, now on the vote path — the follower's `onVoteRequest` now **refuses before any mutation** (the term-ladder conversion still runs first, then: warn + re-armed election timer + one explicit false `VoteResponse` carrying our own committed tail, mirroring the handler's own denial shape; `leaderId` never cleared, and a denial deliberately does **not** burn `votedForNodeId`, so a legitimate same-term candidate is still granted afterward) when the request's last-log term/index is a negative or missing wire field; the base-class `isUpToDate` — the single feed-in point all three pre-vote handlers share (follower/candidate/leader) — now refuses with a plain `false` (warn, no state change) on a hostile/missing tail, sealing all three roles with no handler-side change; `isHostileWireTermIndex` lifted to `RaftNodeBehavior` as a shared static (the follower's copy deleted; the three 6(h) append-path call sites resolve via the inherited static, unchanged) | `stage 6(i)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -31,7 +32,10 @@ pre-existing skip** (+3 leader laggard-branch pins); and after stage 6(g): **341
 green, 0 failures, 1 pre-existing skip** (+2: one pin per TermIndex IAE escape); and
 after stage 6(h): **347 tests green, 0 failures, 1 pre-existing skip** (+6: three
 follower append-path refusal pins and three leader ack-path refusal pins, closing the
-append/ack surface of the 6(g) hostile-wire-tail mechanism).
+append/ack surface of the 6(g) hostile-wire-tail mechanism; and after stage 6(i): **352
+tests green, 0 failures, 1 pre-existing skip** (+5: two follower vote-path refusal pins
+and three pre-vote role refusal pins, closing the vote surface of the hostile-wire-tail
+mechanism).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -487,3 +491,72 @@ exhausted; the same question over the vote path still open (recorded here, not y
 pinned): `onVoteRequest` and `onPreVoteRequest` compare the last log entry's term/index
 against the incoming request's term/index — two more sites where a hostile wire value
 meets the same unguarded constructors and comparators, and the natural 6(i) candidate.
+
+**Non-happy-path hardening pass, seventh round (2026-11-23, stage 6(i))** — the two
+candidate sites the 6(h) pass recorded, now closed. Grep-confirmed exhaustive: these are
+the only remaining places a wire `TermIndex` meets a domain constructor or comparator
+without a guard.
+
+**Follower — `onVoteRequest` (production change).** The accept path feeds the request's
+last-log term/index into the up-to-date comparison *after* clearing `leaderId` — the
+post-mutation throw kind the 6(g)/6(h) passes established as the dangerous one, only
+here the mutation already performed is the cheaper one (no entries appended, no commit
+move). The guard sits after the term ladder — a strictly higher term still runs the
+`convertToFollowerForVote` re-dispatch first, so term recognition is not blocked by the
+refusal — and before `leaderId` is cleared and before the comparison. The refusal takes
+the exact shape of the handler's own ordinary denial below it: warn, re-armed election
+timer, one explicit false `VoteResponse`. The denial carries the voter's **own**
+committed tail (`self.logs.getCommittedTermIndex()`, the L159 convention): a
+well-formed response even when the request's tail is hostile, and the candidate learns
+our real progress instead of echoing back garbage. Crucially, the refusal leaves
+`votedForNodeId` untouched — it is grant-only — so the denial does not burn the node's
+single per-term vote: a legitimate up-to-date candidate in the same term is still
+granted afterward. (Had the refusal burned the vote, the same-term guard at the top of
+the handler would silence that candidate entirely.)
+
+**Base class — `isUpToDate` (production change).** The single feed-in point all three
+pre-vote handlers share — follower, candidate, leader — and the one place a hostile
+tail met the domain constructor on the pre-vote path. The guard lives **inside**
+`isUpToDate`: hostile or missing tail → warn + `false`; the three callers are sealed
+with zero handler-side change. The base warn omits the remote id (no `sender` in scope
+at the base); each caller already logs its own denial with context. The fit with
+`isUpToDate`'s documented pure-read contract is exact: a refusal is a read result, not
+a mutation, and a pre-vote denial trivially never sets `votedFor` — the pre-vote round
+is hypothetical by design. As in 6(h), clamping is deliberately **not** the tool:
+clamping a candidate's reported last entry would manufacture a phantom up-to-date
+comparison (or a phantom log position), converting a denial into a false grant.
+
+**Refactor.** `isHostileWireTermIndex` lifted from the follower to `RaftNodeBehavior`
+as a package-private static (its parameter is the fully-qualified wire type; the base's
+wildcard import makes bare `TermIndex` the domain type). The follower's private copy is
+deleted; its three `hasHostileWireTermIndex` append-path call sites (added in 6(h))
+resolve via the inherited static, source-unchanged — regression-verified by re-running
+both 6(h) snapshot classes in the isolated run.
+
+**Pins, five total (8 hostile-tail requests).** Two in
+`RaftNodeBehaviorFollowerVoteTest`: a negative-index tail, and a null tail. Each asserts
+the full refusal contract — exactly one explicit denial (not silence, not an escape),
+the denial echoing the accepted term and carrying the voter's **pre-request** committed
+tail, the term conversion intact (FOLLOWER of term 1, role unchanged) — plus the
+discriminator: a legitimate up-to-date candidate in the same term is still granted
+afterward. Three in `RaftNodeBehaviorPreVoteTest`, one per voter **role**: the follower
+(term 1 request vs own term 0, `>=` gate passed in both requests), the candidate (two
+peers → majority 2 blocks self-election, so a deterministic term-1 candidate; term-2
+requests vs its term 1), and the leader (same fixture plus `convertToLeader()`). Each
+role's voter is sent a null-tail and a negative-tail `PreVoteRequest` to two
+`RecordingSenders` — exactly two denials, each echoing the request term — and then a
+legitimate up-to-date pre-vote in a `RecordingSender` of its own — granted. Role and
+term unchanged in all three: a refusal is not a step-down, not a promotion, not a term
+advance.
+
+Isolated runs: follower-vote class **3 green** (1 → 3), pre-vote class **13 green**
+(10 → 13), both 6(h) snapshot classes unchanged at **24/23 green** — the inherited
+static resolves from the follower's append-path guard. Final suite: **352 tests green, 0
+failures, 1 pre-existing skip** (+5 over the 6(h) baseline). The vote surface of the
+hostile-wire-tail mechanism is now closed: every site where a wire `TermIndex` meets a
+domain constructor or comparator on the snapshot (6d–6g), append/ack (6h), or vote
+(6i) path now refuses fail-closed before any mutation the accept path had already
+performed. The non-happy-path hardening of the in-memory cache's Raft layer is
+exhausted for the current surface; the next items are the planned structural backlog —
+(A) spill-to-disk durable store, (B) partition ownership, (C) fixed-cluster topology,
+and (D) infra debt.
