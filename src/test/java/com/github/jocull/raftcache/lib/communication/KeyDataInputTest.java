@@ -28,4 +28,27 @@ public class KeyDataInputTest {
 
         assertThrows(UnsupportedOperationException.class, () -> snapshot.getData().put("hello", new byte[16]));
     }
+
+    // --- Non-happy-path intake pins (stage 7(a)): the constructor-carrier axes must be named ---
+
+    @Test
+    void testNullKeyNamesAxis() {
+        // Pre-fix: NPE thrown (the guard sat in the right place) but its message is null —
+        // the key axis never named.
+        final NullPointerException ex = assertThrows(NullPointerException.class,
+                () -> new KeyDataInput(null, Map.of("value", new byte[] { 1 })),
+                "A null key must be refused at the constructor");
+        assertEquals("key", ex.getMessage(),
+                "A constructor carrier must name the dependency it refuses");
+    }
+
+    @Test
+    void testNullDataNamesAxis() {
+        // Pre-fix: NPE thrown with a null message — the data axis never named.
+        final NullPointerException ex = assertThrows(NullPointerException.class,
+                () -> new KeyDataInput("key-1", null),
+                "A null data map must be refused at the constructor");
+        assertEquals("data", ex.getMessage(),
+                "A constructor carrier must name the dependency it refuses");
+    }
 }

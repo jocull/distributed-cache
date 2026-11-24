@@ -9,8 +9,8 @@ public class KeyDataOutput {
     private final long version;
 
     public KeyDataOutput(String key, Map<String, byte[]> data, long version) {
-        Objects.requireNonNull(key);
-        Objects.requireNonNull(data);
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(data, "data");
 
         this.key = key;
         this.data = Map.copyOf(data);

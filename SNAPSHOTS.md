@@ -38,6 +38,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(x) | non-happy-path hardening (twenty-second pass, the partition-intake layer directly beneath the 6(v)/6(w) boundary: `KeyMap` — the per-partition key store every `PartitionMap` data intake delegates to, and the silent state-machine path `StateMachineBridge` applies through — had NO gate of its own: `setEntry(null, dv)` rode HashMap's legal-null-key slot straight in, installing a `KeyValue` under a null key AND publishing the `SetDataEvent` naming an unnameable key (a silent install *with* a bus trace — the campaign's worst admission shape); `setEntry(key, null)` installed the shell FIRST and threw only deep (the 6(w) shape one layer up — the shell survived, and a later `deleteEntry` removed it, publishing a `DeleteDataEvent` for a key never written); `getEntry`/`deleteEntry`/`expireEntry` served empty/false on null silently (asymmetric with the IAE family one layer above on the exact same axis); `restore` CLEARED the partition before validating its state map, so a forged null-key/null-value map (construction-legit: `HashMap` admits both, `capture()` would never emit them) silently installed the null-key phantom with the legitimate entries dropped, or threw the version's `DataVersion` IAE after the clear (mutate-then-throw, partial install reached the `capture()` pin); and `PartitionMap`'s two constructor-carrier NPEs carried NO message — the one constructor in the data plane missing the house named-NPE rule (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs") — and `getPartitionForKey(null)` NPE'd at `key.hashCode()` where every data-plane intake IAEs. The intakes now refuse at the method head in the 6(v) IAE family (`"key must not be null"` in all four `KeyMap` intakes; `"data must not be null"` in `setEntry` before the shell is computed or any event published; `restore` pre-validates the whole state — state/key/state value — before the synchronized clear-install, mirroring the `PartitionMap.restore` template with zero state change on refusal); the constructor carriers now name their dependency (`"eventBus must not be null"`, `"clock must not be null"`); `getPartitionForKey` refuses a null key naming the axis — carrying the legitimate-install-still-works, no-event-published-on-refused-write, shell-not-left-behind (a later `deleteEntry` neither returns true nor publishes), and refused-restore-leaves-the-installed-state-untouched (no clear, no partial install, no phantom) discriminators | `stage 6(x)` |
 | 6(y) | non-happy-path hardening (twenty-third pass, the fan-out root no round visited: `EventBus` — the shared bus every sealed subscriber (the `StateMachineBridge` intake, the leader's `AppendLog` subscriber, `Replica`) sits on — had NO gate of its own: `subscribe(null)` silently parked a null element in the `CopyOnWriteArrayList` (null elements are legal there), so the next legitimate publish NPE'd AT DISPATCH (`s.onEvent` on a null subscriber), starving every subscriber after the null one in list order — a bus-level crash triggered by a shape no sealed intake above can emit; `unsubscribe(null)` was a silent no-op indistinguishable from removing a never-subscribed handle; `publish(null)` fanned the null event OUT to the null-tolerant `instanceof`-shaped subscribers (which swallow anything non-matching, including null) and was only refused deep, by the sealed `StateMachineBridge` intake, mid-iteration — aborting delivery to the subscribers after it (6(v) sealed that axis only at the consumer side, the fan-out itself was raw). The three intakes now refuse at the method head in the 6(v) IAE family (`"subscriber must not be null"` for `subscribe` and `unsubscribe`; `"event must not be null"` for `publish` — the same axis name the `StateMachineBridge` intake already speaks on the consumer side, now spoken by the producer BEFORE any subscriber is invoked), with zero state change and zero fan-out on refusal — carrying the no-crash-at-dispatch (a refused subscription leaves both neighboring subscribers still served the legitimate event), installed-subscribers-untouched, zero-fan-out (a refused publish reaches neither of two null-tolerant recorders, where pre-fix the null rode to ALL subscribers silently, or was refused only mid-iteration by the bridge), and legitimate-intake-still-works (subscribe → publish → served exactly once; unsubscribe → publish → not served again) discriminators | `stage 6(y)` |
 | 6(z) | non-happy-path hardening (twenty-fourth pass, the public client API boundary — the last unsealed surface on the data plane): `DistributedCache` — the phase-4 facade every caller touches (`put`/`delete`/`expire`/`get`, and the constructor that wires the bus, the nodes, and the map) — still spoke the pre-campaign style: seven bare `Objects.requireNonNull` calls with no message, in the WRONG FAMILY — the method intakes NPE'd (the messageless JDK call) where the sealed layer below (`PartitionMap`, 6(v)) throws NAMED IAEs (`key`/`data`/`ttl must not be null`), so `put(key, null)` / `put(null, data)` / `delete(null)` / `expire(null, ttl)` / `expire(key, null)` were indistinguishable from a failure deep in the wiring, and `get(null)` NPE'd at the facade head while the sealed seam one layer below has already spoken the named axis since 6(v); the three constructor NPEs (`clusterEventBus`/`nodes`/`partitionMap`) carried no message either — the one boundary in the data plane whose carriers do not name their dependencies (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs", `PartitionMap` "eventBus"/"clock"). The guards sat in the right PLACE (before `findLeaderNode()`/`submit()` — the only barrier standing a null-key entry from riding `leader.submit` into the raft log) but refused unnamed and in the wrong family; the five method intakes now refuse at the head in the 6(v) IAE family — key/data in `put`, key in `delete`, key/ttl in `expire`, key in `get` — before leader resolution, before `submit`, before any state change, and the constructor carriers now name their dependencies (`clusterEventBus`/`nodes`/`partitionMap`), the empty-nodes IAE kept — carrying the zero-submissions (a recording stub leader proves a refused write never reaches the log), the empty-list-IAE-still-holds, and the legitimate-intake-still-routes (a legitimate `put` reaches the leader exactly once and a legitimate `get` is still served) discriminators | `stage 6(z)` |
+| 7(a) | non-happy-path hardening (twenty-fifth pass, the entry-payload carrier layer — the log-entry payloads every sealed surface rides: `KeyDataInput` / `KeyDataOutput` / `KeyDataDeleteInput` / `KeyDataExpireInput`): the last unnamed constructor family in the data plane — all four heads still spoke the pre-campaign style, seven bare messageless `Objects.requireNonNull` calls whose `NullPointerException.getMessage()` is `null`, so a refused `null` was indistinguishable from a failure deep in the wiring, while the house constructor-carrier family names the dependency it refuses (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs", and since 6(z) the facade's own `clusterEventBus`/`nodes`/`partitionMap`) — now every head names its axis at the constructor (`key` in all four, `data` in Input/Output, `ttl` in Expire), `KeyDataExpireInput`'s named `"ttl must be positive. Provided: …"` IAE and its key → null-ttl → positivity ordering kept intact — carrying the axis-named refusals (a refused carrier never exists), the positivity-IAE-still-holds (zero and negative `ttl`), and the legitimate-construction-still-succeeds (a well-formed carrier still builds and its getters still read back) discriminators | `stage 7(a)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -215,7 +216,15 @@ seam one layer below has spoken the named axis since 6(v), and the three constru
 carriers (`clusterEventBus`/`nodes`/`partitionMap`) refused with no message — the one
 boundary in the data plane whose carriers do not name their dependencies — the five
 intakes now refuse at the head in the 6(v) IAE family before leader resolution and
-before `submit`, and the constructor carriers name their dependencies; see §7).
+before `submit`, and the constructor carriers name their dependencies; see §7); and
+after stage 7(a): **433 tests green, 0 failures, 1 pre-existing skip** (+11: the
+entry-payload carrier layer (`lib/communication` — `KeyDataInput`, `KeyDataOutput`,
+`KeyDataDeleteInput`, `KeyDataExpireInput`), the log-entry payloads every sealed
+surface rides, still spoke the pre-campaign style: seven bare messageless
+`Objects.requireNonNull` calls naming no axis — a refused `null` produced an NPE with
+a `null` message — while the house constructor-carrier family names the dependency it
+refuses; now every head names `key`/`data`/`ttl` at the constructor and the
+`"ttl must be positive. Provided: …"` IAE is kept; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -2013,3 +2022,67 @@ since 6(v) now closes the public client API boundary: the facade every caller of
 cache touches, refusing hostile intakes at the head with the axis named — before
 leader resolution, before `submit`, before any state change — and the constructor
 carriers naming their dependencies, as the rest of the data plane does.
+
+**Non-happy-path hardening pass, twenty-fifth round (2026-11-24, stage 7(a))** — the
+entry-payload carrier layer: 6(v) sealed the apply/data plane at the boundary
+(`PartitionMap`'s intakes), 6(w) its value carriers, 6(x) the key store they write
+through, 6(y) the bus every subscriber sits on, 6(z) the facade every caller touches —
+but the entry-payload carriers those sealed seams route through, the log-entry
+payloads that `StateMachineBridge` applies, `PartitionMap` stores, and
+`DistributedCache` submits, still carried only bare guards:
+
+- **Constructor carriers — the axis never named, the message `null`.** All four
+  carriers — `KeyDataInput` (`key` + `data`), `KeyDataOutput` (`key` + `data`),
+  `KeyDataDeleteInput` (`key`), `KeyDataExpireInput` (`key` + `ttl`) — guarded their
+  null axes with bare messageless `Objects.requireNonNull` calls (seven in total): a
+  refused `null` produced a `NullPointerException` whose `getMessage()` is `null`. The
+  refusal sat in the right family (the house constructor-carrier rule names the
+  dependency it refuses — `Snapshot` "entries", `DataVersion` "data",
+  `LogsCommitted` "logs", `PartitionMap` "eventBus"/"clock", and since 6(z) the
+  facade's own `clusterEventBus`/`nodes`/`partitionMap`) and the seams sat in the
+  right layer — the very same class family already speaking the house IAE language
+  (`KeyDataExpireInput` carries `"ttl must be positive. Provided: ..."`) — but the
+  null axes just never adopted the named style, so a refusal was indistinguishable
+  from a failure deep in the wiring: the caller could not tell "you passed null"
+  from "the wiring produced a null".
+
+The 7(a) fix moves the four constructor heads to the named 2-arg form
+(`Objects.requireNonNull(x, <axis>)`), each axis named, in the house
+constructor-carrier family, with the one existing named IAE kept intact and its
+ordering preserved:
+
+- `KeyDataInput` — constructor names `key`, then `data`;
+- `KeyDataOutput` — constructor names `key`, then `data`;
+- `KeyDataDeleteInput` — constructor names `key`;
+- `KeyDataExpireInput` — constructor names `key`, then `ttl`; the named
+  `"ttl must be positive. Provided: ..."` IAE and the key → null-ttl → positivity
+  ordering kept (a `null` ttl is still a NPE naming `ttl`; a zero or negative one is
+  still the IAE naming the provided value).
+
+**Pin (RED-confirmed before the fix, then GREEN), 13 across four test classes
+in-package (`lib/communication`):** RED re-confirmed against the pre-fix carriers —
+all seven axis pins failed `expected: <key|data|ttl> but was: <null>` (the
+`NullPointerException` WAS thrown — the guard sat in the right place, the
+`lib/communication` head — its message was the JDK `null`), with exactly the six
+control/IAE pins green (the two pre-existing immutability discriminations, the two
+positive-IAE pins — `PT0S` and `PT-1S` — and the two legitimate-construction
+sanities). Then GREEN: the seven axis pins assert the NPE names the axis (a refused
+carrier never exists — zero construction, zero state change before or after the
+refusal), the two positive-IAE pins assert the named refusal still holds for a zero
+(`Duration.ZERO` → `"ttl must be positive. Provided: PT0S"`) and a negative
+(`Duration.ofSeconds(-1L)` → `"ttl must be positive. Provided: PT-1S"`) `ttl` — the
+new null guards do not shadow the pre-existing IAE — and the two
+`testValidConstructionSanity` controls pin the legitimate-intake-discrimination: a
+well-formed carrier still builds and its `getKey()` / `getTtl()` read back (a guard
+that refuses everything is as broken as one that refuses nothing).
+
+Isolated (`KeyDataInputTest` / `KeyDataOutputTest` / `KeyDataDeleteInputTest` /
+`KeyDataExpireInputTest`): **13 green / 0 fail / 0 skip**.
+Full suite at this point: **433 tests green, 0 failures, 1 pre-existing skip**
+(+11 over the 6(z) baseline of 422). With this the house constructor-carrier family
+— `Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs", `PartitionMap`
+"eventBus"/"clock", the `DistributedCache` `clusterEventBus`/`nodes`/`partitionMap` —
+now names its dependency end-to-end across the data plane, including the
+carrier layer every sealed surface rides on: the entry payloads
+`StateMachineBridge` applies, `PartitionMap` stores, and `DistributedCache` submits
+(code `stage 7(a)`).

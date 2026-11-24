@@ -11,8 +11,8 @@ public class KeyDataInput implements Serializable {
     private final Map<String, byte[]> data;
 
     public KeyDataInput(String key, Map<String, byte[]> data) {
-        Objects.requireNonNull(key);
-        Objects.requireNonNull(data);
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(data, "data");
 
         this.key = key;
         this.data = Map.copyOf(data); // Immutable!

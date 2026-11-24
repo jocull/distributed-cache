@@ -20,7 +20,7 @@ public class KeyDataDeleteInput implements Serializable {
     private final String key;
 
     public KeyDataDeleteInput(String key) {
-        Objects.requireNonNull(key);
+        Objects.requireNonNull(key, "key");
         this.key = key;
     }
 

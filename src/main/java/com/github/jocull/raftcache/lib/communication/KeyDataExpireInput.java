@@ -25,8 +25,8 @@ public class KeyDataExpireInput implements Serializable {
     private final Duration ttl;
 
     public KeyDataExpireInput(String key, Duration ttl) {
-        Objects.requireNonNull(key);
-        Objects.requireNonNull(ttl);
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(ttl, "ttl");
         // Note: Duration has isNegative()/isZero() but not isPositive() (that is a Period
         // method), and this toolchain's --release 17 profile is missing it anyway
         if (ttl.isNegative() || ttl.isZero()) {
