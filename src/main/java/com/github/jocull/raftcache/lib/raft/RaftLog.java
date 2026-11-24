@@ -7,8 +7,8 @@ public class RaftLog<T> {
     private final T entry;
 
     public RaftLog(TermIndex termIndex, T entry) {
-        Objects.requireNonNull(termIndex);
-        Objects.requireNonNull(entry);
+        Objects.requireNonNull(termIndex, "termIndex");
+        Objects.requireNonNull(entry, "entry");
 
         this.termIndex = termIndex;
         this.entry = entry;

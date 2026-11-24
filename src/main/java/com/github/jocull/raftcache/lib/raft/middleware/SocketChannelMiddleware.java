@@ -94,7 +94,7 @@ public class SocketChannelMiddleware implements ChannelMiddleware, AutoCloseable
      * @throws IllegalStateException if the socket cannot be bound
      */
     public SocketChannelMiddleware(String host) {
-        Objects.requireNonNull(host);
+        Objects.requireNonNull(host, "host");
         final ServerSocket bound;
         try {
             bound = new ServerSocket();
