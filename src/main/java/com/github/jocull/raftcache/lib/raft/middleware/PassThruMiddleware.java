@@ -42,7 +42,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
     }
 
     public synchronized PassThruMiddleware addNode(RaftNode raftNode) {
-        Objects.requireNonNull(raftNode);
+        Objects.requireNonNull(raftNode, "raftNode must not be null");
         addressRaftNodeMap.compute(raftNode.getNodeAddress(), (k, v) -> {
             if (v != null) {
                 throw new IllegalArgumentException("Node " + v.getId() + " already registered!");

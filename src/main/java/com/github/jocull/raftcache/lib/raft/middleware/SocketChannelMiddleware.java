@@ -121,7 +121,7 @@ public class SocketChannelMiddleware implements ChannelMiddleware, AutoCloseable
     }
 
     public SocketChannelMiddleware addNode(RaftNode raftNode) {
-        Objects.requireNonNull(raftNode);
+        Objects.requireNonNull(raftNode, "raftNode must not be null");
         synchronized (addressRaftNodeMap) {
             addressRaftNodeMap.compute(raftNode.getNodeAddress(), (k, v) -> {
                 if (v != null) {
@@ -180,7 +180,8 @@ public class SocketChannelMiddleware implements ChannelMiddleware, AutoCloseable
     @Override
     public ChannelSide openChannel(RaftNode source, NodeAddress targetAddress) {
         Objects.requireNonNull(source, "source must not be null");
-        final NodeAddress clientAddress = Objects.requireNonNull(source.getNodeAddress());
+        final NodeAddress clientAddress = Objects.requireNonNull(source.getNodeAddress(),
+                "source.getNodeAddress() must not be null");
         if (closed) {
             throw new IllegalStateException("This middleware is closed");
         }
@@ -408,7 +409,7 @@ public class SocketChannelMiddleware implements ChannelMiddleware, AutoCloseable
         }
 
         private void setReceiver(Consumer<Object> newReceiver) {
-            Objects.requireNonNull(newReceiver);
+            Objects.requireNonNull(newReceiver, "newReceiver must not be null");
             final List<Object> backlog;
             synchronized (receiverLock) {
                 this.receiver = newReceiver;

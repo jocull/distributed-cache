@@ -41,6 +41,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 7(a) | non-happy-path hardening (twenty-fifth pass, the entry-payload carrier layer — the log-entry payloads every sealed surface rides: `KeyDataInput` / `KeyDataOutput` / `KeyDataDeleteInput` / `KeyDataExpireInput`): the last unnamed constructor family in the data plane — all four heads still spoke the pre-campaign style, seven bare messageless `Objects.requireNonNull` calls whose `NullPointerException.getMessage()` is `null`, so a refused `null` was indistinguishable from a failure deep in the wiring, while the house constructor-carrier family names the dependency it refuses (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs", and since 6(z) the facade's own `clusterEventBus`/`nodes`/`partitionMap`) — now every head names its axis at the constructor (`key` in all four, `data` in Input/Output, `ttl` in Expire), `KeyDataExpireInput`'s named `"ttl must be positive. Provided: …"` IAE and its key → null-ttl → positivity ordering kept intact — carrying the axis-named refusals (a refused carrier never exists), the positivity-IAE-still-holds (zero and negative `ttl`), and the legitimate-construction-still-succeeds (a well-formed carrier still builds and its getters still read back) discriminators | `stage 7(a)` |
 | 7(b) | non-happy-path hardening (twenty-sixth pass, the raft-core bootstrap/transport carrier layer — the layer every sealed surface addresses: `NodeAddress` (topology identity — the address every connection dials and every `AnnounceClusterTopology` list carries), `Handshake` (the bootstrap frame every connection writes first), `InstallSnapshot` (the 6(g) message boundary the 6-series hostile pins refuse at construction), and the `AppendEntries.RaftLog` entry carrier (the log entries the sealed leader/follower seams apply)): the family still spoke the pre-campaign style — six bare messageless `Objects.requireNonNull` calls whose `NullPointerException.getMessage()` is `null`, so a refused `null` was indistinguishable from a failure deep in the wiring, while the house constructor-carrier family names the dependency it refuses — now every head names its axis at the constructor (`address` in `NodeAddress`, `client`/`target` in `Handshake`, `leaderId`/`payload` in `InstallSnapshot`, `entry` in `RaftLog`), a pure message rename (the guards stay in place, the exception type unchanged — the 6(g) class-only pin `aNullPayload_isBlockedAtTheMessageBoundary_soTheFollowerNeverSeesOne` and every 6-series hostile-shape pin keep building and rejecting exactly as before), while the bare identity family (`messages.NodeIdentifier`, `topology.NodeIdentifier`/`NodeIdentifierAddress`, `Introduction`) and `RaftLog`'s sibling `termIndex` axis stay deliberately bare by the 6(i)/6(k) decision (the receiver seams refuse those axes, and the 6(i) hostile-carrier pin constructs them on purpose) — carrying the axis-named refusals (a refused carrier never exists) and the legitimate-construction-still-succeeds (a well-formed carrier still builds and its getters still read back) discriminators | `stage 7(b)` |
 | 7(c) | non-happy-path hardening (twenty-seventh pass, the last unnamed constructor-carrier axes in `src/main` — the two family members no round visited: `RaftLog` (the raw log-entry carrier in `lib/raft` — the type `StateMachineBridge` applies, `CompletableRaftLog` extends, `RaftLogs` seeds with `EPOCH_LOG`), and `SocketChannelMiddleware`'s `host` constructor (the head the no-arg loopback constructor delegates to)): the family's final two members still spoke the pre-campaign style — three bare messageless `Objects.requireNonNull` calls whose `NullPointerException.getMessage()` is `null`, so a refused `null` was indistinguishable from a failure deep in the wiring, while the house constructor-carrier family names the dependency it refuses — and, unlike every earlier round, both heads had never been pin-constructed (zero constructions of either carrier anywhere in `src/test`) — now every head names its axis at the constructor (`termIndex`/`entry` in `RaftLog`, `host` in `SocketChannelMiddleware`), a pure message rename (the guards stay in place, the exception type unchanged), with this the unnamed constructor-carrier family is grep-provably exhausted (zero bare constructor-head guards remain in `src/main`) while the four remaining bare guards are method intakes on the facade-intake line (`PassThruMiddleware.addNode`, `SocketChannelMiddleware.addNode`, `openChannel`'s node-address guard, the private `setReceiver`) — off the 7-series constructor-carrier theme, recorded as the campaign's next candidate (stage 8(a) on the 6(z) intake line) — carrying the axis-named refusals (a refused carrier never exists; the host refusal precedes the bind — no socket, no acceptor thread) and the legitimate-construction-still-succeeds (a well-formed carrier still builds and its getters still read back) discriminators | `stage 7(c)` |
+| 8(a) | non-happy-path hardening (twenty-eighth pass, the last four bare `Objects.requireNonNull` guards in `src/main` — the 7(c) closeout's own next-candidate inventory: `PassThruMiddleware.addNode` and `SocketChannelMiddleware.addNode` (the two facade-intake heads), `SocketChannelMiddleware.openChannel`'s node-address guard (`source.getNodeAddress()` — the client address every handshake and `ChannelSide` names), and the private `Connection.setReceiver` (the receiver-install seam, public via `ChannelSide.setReceiver`)): the method-intake family's last members still spoke the pre-campaign style — bare `requireNonNull` calls whose NPE message is `null`, so a refused `null` was indistinguishable from a failure deep in the wiring, while the same two files already speak the 6(z) prose family (`"source must not be null"`, `"nodeAddress must not be null"`); now all four name their axes in that prose family (`"raftNode must not be null"` ×2, `"source.getNodeAddress() must not be null"`, `"newReceiver must not be null"`), a pure message rename (the guards stay in place, the exception type unchanged, the pre-campaign class-only `openChannel(null, …)` pin unaffected — the pin audit found the null-`source` head already class-pinned, the node-address axis and both `addNode` heads never pinned, and `setReceiver` reachable through `ChannelSide.setReceiver`); the six pins across the two new test classes (including the two legitimate-intake-still-routes controls) carry the axis-named refusals; with this the bare-guard inventory of `src/main` is grep-provably exhausted — zero bare `Objects.requireNonNull` calls remain anywhere in `src/main` — and the campaign's non-happy-path hardening line is complete | `stage 8(a)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -246,7 +247,13 @@ carrier's `termIndex`/`entry` and the transport middleware's bind-host intake
 7-series constructor-carrier family (grep-provably: zero bare
 constructor-head guards remain in `src/main`); the four remaining bare guards
 are method intakes on the facade-intake line, recorded as the next-candidate
-stage 8(a); see §7).
+stage 8(a); see §7); and after stage 8(a): **454 tests green, 0 failures,
+1 pre-existing skip** (+6: the last four bare `Objects.requireNonNull`
+guards in `src/main` — the 7(c) closeout's own next-candidate inventory, all
+on the facade-intake line — now name their axes in the 6(z) prose family,
+closing the last family on the intake line (grep-provably: zero bare
+`Objects.requireNonNull` calls remain anywhere in `src/main`) and the
+campaign's non-happy-path hardening line; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -2236,3 +2243,49 @@ are method intakes on the facade-intake line (the 6(z) family):
 `SocketChannelMiddleware.openChannel`'s node-address guard, and the private
 `setReceiver` — off the 7-series constructor-carrier theme, recorded as the
 campaign's next candidate (stage 8(a)) (code `stage 7(c)`).
+
+**Non-happy-path hardening pass, twenty-eighth round (2026-11-24, stage 8(a))** — the
+four bare `Objects.requireNonNull` guards the campaign's closeout inventory left standing:
+7(c)'s own next-candidate list, all method intakes on the facade-intake line (the 6(z)
+family): `PassThruMiddleware.addNode` (the in-memory middleware the phase-3 tests drive),
+`SocketChannelMiddleware.addNode` (the real-socket middleware),
+`SocketChannelMiddleware.openChannel`'s node-address guard
+(`Objects.requireNonNull(source.getNodeAddress())` — the client address every handshake
+and `ChannelSide` names), and the private `Connection.setReceiver` (the receiver-install
+seam, public surface `ChannelSide.setReceiver`): each still spoke the pre-campaign style —
+a bare `requireNonNull` whose `NullPointerException.getMessage()` is `null`, so a refused
+`null` was indistinguishable from a failure deep in the wiring — while the same two files
+already speak the 6(z) prose family on their neighboring axes (`"source must not be
+null"`, `"nodeAddress must not be null"`).
+
+The pin audit found the pre-campaign `SocketChannelMiddlewareTest` pin on the null-`source`
+head is class-only (no message assertion), so renaming it disturbs nothing; the node-address
+axis, both `addNode` heads, and `setReceiver` had never been pinned at all; and
+`setReceiver`'s refusal point is a private method reachable only through the public
+`ChannelSide.setReceiver` — the N1 bootstrap shape, where the node installs its own sink.
+
+The 8(a) fix moves the four axes to the named 2-arg form in the 6(z) prose family:
+`"raftNode must not be null"` (both `addNode` heads), `"source.getNodeAddress() must not
+be null"` (the `openChannel` node-address guard — named by the exact expression it
+refuses, keeping it distinct from the method's `targetAddress` axis, whose refusal is an
+`IllegalArgumentException`), and `"newReceiver must not be null"` (the `setReceiver`
+head) — a pure message rename: the guards stay in place, the exception type is
+unchanged, and every pre-campaign pin keeps passing exactly as before.
+
+RED confirmed: the four axis-named refusals failed their message checks with
+`expected: <raftNode|source.getNodeAddress()|newReceiver> must not be null but was:
+<null>` — the NPE was thrown, the guard sat in the right place, its message was the JDK
+null — while the two legitimate-intake controls ran green (a well-formed node still
+registers at its own address; a well-formed channel still opens and installs its
+receiver). GREEN: isolated (`PassThruMiddlewareIntakeTest` /
+`SocketChannelMiddlewareIntakeTest`) **6 green / 0 fail / 0 skip**.
+
+Full suite at this point: **454 tests green, 0 failures, 1 pre-existing skip**
+(+6 over the 7(c) baseline of 448). With this the bare-guard inventory of `src/main`
+is grep-provably exhausted — a `grep -E 'requireNonNull\([^,()]*\);' -r src/main` over
+the sealed tree returns zero hits: every `Objects.requireNonNull` in `src/main` now
+names the axis it refuses (constructor-carriers in the 7-series short-axis family,
+method intakes in the 6(z) prose family) — and the campaign's non-happy-path
+hardening line is complete: every bare `requireNonNull` present at campaign start
+now names its axis, and every one of those refusals is pinned with its axis-named
+message plus a legitimate-intake-still-works discriminator (code `stage 8(a)`).
