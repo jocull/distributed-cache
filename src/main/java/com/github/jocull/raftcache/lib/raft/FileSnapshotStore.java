@@ -136,6 +136,20 @@ public class FileSnapshotStore implements SnapshotStore {
             // exactly like an unparseable name.
             final List<Path> snapshots = new ArrayList<>();
             files.filter(this::isSnapshotFile).forEach(p -> {
+                // The TYPE axis of the same family (stage 6q): the 6(d) gate is on the NAME
+                // and the 6(o) gate is on the BODY — hasPayload is a stat, and a directory's
+                // stat legitimately reports a positive size, so neither can express "am I a
+                // regular file?", which is the only question a directory answers with "no".
+                // A save() only ever writes regular files, so a non-regular entry that
+                // carries a snapshot name is a foreign object: selecting it masks or blows
+                // up the load (readAllBytes on it throws), and it is left in place. A
+                // vanished or unstat'able entry lands here too (isRegularFile is false for
+                // both): skipped, never masquerading as hollow-but-present.
+                if (!Files.isRegularFile(p)) {
+                    LOGGER.warn("Ignoring snapshot entry {} in {}: it is not a regular file, so it cannot carry a readable payload (a save writes only regular files)",
+                            p.getFileName(), directory);
+                    return;
+                }
                 try {
                     parseBoundary(p);
                 } catch (RuntimeException e) {
@@ -232,6 +246,16 @@ public class FileSnapshotStore implements SnapshotStore {
     private void deleteSuperseded(Path keep) throws IOException {
         try (Stream<Path> files = Files.list(directory)) {
             files.filter(this::isSnapshotFile)
+                    // The TYPE axis on the write path (stage 6q): a save() writes regular
+                    // files and nothing else, so a NON-REGULAR entry with a snapshot-shaped
+                    // name (a foreign directory) is not a superseded snapshot — deleting it
+                    // would throw on a non-empty one (DirectoryNotEmptyException, escaping
+                    // save as a RuntimeException AFTER the new file is already in place), or
+                    // silently tear down a foreign object on an empty one. loadLatest skips
+                    // the same shape, so sparing it here keeps the pair consistent: an
+                    // entry that is not a regular file is inert under our naming scheme —
+                    // never read, never torn out.
+                    .filter(Files::isRegularFile)
                     .filter(p -> !p.equals(keep))
                     .forEach(p -> {
                         try {

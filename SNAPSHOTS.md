@@ -28,6 +28,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(n) | non-happy-path hardening (twelfth pass): the last open axis of the message-`field` null family the 6(k)–6(m) identity passes left — not the sender (6(k)–6(m)), not a hostile term/index (6(g)–6(i)), not a null <i>slot</i> (6(j)), but a null <i>payload</i> inside an otherwise well-formed append entry. The wire `AppendEntries.RaftLog` constructor null-guards `entry` (`requireNonNull`), which made the shape look unreachable — but Java deserialization reconstructs fields without calling constructors, so a hostile or corrupted stream carries the payload past the construction guard, and on the direct-handler surface that is the one vector that reaches the accept path with an entry the construction layer never accepted. Without the extension the refusal was never even reached: `RaftLogs.appendLogInternal` deletes conflicting entries FIRST (real log state torn out) and only then NPEs out of `CompletableRaftLog` construction — the throw-after-mutation family 6(e)/6(g)/6(h) closed on the other axes, here through a different field. `hasHostileWireTermIndex` now classifies `entry.getEntry() == null` in the same per-entry pass (alongside the 6(h) hostile term/index and the 6(j) null slot), so the follower's `onAppendEntries` refuses in the established 6(g)/6(h)/6(j) shape before ANY mutation — before `containsStartPoint`, before the leader install, before the append — one false ack answering in OUR term with OUR unchanged tail, zero state change (no leader, no append, no commit move, nothing applied). A null payload is structurally invalid exactly like a null slot or a missing term/index, so it is refused, not negotiated (no clamping); the full message-`field` null audit — the sealed matrix of every remaining carrier and why each needs no guard (consumer-inert reads, primitive-only fields, and the construction-guarded rest) — is recorded in §7 | `stage 6(n)` |
 | 6(o) | non-happy-path hardening (thirteenth pass, audit sweep of the `SnapshotStore` file surface): the empty-<i>body</i> axis of the 6(d) family — a file whose NAME parses to a valid boundary but whose body is ZERO BYTES (`raft-snapshot-99-99.snap` in a shared directory, left by a crashed or foreign writer: both `save()`s reject an empty payload, so the shape cannot come from this store) — was being handed back as a `Stored` (the record null-checks the payload but not its length) and, named for a higher boundary than the real snapshot, MAX-BY-BOUNDARY masked the real one. `loadLatest` now warns and skips empty-payload files in the collect pass — parallel to the 6(d) unparseable-name skip (a hollow body is a no-snapshot, left in place, never allowed to blow up an otherwise clean load), and the `Stored` record completes the invariant symmetric with `save()` by rejecting an empty payload (defense-in-depth; the skip in `loadLatest` is the behavioral fix). Two pins: a hollow file named for a higher boundary is invisible to `loadLatest` (the real snapshot still wins, bytes intact, hollow file left in place) and a hollow-only directory loads as `Optional.empty()` instead of a `Stored` with an empty payload | `stage 6(o)` |
 | 6(p) | non-happy-path hardening (fourteenth pass, the store `save()` argument surface on a 6(g)-family axis): the negative-<i>term</i> axis — the `TermIndex` constructor rejects BOTH negative axes (the 6(g) root mechanism), which made the axis look unreachable to the store guards, but a deserialized/construction-bypassed boundary reaches `save()` with one; both `save()`s guarded `boundary.getIndex() < 0` and never `boundary.getTerm() < 0`, so a `(-3,10)` boundary wrote `raft-snapshot--3-10.snap` — a name `parseBoundary` can never read back (the first dash is at position 0) — AFTER `deleteSuperseded` had torn out the valid snapshot: a "successful" save leaving the store EMPTY, data loss with no exception (worse than the 6(o) masking, where the real snapshot still existed); `InMemorySnapshotStore` stored the forged boundary and handed it back. Both `save()`s now refuse a negative term before any temp file, write, or delete (the shape of the sibling index guard), and the shared `Stored` record completes the axis (defense-in-depth, symmetrical with the 6(o) empty-payload completion) | `stage 6(p)` |
+| 6(q) | non-happy-path hardening (fifteenth pass, the <i>type</i> axis of the 6(d)/6(o) "looks like a snapshot but is not one" family on the file surface): 6(d) sealed the NAME axis (unparseable → warn+skip), 6(o) the BODY axis (zero bytes) — but neither gate could express TYPE, because 6(o)'s `hasPayload` is a stat and a directory's stat legitimately reports a positive size (the only question a directory answers with "no" is "am I a regular file?", which the code never asked). A save() writes regular files and nothing else, yet a NON-REGULAR foreign entry named like a snapshot (a directory `raft-snapshot-99-99.snap` in a shared directory) passed every gate that existed: name shape, `parseBoundary`, "has payload". Load path: max-by-boundary "recovered" it (a foreign writer can always name it ABOVE the real snapshot — the 6(o) masking mechanism), `readAllBytes` threw (`Is a directory`), and the one VALID snapshot sitting next to it became unrecoverable — a seed-at-startup node starting unseeded over a log already compaction-truncated to the real boundary. Save path: `deleteSuperseded` visited it as superseded — throwing on a non-EMPTY foreign directory (the failure escapes `save()` as a `RuntimeException`, not the `IllegalStateException` family it wraps, and reaches the caller AFTER the new snapshot is already in place: a partial save reported as one), or silently tearing down an empty foreign object as collateral. Fix: ONE root-cause predicate on both paths — only a regular file is a snapshot — `loadLatest` warns and skips non-regular entries (the 6(o) skip shape; a vanished entry lands on the same guard, still skipped) and `deleteSuperseded` spares them (inert under our naming scheme: never read, never torn out); three pins in `FileSnapshotStoreTest` including the distinguishing valid-snapshot-must-still-load assertion | `stage 6(q)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -88,7 +89,16 @@ in a `FileSnapshotStore` that has already deleted the valid snapshot
 (data loss with no exception), or been handed back by
 `InMemorySnapshotStore.loadLatest`; both stores now refuse it before any
 write or delete, and the `Stored` record completes the axis as
-defense-in-depth; see §7).
+defense-in-depth; see §7); and after stage 6(q): **382 tests green, 0
+failures, 1 pre-existing skip** (+3: the <i>type</i> axis of the
+"looks like a snapshot but is not one" family — 6(d) sealed NAME and 6(o)
+sealed BODY, but neither gate could express TYPE: 6(o)'s `hasPayload` is a
+stat and a directory's stat legitimately reports a positive size, so a
+NON-REGULAR foreign entry named like a snapshot was "recovered" by
+`loadLatest` (the read then throws and the one VALID snapshot beside it is
+lost) and visited by `deleteSuperseded` (throwing mid-save after the new
+file is in place, or silently torn down as collateral); only a regular file
+is a snapshot, now, on both paths; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1142,3 +1152,89 @@ baseline of 376). The store-input surface and the record now share one answer to
 "what is a legitimate `Stored`": non-null, non-empty payload, non-negative term,
 non-negative index — the `TermIndex` constructor's contract, enforced at every entry
 point the constructor does not reach.
+
+**Non-happy-path hardening pass, fifteenth round (2026-11-24, stage 6(q))** — the
+<i>type</i> axis of the "looks like a snapshot but is not one" family the 6(d) and 6(o)
+passes sealed on the file surface, open in exactly the one member neither fix ever
+considered: a NON-REGULAR entry bearing a snapshot name. The audit that closed 6(o)
+ruled the family complete because its two gates answered every question a <i>file</i>
+can pose: the 6(d) gate asks of the NAME ("does it name a boundary?"), the 6(o) gate
+asks of the BODY ("does it carry bytes?"). But `hasPayload` is itself a `Files.size`
+stat, and a directory's stat legally reports a positive size (40 bytes on this box,
+verified), so a stat cannot express the one question a directory answers with "no" —
+"am I a regular file?" — and the code had never once asked it. Meanwhile the store's
+own contract is explicit about that member: `save()` writes a same-directory regular
+temp file and renames it, and never anything else. So a non-regular entry with a
+snapshot name can only be foreign, and it was the one shape every gate waved through:
+
+- **Load path.** A directory `raft-snapshot-99-99.snap` in the store's directory passed
+  everything: name shape, `parseBoundary` (a name is a name and does not know it names
+  a directory), and `hasPayload` (stat 40 > 0). It then won the max-by-boundary
+  selection — and a foreign writer can always name the impostor for a boundary ABOVE
+  the real snapshot — which is exactly the 6(o) masking mechanism, this time against a
+  type both earlier fixes could *read* but never *considered*. Selection returns the
+  directory, `Files.readAllBytes` throws `Is a directory`, `loadLatest` surfaces an
+  `IllegalStateException` — and everything in the directory but the directory's own
+  bytes was a valid snapshot now UNREACHABLE through the store's only read path. A
+  node seeding at startup starts unseeded over a log already compacted to the real
+  boundary: the data loss 6(o) forbade, re-emerging through the type axis, and in the
+  strictly worse posture — in 6(o) the real snapshot at least still <i>existed</i>.
+- **Save path.** `deleteSuperseded` filtered by name shape only and visited every
+  non-<i>keep</i> entry as "a superseded snapshot": on a NON-EMPTY foreign directory
+  (the realistic foreign-writer shape), `Files.deleteIfExists` throws
+  `DirectoryNotEmptyException`, and the `RuntimeException` wrapping it escapes `save`'s
+  `catch (IOException)` unconverted — reaching the caller AFTER the new snapshot was
+  already moved into place, in an exception family no other `save` failure uses: a
+  partial save reported as one, with whether the earlier regular snapshots were already
+  gone (a stream-order question) left to chance. On an EMPTY foreign directory, the
+  mirror: `deleteIfExists` quietly succeeds and the store tears down a foreign object
+  it did not create — the collateral the 6(d) read-only contract refuses on the load
+  side.
+
+The fix is one root-cause predicate, applied on both paths — **only a regular file is a
+snapshot**:
+
+- `loadLatest`'s collect pass refuses `Files.isRegularFile(p)` with a warning, in the
+  exact shape of the 6(o) empty-payload skip: warn, skip, leave in place. A vanished or
+  unstat'able entry lands on this same guard (`isRegularFile` is false for both) and is
+  still skipped — the 6(o) "cannot stat" branch remains as defense-in-depth, no longer
+  reached first.
+- `deleteSuperseded` filters to regular files: a non-regular entry with a
+  snapshot-shaped name is not a superseded snapshot and is never touched. Load already
+  skips the same shape (6(d)/6(o), now 6(q)), so the pair is consistent: an entry that
+  is not a regular file is inert under our naming scheme — never selected, never read,
+  never torn out.
+
+Why the type check is a root-cause guard and not one more ad-hoc skip: the store's
+entire model is "a snapshot is a FILE named for a boundary, with a payload body." The
+name axis and the body axis were sealed with contract-shaped gates; the FILE-ness was
+the one word of that sentence the code never expressed, and `hasPayload` stat'ing a
+directory to 40 bytes is the tell — a gate that tests "does it carry bytes" passes a
+directory, because directories do carry stat bytes. Only `isRegularFile` asks the
+question the contract depends on.
+
+**Pins, three, all in `FileSnapshotStoreTest`:**
+`aDirectoryNamedLikeASnapshot_isInvisibleToLoadLatest` — the distinguishing pin: a
+valid `(5,10)` save, then a directory `raft-snapshot-99-99.snap` named for a HIGHER
+boundary (the masking shape): `loadLatest` must still return `(5,10)` with its payload
+intact, and the directory left in place. Pre-fix, this threw `IllegalStateException`;
+asserting the VALID snapshot's survival is what distinguishes a skip from "the load
+worked by luck" — the same distinguishing discipline as the 6(o) hollow-file pin and
+the 6(p) no-torn-out pin.
+`aDirectoryWhoseOnlySnapshotEntryIsNonRegular_loadsAsEmpty` — with nothing to fall
+back to a directory-only "store" reads as "no snapshot": the same
+`Optional.empty()` a fresh store gives (the 6(o) hollow-only pin's twin on the type
+axis), with the entry left in place. Pre-fix: `IllegalStateException`.
+`save_leavesANonRegularForeignEntryAlone_evenAtASupersededBoundary` — a NON-EMPTY
+foreign directory `raft-snapshot-3-7.snap` at a LOWER boundary: after saving `(9,20)`,
+`save` must COMPLETE (pre-fix it threw `RuntimeException` with the new file already in
+place — the partial save), the new snapshot loads, the superseded REGULAR `(5,10)`
+snapshot is still deleted (retention preserved for real snapshots), and the foreign
+directory and its contents are intact.
+
+Isolated: `FileSnapshotStoreTest` **17 green / 0 fail / 0 skip** (14 baseline + 3).
+Full suite at this point: **382 tests green, 0 failures, 1 pre-existing skip** (+3
+over the 6(p) baseline of 379). The family — name (6(d)), body (6(o)), type (6(q)) —
+is now closed on the file surface: an entry is a snapshot iff it is a regular file
+whose name names a boundary and whose body is non-empty, and every other shape under
+our naming scheme is warned about on load, spared on save, and left in place on both.

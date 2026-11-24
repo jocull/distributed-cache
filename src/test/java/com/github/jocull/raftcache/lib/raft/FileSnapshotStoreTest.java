@@ -14,6 +14,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -262,6 +263,81 @@ class FileSnapshotStoreTest {
                 "a zero-byte file is not a snapshot: the directory holds nothing loadable");
         assertTrue(Files.exists(dir.resolve("raft-snapshot-3-7.snap")),
                 "load is read-only: the hollow file is left in place");
+    }
+
+    @Test
+    void aDirectoryNamedLikeASnapshot_isInvisibleToLoadLatest(@TempDir Path dir) throws IOException {
+        // (6q) The third member of the "looks like a snapshot but is not" family: 6(d) closed
+        // the NAME axis (unparseable), 6(o) the BODY axis (zero bytes) — but the TYPE axis was
+        // open. 6(o)'s hasPayload gate is a stat, and a directory's stat legitimately reports
+        // a positive size, so a NON-REGULAR entry named raft-snapshot-99-99.snap passes every
+        // gate there is: name shape, parseable boundary, "has payload". Max-by-boundary then
+        // "recovers" the directory, the read throws, and the one VALID snapshot that sits
+        // next to it is lost — a node seeded at startup would start unseeded over a log
+        // already compacted to the real snapshot's boundary. A save() only ever writes
+        // regular files, so this shape can only come from outside this store.
+        final FileSnapshotStore store = new FileSnapshotStore(dir);
+        store.save(new TermIndex(5, 10L), PAYLOAD_A);
+
+        // Named for a HIGHER boundary than the real snapshot: if non-regular entries were
+        // candidates, max-by-boundary would "recover" the directory and the real snapshot
+        // would be masked — the same shape as 6(d)'s orphan-.tmp and 6(o)'s hollow-file pins.
+        Files.createDirectory(dir.resolve("raft-snapshot-99-99.snap"));
+
+        assertTrue(Files.isDirectory(dir.resolve("raft-snapshot-99-99.snap")), "sanity: the impostor is a directory");
+        assertEquals(1, files(dir).size(), "sanity: the directory sits next to exactly one real snapshot");
+        final SnapshotStore.Stored stored = store.loadLatest().orElseThrow(
+                () -> new AssertionError("a non-regular entry must not blow up an otherwise clean load"));
+        assertEquals(new TermIndex(5, 10L), stored.boundary(),
+                "a directory is not a snapshot: the real one still wins max-by-boundary");
+        assertArrayEquals(PAYLOAD_A, stored.payload(), "loadLatest returns the REAL snapshot's bytes");
+        assertTrue(Files.isDirectory(dir.resolve("raft-snapshot-99-99.snap")),
+                "load is read-only: an entry it does not read is left in place (the 6(d) contract)");
+    }
+
+    @Test
+    void aDirectoryWhoseOnlySnapshotEntryIsNonRegular_loadsAsEmpty(@TempDir Path dir) throws IOException {
+        // (6q) With nothing to fall back behind, a directory-only "store" must read as "no
+        // snapshot" — the same Optional.empty() a fresh store gives (the 6(o) hollow-only
+        // pin's twin on the type axis) — not throw, and not hand back a Stored whose payload
+        // was read from a directory.
+        Files.createDirectory(dir.resolve("raft-snapshot-99-99.snap"));
+
+        assertTrue(new FileSnapshotStore(dir).loadLatest().isEmpty(),
+                "a non-regular entry is not a snapshot: the directory holds nothing loadable");
+        assertTrue(Files.isDirectory(dir.resolve("raft-snapshot-99-99.snap")),
+                "load is read-only: the entry is left in place");
+    }
+
+    @Test
+    void save_leavesANonRegularForeignEntryAlone_evenAtASupersededBoundary(@TempDir Path dir) throws IOException {
+        // (6q) The write path half of the type axis: deleteSuperseded visited every
+        // snapshot-named entry other than the new one, including NON-REGULAR foreign
+        // entries. deleteIfExists on a NON-EMPTY directory throws — and that failure escapes
+        // save() AFTER the new snapshot is already moved into place, so a partial save
+        // reports as a failure (a RuntimeException, not even the same family a read failure
+        // gives); on an EMPTY foreign directory it would instead silently tear down a
+        // foreign object. Only regular files are snapshots: a save() writes regular files
+        // and nothing else, so the retention pass must spare everything that is not one.
+        final FileSnapshotStore store = new FileSnapshotStore(dir);
+        store.save(new TermIndex(5, 10L), PAYLOAD_A);
+
+        final Path foreign = dir.resolve("raft-snapshot-3-7.snap");
+        Files.createDirectory(foreign); // a directory, at a LOWER boundary than what is about to be saved
+        Files.write(foreign.resolve("foreign-content"), new byte[]{0x42});
+
+        store.save(new TermIndex(9, 20L), PAYLOAD_B); // must complete, not throw on the foreign entry
+
+        final SnapshotStore.Stored stored = store.loadLatest().orElseThrow();
+        assertEquals(new TermIndex(9, 20L), stored.boundary(), "the new snapshot is the latest");
+        assertArrayEquals(PAYLOAD_B, stored.payload());
+        assertTrue(Files.isDirectory(foreign),
+                "a non-regular entry is not a snapshot: the retention pass does not tear it out");
+        assertArrayEquals(new byte[]{0x42}, Files.readAllBytes(foreign.resolve("foreign-content")),
+                "a store never reads or deletes foreign contents it does not own");
+        final Path superseded = dir.resolve("raft-snapshot-5-10.snap");
+        assertFalse(Files.exists(superseded),
+                "the SUPERSEDED REGULAR snapshot is still deleted: only the foreign entry is spared");
     }
 
     @Test
