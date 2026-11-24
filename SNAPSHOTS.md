@@ -421,10 +421,10 @@ is a natural *consumer* of the Stage-1 artifact: "state → portable object" alr
 2. **`getSnapshot()` global-version TODO** — resolved as designed in Stage 1 (carry `DataVersion`
    through, so version counters survive; the map's global counter is derived on read).
 3. **Compaction threshold N.** etcd defaults to thousands of entries; for a cache workload a much
-   smaller N is defensible since re-apply is cheap. Pick per Stage-5 tests.
+   smaller N is defensible since re-apply is cheap. Resolved by delivery — the trigger shipped as `SNAPSHOT_TRIGGER_ENTRIES = 5` at `RaftNodeBehaviorLeader` (Stage 5, `3fd7e6c`/`9f0a705`), so this is no longer an open pick.
 4. **Snapshot retention after all followers catch up** (paper §7.1's "leader discards the snapshot
    when all followers have caught up"). The `RaftLogs` boundary must *stay* (the log still starts
-   there); only the byte payload is droppable. Not worth the complexity until Stage 6.
+   there); only the byte payload is droppable. Not implemented in the delivered stages — remains an open, deferred design call (retention is a resource-policy choice, not a correctness requirement).
 5. **`InProgressSnapshot` assembly buffer is unbounded — deliberate, deferred.** The follower
    assembles a chunked capture in a `ByteArrayOutputStream` until the final chunk; nothing caps the
    total bytes (only the leader's pinned capture length bounds a *well-behaved* sender). A stuck or
