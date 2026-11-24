@@ -126,6 +126,19 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
     @Override
     public void onVoteRequest(NodeConnectionOutbound sender, VoteRequest voteRequest) {
+        // Stage 6(l) (SNAPSHOTS.md stage 6(l)): the sender's identity is bound by
+        // onIntroduction BEFORE any vote traffic can arrive, and the transport layer throws on
+        // an unbound vote carrier — so a null remoteNodeId at this point is malformed by
+        // construction. Guarding here is defense-in-depth for the direct-handler surface:
+        // granting below would record votedForNodeId = null, which the same-term guard above
+        // (votedForNodeId != null) would then silently bypass, handing out a SECOND vote in the
+        // same term (Raft §5.2 one-vote-per-term). Refuse before any term comparison or
+        // conversion — warn + zero state change + no reply, the identity-family shape.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} VoteRequest from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         if (voteRequest.getTerm() < term) {
             LOGGER.warn("{} Received a vote request from {} for a term lower than current term: {} vs {}", self.getId(), sender.getRemoteNodeId(), voteRequest.getTerm(), term);
             return;
@@ -205,6 +218,16 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
     @Override
     public void onVoteResponse(NodeConnectionOutbound sender, VoteResponse voteResponse) {
+        // Stage 6(l) (SNAPSHOTS.md stage 6(l)): unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Refuse BEFORE the higher-term branch so the null sender does
+        // not even advance our term via convertToFollower. Identity-family shape: warn, zero
+        // state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} VoteResponse from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         if (voteResponse.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} will move from term {} as follower", self.getId(), sender.getRemoteNodeId(), voteResponse.getTerm(), term);
             self.convertToFollower(voteResponse.getTerm(), Function.identity());

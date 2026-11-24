@@ -94,6 +94,16 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
 
     @Override
     public void onVoteRequest(NodeConnectionOutbound sender, VoteRequest voteRequest) {
+        // Stage 6(l) (SNAPSHOTS.md stage 6(l)): unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Refuse BEFORE the higher-term branch so the null sender does
+        // not even advance our term via convertToFollowerForVote. Identity-family shape: warn,
+        // zero state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} VoteRequest from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         if (voteRequest.getTerm() > term) {
             LOGGER.info("{} Received a vote request from {} for term {} and granted vote as new follower", self.getId(), sender.getRemoteNodeId(), voteRequest.getTerm());
             // Voting advances the term but must NOT roll back the log: the up-to-date rule
@@ -111,6 +121,17 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
 
     @Override
     public void onVoteResponse(NodeConnectionOutbound sender, VoteResponse voteResponse) {
+        // Stage 6(l) (SNAPSHOTS.md stage 6(l)): unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Without this, votes.add(null) at the counting point below is
+        // legal for a HashSet and would let a phoney unattributed grant push the candidate past
+        // the majority into an illegitimate convertToLeader. Refuse before any term comparison
+        // or conversion. Identity-family shape: warn, zero state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} VoteResponse from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         if (voteResponse.getTerm() > term) {
             LOGGER.info("{} Received vote response from {} for term {} will move from term {} as follower", self.getId(), sender.getRemoteNodeId(), voteResponse.getTerm(), term);
             self.convertToFollower(voteResponse.getTerm(), Function.identity());

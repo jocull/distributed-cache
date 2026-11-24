@@ -23,6 +23,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(i) | non-happy-path hardening (seventh pass): the last two hostile-wire-tail escapes of the 6(g)/6(h) family, now on the vote path — the follower's `onVoteRequest` now **refuses before any mutation** (the term-ladder conversion still runs first, then: warn + re-armed election timer + one explicit false `VoteResponse` carrying our own committed tail, mirroring the handler's own denial shape; `leaderId` never cleared, and a denial deliberately does **not** burn `votedForNodeId`, so a legitimate same-term candidate is still granted afterward) when the request's last-log term/index is a negative or missing wire field; the base-class `isUpToDate` — the single feed-in point all three pre-vote handlers share (follower/candidate/leader) — now refuses with a plain `false` (warn, no state change) on a hostile/missing tail, sealing all three roles with no handler-side change; `isHostileWireTermIndex` lifted to `RaftNodeBehavior` as a shared static (the follower's copy deleted; the three 6(h) append-path call sites resolve via the inherited static, unchanged) | `stage 6(i)` |
 | 6(j) | non-happy-path hardening (eighth pass): the last hostile shape on the append surface, found by the post-6(i) audit sweep — a null slot **inside** the `AppendEntries.entries` list (the 6(h) pins covered a null term/index <i>inside</i> a well-formed entry; the wire ctor's element-blind `unmodifiableList` copy admits null slots, unlike `AnnounceClusterTopology`'s `List.copyOf`, which rejects such lists at construction) — `hasHostileWireTermIndex` now classifies a null slot as hostile, so the follower refuses it in the established shape (false ack carrying our unchanged tail; no leader installed, no append, no commit move, nothing applied) instead of NPE-ing on the very dereference the classification performs (the guard throwing where it exists to catch) — including the tail slot, which the accept path would read FIRST as the new tail, the post-mutation surface 6(h) closed on the other axes; the audit sweep clearing every remaining carrier (`AnnounceClusterTopology`, `VoteResponse`, `Introduction`, `StateResponse`) is recorded in §7 | `stage 6(j)` |
 | 6(k) | non-happy-path hardening (ninth pass): the two base-class **bootstrap handlers** — `onIntroduction` / `onAnnounceClusterTopology`, the only surface the hostile-wire audit left, flagged in the §7 sweep as a *separate carrier family* (null id / null nodeAddress in the bootstrap carriers; `Introduction` and `messages.NodeIdentifier` are bare null-permitting, unlike the term/index family that the domain constructors reject) — both now **refuse before any mutation** (the no-reply refusal shape: warn, zero state change): an intro carrying a null id or null address is refused before `setRemoteNodeId`, before `register`, and before the announce reply (previously: a null-bound connection feeding the follower vote/leader-handoff paths, a null map key in the topology — a `HashMap` null key, which inflates `getMajorityCount()` and votes can never name the unnameable member, a quorum DoS — and the null-address entry propagating to peers inside the reply built from `getTopology()`); an announce with a null slot / null id / null address anywhere in its list is refused wholesale (the 6(i) whole-list convention) and an unbound sender must be resolvable against the held topology <i>or its announced list</i> (real nodes announce themselves, so legitimate bootstrap still resolves) — all checks now run **before** `register`, making the post-registration `locate` `orElseThrow` ISE an unreachable invariant tripwire that used to fire after the topology had moved (the throw-after-mutation surface, closed for the follower-append path in 6(j), now on the bootstrap surface); the "exhausted" claim of the 6(i)/6(j) closure is re-scoped to the term/index family (see §7) | `stage 6(k)` |
+| 6(l) | non-happy-path hardening (tenth pass): the 6(k) identity family on the **vote surface as a whole** — the last audited vote surface the identity guard did not reach: all six handlers (follower/candidate/leader × `onVoteRequest`/`onVoteResponse`) now **refuse a null-sender before any term comparison or conversion** (one inline `sender.getRemoteNodeId() == null` check at the top of each, the 6(k) refusal shape: warn, zero state change, <i>no reply</i> — the vote surface has the reply machinery of the hostile-tail family available, but a grant-shaped reply would be strictly worse, so the family's no-reply form holds). Malformed-by-construction and unreachable on the live wire (`onIntroduction` is the only binder of `remoteNodeId`; `NodeConnectionOutboundImpl.receive` throws on an unbound non-bootstrap carrier) — defense-in-depth for the direct-handler surface (tests, middleware, future dispatch paths), where the handler-top check is the only line of defense. Three closed vectors: a follower grant recording `votedForNodeId = null`, which the same-term guard (`votedForNodeId != null`) <i>silently bypasses</i> — a second vote in the same term, Raft §5.2; a candidate tally via `votes.add(null)` (legal for a `HashSet`) — one phoney unattributed grant crossing `getMajorityCount()` (with the candidate's own vote already tallied, the null grant ALONE) into an illegitimate `convertToLeader`; and any-role step-downs handing free term recognition (a `convertToFollower(ForVote)` to an unattributable sender) before any guard hit | `stage 6(l)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -46,7 +47,11 @@ refusal pins and two legitimate-bootstrap acceptance pins on `onIntroduction` /
 `onAnnounceClusterTopology`, the first test coverage of these handlers at all — a
 separate carrier family, null id / null nodeAddress, from the term/index family the
 audit closed; the "exhausted on the current surface" claim is re-scoped to that
-family; see §7).
+family; see §7); and after stage 6(l): **368 tests green, 0 failures, 1 pre-existing
+skip** (+7: the 6(k) identity family on the vote surface as a whole — null
+`remoteNodeId` at the top of all six vote-surface handlers, refused before any term
+comparison or conversion, no reply; the identity family now covers the bootstrap and
+vote surfaces; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -712,3 +717,91 @@ through the real `sendIntroduction` path unchanged. Final suite: **361 tests gre
 id / null address) is a different mechanism, closed by this stage; the wire surface
 is now exhausted *per family*, and both families are accounted for on the current
 surface. The structural-backlog handoff stands as recorded in the 8th-round closure.
+
+**Non-happy-path hardening pass, tenth round (2026-11-23, stage 6(l))** — 6(k) closed
+the identity family on the **bootstrap surface**; the post-6(k) sweep found the same
+carrier — a bare `Sender` whose `getRemoteNodeId()` is null — still unguarded on the
+**vote surface as a whole**: all six handlers (follower/candidate/leader ×
+`onVoteRequest`/`onVoteResponse`) read the sender's identity on their mutation paths
+with no top-of-handler check. On the direct-handler surface (tests, middleware, future
+dispatch paths) that identity is the only attribution, and three vectors were live:
+(1) *follower second-vote* — a grant records `votedForNodeId = sender.getRemoteNodeId()`
+= null, and the same-term one-vote-per-term guard (`votedForNodeId != null`)
+<i>silently bypasses null</i>, so the follower hands out a second vote in the same term
+(Raft §5.2 violation, and the grant's `voted` flag is a positive — a real node can
+never get the refusal back); (2) *candidate illegitimate leadership* —
+`votes.add(sender.getRemoteNodeId())` = `votes.add(null)`, legal for the `HashSet`;
+with the candidate's own seeded vote already tallied, one phoney null-sender grant
+<i>alone</i> reaches `getMajorityCount()` (2 of 2 on the test cluster) and
+`convertToLeader` fires with a majority no real peer named; (3) *free step-down
+anywhere* — every `> term` branch runs `convertToFollower[ForVote]` on the unbound
+sender before any other guard hit: a null-sender carrier hands free term recognition
+to a voter/connection nobody could name, and on the request path the follower grant
+to that carrier compounds (1). Unreachable on the live wire — `onIntroduction` is the
+only binder of `remoteNodeId` (6(k)) and `NodeConnectionOutboundImpl.receive` throws
+on an unbound non-bootstrap carrier — so this is defense-in-depth for the
+direct-handler surface, in the identical shape 6(k) set for the identity family:
+warn, **zero state change**, **no reply** (the vote surface has reply machinery — the
+6(i) hostile-tail family uses it — but a *grant-shaped* reply would be strictly
+worse than silence: a null grant with a false `voted` flag is still a message that
+names no one and a positive one is a lie, so the family's no-reply form holds).
+
+**The fix (six handlers, one inline check each).** Each of the six handlers now
+starts with `sender.getRemoteNodeId() == null` → warn (naming the handler, the
+sender's `getRemoteNodeAddress()` — "stub-null" for a stub) + return, **before any
+term comparison, vote-record write, tally write, or conversion**. No new helper:
+the check is one line, the six sites are semantically distinct enough that a shared
+predicate would hide the per-handler message, and the family's convention (6(k):
+inline, message-rich) holds. Inline, not in the base class, because the six handlers
+are the only sites and the base already hosts the bootstrap handlers' two
+6(k) checks — a third helper family in the base would obscure the per-handler
+attribution each message carries.
+
+**Pins, seven total**, one per guarded handler site, across the three role hosts
+(the pin set follows the role-naming convention of `RaftNodeBehaviorFollowerVoteTest`
+and its siblings; the candidate and leader hosts are <i>new files</i>, mirroring the
+role naming, since no existing candidate- or leader-role vote host existed — the
+pre-vote hosts are a different mechanism and were not the right place). Follower, in
+`RaftNodeBehaviorFollowerVoteTest` (+2): (i) unbound request at the same term —
+refused, no `votedForNodeId` write, no reply; the discriminator follows: a bound
+same-term candidate is still granted (the refusal did not burn the vote and did not
+kill the handler), and the same-term <i>second</i> bound candidate gets the
+vote-burn refusal — the one-vote-per-term machinery is intact <i>and</i> now immune
+to the null bypass; (ii) unbound response at a higher term — refused, no term
+advance (an unattributable carrier must not be granted free term recognition); the
+following bound higher-term response still converts the follower. Candidate, in the
+new `RaftNodeBehaviorCandidateVoteTest` (+3): (iii) unbound grant — the sharpest
+discriminator in the set: without the guard, own-seeded-vote + null = 2 of 2 and the
+candidate would <i>be leader</i> after this single dispatch, so the
+`CANDIDATE`-after-dispatch assertion is the guard itself; then ONE real grant (own +
+peerA = 2 of 2) steps it up legitimately; (iv) unbound higher-term response — no
+step-down, term unchanged; a bound higher-term response still converts to follower;
+(v) unbound higher-term request — no conversion to follower (the `> term` branch
+refuses before the conversion), term unchanged; a bound higher-term request still
+converts and grants. Leader, in the new `RaftNodeBehaviorLeaderVoteTest` (+2):
+(vi) unbound higher-term request — no step-down; a bound higher-term request still
+converts (the legitimate handoff is alive); (vii) unbound higher-term response — no
+step-down; a bound higher-term response still converts. Each pin's
+`assertTrue(sender.voteRequests().isEmpty())` / `voteResponses().isEmpty()` is the
+no-reply assertion (identity-family shape: nothing goes back to the unattributable
+sender).
+
+Isolated: `RaftNodeBehaviorFollowerVoteTest` **5 green** (3 → 5), the new
+`RaftNodeBehaviorCandidateVoteTest` **3 green**, the new
+`RaftNodeBehaviorLeaderVoteTest` **2 green**,
+`RaftNodeBehaviorPreVoteTest` **13 green** (unchanged — the pre-vote surface is a
+different mechanism and was out of scope), all with the guards firing (the warn
+lines — "is unbound (null remoteNodeId) - refusing" — visible once per driven
+dispatch in the surefire output). Full-cluster `RaftNodeTest` **155 green** —
+legitimate wire traffic always binds through `onIntroduction` before any vote
+carrier, e2e untouched. Final suite: **368 tests green, 0 failures, 1 pre-existing
+skip** (+7 over the 6(k) baseline of 361).
+
+**Reconciliation of the identity family's scope.** The 6(k) closure was scoped to
+the **bootstrap surface** — the two `onIntroduction`/`onAnnounceClusterTopology`
+handlers. This stage extends the same family (null `remoteNodeId` on a sender) to
+the **vote surface** — the six role handlers. The identity family is now accounted
+for on both closed surfaces; the append/ack surface (6(g)–6(h)) and the
+snapshot-transfer surface (6(a)–6(f)) are orthogonal mechanisms (term/index and
+offset/cursor axes respectively) and were already closed in their own families.
+The structural-backlog handoff stands as recorded in the 8th-round closure.

@@ -193,6 +193,93 @@ class RaftNodeBehaviorFollowerVoteTest {
         }
     }
 
+    // ---- Stage 6(l): an unbound sender identity is refused before any mutation ----
+
+    /**
+     * Stage 6(l): a vote request from a connection whose remoteNodeId was never bound is
+     * malformed by construction (onIntroduction is the only binder, and the transport layer
+     * throws on an unbound vote carrier before it can arrive at the handler). Granting it
+     * anyway would record {@code votedForNodeId = null}, which the same-term guard
+     * ({@code votedForNodeId != null}) silently bypasses — handing out a SECOND grant in the
+     * same term, violating Raft §5.2's one-vote-per-term. The refusal must precede even the
+     * higher-term conversion (so the null sender does not get free term recognition), and it
+     * must not burn the voter's single vote: the discriminator below proves both.
+     */
+    @Test
+    void unboundSender_onVoteRequest_refusedBeforeConversion_voteNotBurned() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl voter = (RaftNodeImpl) raftManager.newNode("voter", new NodeAddress("voterAddress"));
+            middleware.addNode(voter);
+            for (int i = 1; i <= VOTER_LAST_INDEX; i++) {
+                voter.logs.appendLog(TERM, "entry-" + i);
+            }
+            voter.start().join(); // started FOLLOWER of term 0
+
+            final RecordingSender unbound = new RecordingSender(null);
+            voter.currentReceiver().onVoteRequest(unbound,
+                    new VoteRequest(TERM, "unboundCandidate", new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, VOTER_LAST_INDEX)));
+
+            // Identity-family shape: NO reply, and ZERO state change — not even the
+            // 0 -> 1 term conversion that the higher-term request would otherwise trigger.
+            assertTrue(unbound.voteResponses().isEmpty(), "an unbound sender must be refused without a reply");
+            assertEquals(NodeStates.FOLLOWER, ((RaftNodeBehavior) voter.currentReceiver()).state, "the refusal must not change the role");
+            assertEquals(0, ((RaftNodeBehavior) voter.currentReceiver()).term, "the refusal must not advance the term (no conversion)");
+
+            // THE DISCRIMINATOR: the voter's single true vote must be UNBURNED — a legitimate
+            // bound candidate in the same term still gets its one, and only one, grant.
+            final RecordingSender legitimate = new RecordingSender("legitimateCandidate");
+            voter.currentReceiver().onVoteRequest(legitimate,
+                    new VoteRequest(TERM, "legitimateCandidate", new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, VOTER_LAST_INDEX)));
+            assertEquals(1, legitimate.voteResponses().size(), "a legitimate candidate must still receive its one vote response");
+            assertTrue(legitimate.voteResponses().get(0).isVoteGranted(), "a legitimate up-to-date same-term candidate must be granted");
+            assertEquals(TERM, ((RaftNodeBehavior) voter.currentReceiver()).term, "the legitimate request takes the term conversion");
+
+            // Sanity: one vote per term — a further same-term candidate receives nothing.
+            final RecordingSender later = new RecordingSender("laterCandidate");
+            voter.currentReceiver().onVoteRequest(later,
+                    new VoteRequest(TERM, "laterCandidate", new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, VOTER_LAST_INDEX)));
+            assertTrue(later.voteResponses().isEmpty(), "one vote per term: a second same-term candidate gets no grant");
+            ((RaftNodeBehavior) voter.currentReceiver()).close();
+        }
+    }
+
+    /**
+     * Stage 6(l): a vote RESPONSE from an unbound sender carries an unattributable voter. The
+     * follower's only reaction to this surface is the higher-term branch (convertToFollower),
+     * so the refusal must fire before it: the null sender must not earn even a step-down.
+     * (The transport layer already throws on this on the live path — this pins the
+     * direct-handler surface, the family's whole reason for existence.)
+     */
+    @Test
+    void unboundSender_onVoteResponse_doesNotAdvanceTerm() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl voter = (RaftNodeImpl) raftManager.newNode("voter", new NodeAddress("voterAddress"));
+            middleware.addNode(voter);
+            voter.start().join(); // started FOLLOWER of term 0
+
+            final RecordingSender unbound = new RecordingSender(null);
+            voter.currentReceiver().onVoteResponse(unbound,
+                    new VoteResponse(TERM, new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, 0L), false));
+
+            assertTrue(unbound.voteResponses().isEmpty(), "an unbound sender must be refused without a reply");
+            assertEquals(NodeStates.FOLLOWER, ((RaftNodeBehavior) voter.currentReceiver()).state, "a null-sender response must not change the role");
+            assertEquals(0, ((RaftNodeBehavior) voter.currentReceiver()).term, "a null-sender response must not advance the term (no conversion)");
+
+            // THE DISCRIMINATOR: the step-down path is not burned — a BOUND higher-term
+            // response still converts the follower up to that term.
+            final RecordingSender bound = new RecordingSender("boundVoter");
+            voter.currentReceiver().onVoteResponse(bound,
+                    new VoteResponse(TERM, new com.github.jocull.raftcache.lib.raft.messages.TermIndex(TERM, 0L), false));
+            assertEquals(NodeStates.FOLLOWER, ((RaftNodeBehavior) voter.currentReceiver()).state, "a bound higher-term response still steps down to follower");
+            assertEquals(TERM, ((RaftNodeBehavior) voter.currentReceiver()).term, "a bound higher-term response still advances the term");
+            ((RaftNodeBehavior) voter.currentReceiver()).close();
+        }
+    }
+
     /**
      * A minimal {@link NodeConnectionOutbound} that identifies itself as a given candidate and
      * records the {@link VoteResponse}s it is asked to send. Everything else is inert.
