@@ -36,6 +36,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(v) | non-happy-path hardening (twentieth pass, the apply/data plane — the last raw in-process intake downstream of the sealed log: `LogsCommitted` — the last unguarded public event carrier — feeds `StateMachineBridge.onEvent`, which replays it into the `PartitionMap` write intakes, and neither side had a single gate. RED-confirmed pre-fix (the pins' first failures, both new test methods): the bridge constructor NPE'd at `eventBus.subscribe` on a null bus with the JDK-enriched message (indistinguishable from a failure deeper in the wiring), and *passed construction* on a null state machine to NPE later, silently, inside an applied write (wrong time, wrong place); `onEvent(null)` fell through into the silent unknown-event-ignore line (indistinguishable from a legitimate discard by another publisher on the shared bus); the carrier held the producer's mutable list by reference, so a nulled element — a shape `List.of` itself would refuse — rode past it, and a forged log (null term index, or null entry: shapes the `RaftLog` constructor never produces) was accepted and NPE'd inside the apply loop — in a mixed `[good, forged]` batch the good log was *applied first* (state changed, applied position moved) and only then the batch died: a half-applied commit; the store intakes bumped `globalVersion` *before* the NPE they threw (every refusal leaked one consumed version — a legitimate SET landed on version **5** where the contract says 1, a follow-up EXPIRE on **5** where it says 2), and `restore` NPE'd mid-restore over a construction-legit `HashMap` with a null key or a null `DataVersion` value. The intakes now refuse at the method head in the 6(r)–6(t) IAE family — constructor arguments refused as named NPEs (`eventBus`/`partitionMap`, the `adopt` `"snapshot"` family; the bus axis pins the message, since the JDK message differed pre-fix), the event refused naming the event while the ignore line narrows to *unknown, non-null* events, the WHOLE batch validated axis by axis (`term index`/`entry`) before anything is applied so a mixed batch is refused as a batch with zero state change and the applied index does not move, the `LogsCommitted` constructor taking `List.copyOf` of a required list (immutable and null-free at the handoff; safe — its only consumer iterates read-only), and the store axes `key` / `input`+`key`+`data` / `input`+`key`+`ttl` / `state` + per-entry `key`+value all refused BEFORE `incrementAndGet()` or any partition mutation — carrying the legitimate-commit-still-applies, refused-restore-leaves-existing-state-untouched-and-restore-then-works, and no-version-leak discriminators | `stage 6(v)` |
 | 6(w) | non-happy-path hardening (twenty-first pass, the value-axis layer 6(v) sealed at the boundary but left raw underneath: `DataVersion` — the entry payload of every stored value and of every `Snapshot` entry — held the producer's map in a LIVE `unmodifiableMap` view despite its own javadoc's "a detached copy" (a producer that put/cleared its map after construction still rewrote the installed value, the snapshot entry, and the ALREADY-PUBLISHED `SetDataEvent` payload — the exact mutable-by-reference shape 6(v) closed with `List.copyOf` for `LogsCommitted`); NPE'd a null map with the JDK-enriched "Cannot invoke `Map.getClass()` because `m` is null" (the JDK's own parameter name, indistinguishable from a failure deeper in the wiring); and silently ADMITTED null keys and null values its `Map.copyOf` siblings (`KeyDataInput`/`KeyDataOutput`) refuse at their own heads. And the three `KeyValue` value-writes had no head gate: `setData` STORED the null version first and only then NPE'd at `data.getData()` — leaving the key present but masquerading as never-written (`getData()` serving `Optional.empty`) with the event unpublished — while `updateExpiration`/`restore` stored null with NO exception at all (a snapshot-adopt path under the very guards 6(v) placed upstream). The carrier now holds a true detached copy (`Map.copyOf`) behind the named `"data must not be null"` NPE and the copy's own element NPEs (the `Snapshot`/`LogsCommitted` constructor family), and the three writes refuse a null version at the method head in the 6(v) IAE family before anything is stored, built, or published — carrying the stored-value-survives-a-refused-write, no-view-rewrite-after-construction, and null-map-names-the-axis discriminators | `stage 6(w)` |
 | 6(x) | non-happy-path hardening (twenty-second pass, the partition-intake layer directly beneath the 6(v)/6(w) boundary: `KeyMap` — the per-partition key store every `PartitionMap` data intake delegates to, and the silent state-machine path `StateMachineBridge` applies through — had NO gate of its own: `setEntry(null, dv)` rode HashMap's legal-null-key slot straight in, installing a `KeyValue` under a null key AND publishing the `SetDataEvent` naming an unnameable key (a silent install *with* a bus trace — the campaign's worst admission shape); `setEntry(key, null)` installed the shell FIRST and threw only deep (the 6(w) shape one layer up — the shell survived, and a later `deleteEntry` removed it, publishing a `DeleteDataEvent` for a key never written); `getEntry`/`deleteEntry`/`expireEntry` served empty/false on null silently (asymmetric with the IAE family one layer above on the exact same axis); `restore` CLEARED the partition before validating its state map, so a forged null-key/null-value map (construction-legit: `HashMap` admits both, `capture()` would never emit them) silently installed the null-key phantom with the legitimate entries dropped, or threw the version's `DataVersion` IAE after the clear (mutate-then-throw, partial install reached the `capture()` pin); and `PartitionMap`'s two constructor-carrier NPEs carried NO message — the one constructor in the data plane missing the house named-NPE rule (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs") — and `getPartitionForKey(null)` NPE'd at `key.hashCode()` where every data-plane intake IAEs. The intakes now refuse at the method head in the 6(v) IAE family (`"key must not be null"` in all four `KeyMap` intakes; `"data must not be null"` in `setEntry` before the shell is computed or any event published; `restore` pre-validates the whole state — state/key/state value — before the synchronized clear-install, mirroring the `PartitionMap.restore` template with zero state change on refusal); the constructor carriers now name their dependency (`"eventBus must not be null"`, `"clock must not be null"`); `getPartitionForKey` refuses a null key naming the axis — carrying the legitimate-install-still-works, no-event-published-on-refused-write, shell-not-left-behind (a later `deleteEntry` neither returns true nor publishes), and refused-restore-leaves-the-installed-state-untouched (no clear, no partial install, no phantom) discriminators | `stage 6(x)` |
+| 6(y) | non-happy-path hardening (twenty-third pass, the fan-out root no round visited: `EventBus` — the shared bus every sealed subscriber (the `StateMachineBridge` intake, the leader's `AppendLog` subscriber, `Replica`) sits on — had NO gate of its own: `subscribe(null)` silently parked a null element in the `CopyOnWriteArrayList` (null elements are legal there), so the next legitimate publish NPE'd AT DISPATCH (`s.onEvent` on a null subscriber), starving every subscriber after the null one in list order — a bus-level crash triggered by a shape no sealed intake above can emit; `unsubscribe(null)` was a silent no-op indistinguishable from removing a never-subscribed handle; `publish(null)` fanned the null event OUT to the null-tolerant `instanceof`-shaped subscribers (which swallow anything non-matching, including null) and was only refused deep, by the sealed `StateMachineBridge` intake, mid-iteration — aborting delivery to the subscribers after it (6(v) sealed that axis only at the consumer side, the fan-out itself was raw). The three intakes now refuse at the method head in the 6(v) IAE family (`"subscriber must not be null"` for `subscribe` and `unsubscribe`; `"event must not be null"` for `publish` — the same axis name the `StateMachineBridge` intake already speaks on the consumer side, now spoken by the producer BEFORE any subscriber is invoked), with zero state change and zero fan-out on refusal — carrying the no-crash-at-dispatch (a refused subscription leaves both neighboring subscribers still served the legitimate event), installed-subscribers-untouched, zero-fan-out (a refused publish reaches neither of two null-tolerant recorders, where pre-fix the null rode to ALL subscribers silently, or was refused only mid-iteration by the bridge), and legitimate-intake-still-works (subscribe → publish → served exactly once; unsubscribe → publish → not served again) discriminators | `stage 6(y)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -191,7 +192,19 @@ entries and installed the phantom, or threw the deep `DataVersion` IAE after the
 `PartitionMap`'s two constructor-carrier NPEs were unnamed and `getPartitionForKey(null)`
 NPE'd where its intakes IAE; the intakes now refuse at the method head in the 6(v) IAE
 family — key/data before any shell install or event publish, whole-state pre-validation
-before any clear — and the constructor carriers name their dependencies; see §7).
+before any clear — and the constructor carriers name their dependencies; see
+§7); and after stage 6(y): **411 tests green, 0 failures, 1
+pre-existing skip** (+4: the fan-out root no round visited — `EventBus`, the shared bus
+every sealed subscriber (`StateMachineBridge`, the leader's `AppendLog` subscriber,
+`Replica`) sits on: `subscribe(null)` silently parked a null element
+(`CopyOnWriteArrayList` admits them), so the next legitimate publish NPE'd AT DISPATCH,
+starving the subscribers after it in list order; `unsubscribe(null)` was a silent
+no-op; `publish(null)` fanned the null event out to the null-tolerant
+instanceof-shaped subscribers and was refused only deep, by the sealed
+`StateMachineBridge` intake, mid-iteration, aborting delivery past it; the three
+intakes now refuse at the method head in the 6(v) IAE family — `subscriber must not be
+null` in subscribe/unsubscribe, `event must not be null` in publish before any
+subscriber is invoked; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1861,3 +1874,65 @@ closing since 6(g) now closes the layer its boundary sealed in 6(v) delegated to
 key store every data intake writes through and every committed state applies through —
 refusing the shapes the sealed intakes above it can never produce, before a shell is
 installed, before a version is consumed, and before an event is published.
+
+**Non-happy-path hardening pass, twenty-third round (2026-11-24, stage 6(y))** — the
+fan-out root itself: 6(v) sealed the data plane at the boundary (`PartitionMap`
+intakes), 6(w) its carriers, 6(x) the key store they write through — while the
+`EventBus`, the shared bus **every** sealed subscriber subscribes onto
+(`StateMachineBridge`, the leader's `AppendLog` subscriber, `Replica`) and every
+publisher delivers through, had no gate of its own. Production wiring only ever
+subscribes sealed subscribers and publishes sealed events, so the raw axes were
+reachable by a construction-bypassed caller — the 6(n)/6(p) shape at every sealed
+intake above — but at the root, that bypass IS the surface:
+
+- **null subscriber into `subscribe`**: `CopyOnWriteArrayList` admits null elements
+  (unlike the `Map.copyOf`/`List.copyOf` family 6(w) sealed on its carriers), so
+  `subscribe(null)` parked a null entry **silently** — no exception, no trace — and
+  the next legitimate `publish` NPE'd AT DISPATCH (`s.onEvent` on the null entry): a
+  bus-level crash, with list order deciding the blast radius — subscribers before the
+  parked null were served, the ones after it were STARVED of that event. A
+  position-dependent failure with no exception naming the axis.
+- **null subscriber into `unsubscribe`**: a silent no-op indistinguishable from
+  removing a handle that was never subscribed — no axis named, no error surfaced.
+- **null event into `publish`**: the null event fanned OUT to the subscribers — the
+  production-shaped `instanceof`-filtering ones (`Replica`, the leader's `AppendLog`
+  subscriber) silently swallow anything non-matching, **including null** — until it
+  reached the sealed `StateMachineBridge` intake, whose 6(v) refusal (`"event must not
+  be null"`) threw from DEEP inside the bus's fan-out loop, not from the bus's own
+  intake: readable as a subscriber failure, and every subscriber after the bridge in
+  list order never saw the event. 6(v) sealed the axis at the consumer side; the
+  producer side still handed nulls across.
+
+The fix is the house IAE family applied at the root, carrying the same zero-state-
+change and zero-side-effect guarantees 6(v)/6(x) anchored in the data plane:
+
+- `subscribe` / `unsubscribe` — `"subscriber must not be null"` at the head, BEFORE
+  the list is touched: a null entry can never park, so dispatch can never crash on
+  one and list-order starvation dies with it;
+- `publish` — `"event must not be null"` at the head, BEFORE any subscriber is
+  invoked: the same axis name the sealed `StateMachineBridge` intake already speaks
+  on the consumer side, now spoken by the producer where the null originates; a
+  refused publish fans out to exactly zero subscribers and leaves the bus
+  byte-identical.
+
+**Pin (RED-confirmed before the fix, then GREEN), new `EventBusTest` (4) in-package
+(`lib.event`):** `subscribe(null)` IAEs naming the subscriber — the discriminator
+observes the bus, not the exception: after the refusal, the recorder subscribed
+before AND after the refused null are each served exactly one legitimate event
+(pre-fix: the parked null NPE'd that same publish at dispatch, starving the later
+subscribers in list order); `unsubscribe(null)` IAEs naming the subscriber and leaves
+the installed subscriber still subscribed and still served; `publish(null)` IAEs
+naming the event with the zero-fan-out discriminator — two null-tolerant recorders
+(mirroring the production `instanceof` shape that swallows non-matches) each received
+**nothing** (pre-fix: the null event rode to ALL subscribers silently, and was refused
+only if a sealed bridge happened to sit in list order — in which case the exception
+arrived mid-iteration and delivery past it aborted); `testLegitimateIntakeStillWorks`
+pins subscribe → publish → served exactly once, unsubscribe → publish → not served
+again, the intake shape every round's wiring above depends on.
+
+Isolated: `EventBusTest` **4 green / 0 fail / 0 skip**.
+Full suite at this point: **411 tests green, 0 failures, 1 pre-existing skip**
+(+4 over the 6(x) baseline of 407). The fan-out family the house has been closing
+since 6(g) now closes its root: the bus every production subscriber sits on and every
+publisher delivers through — refusing a null subscriber before it parks, a null event
+before any fan-out, speaking the same axis names its own sealed consumers speak.
