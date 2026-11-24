@@ -34,6 +34,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(t) | non-happy-path hardening (eighteenth pass, the `RaftLogs` read + notification surfaces — the last unguarded public intakes on a class whose mutation intakes 6(r)/6(s) just sealed): `containsStartPoint`, `getLogRange`, and `notifyCommitted` were raw. All RED-confirmed pre-fix: a **null pointer** NPE'd at the `containsStartPoint` `startSeed` equality check or in the `getLogRange` stream filter; a **null transform** NPE'd at the `map` step; **forged negative axes** were silently answered "not contained" or served a range computed off a pointer no `TermIndex` may hold (the range filter indexes the index axis only, so a forged term was ignored and a forged negative index served a wider range than asked); `notifyCommitted(**null)**` NPE'd in the for-each, and a **null element** was skipped with no trace (`instanceof` is simply false) — the caller cannot tell a refusal from a skipped acknowledgement, and the good neighbours completed *first*. Each gate now refuses a null pointer / negative-axis pointer / null transform / null list / null element before touching the list — in `notifyCommitted` validating the WHOLE list before completing ANY future, so a mixed-list refusal is zero-state-change — carrying the zero-state-change, legitimate-range-still-served, and legitimate-ack-still-completes-a-waiting-client discriminators | `stage 6(t)` |
 | 6(u) | non-happy-path hardening (nineteenth pass, the pending-request registry — the last raw in-process intake sitting between the sealed wire (6(g)–6(n)) and the sealed log (6(r)–6(t)): `NodeRequests` is the sole request/response correlation point; `NodeConnectionOutboundImpl` is its only caller and funnels BOTH `sendStateRequest` and `receive(StateResponse)` through it, yet neither intake had a single gate. RED-confirmed pre-fix (the pin's first two failures): a **null request** NPE'd synchronously at the `pendingRequests.put(request.getRequestId(), …)` key dereference while the already-scheduled delayed-cancellation task NPE'd a SECOND time, invisibly, 5 s later inside the common pool; a **null response** into `completeRequest` NPE'd at `response.getRequestId()` (the wrong family, both). The remaining shapes are confirmed from the same source walk and guarded in the same pass: a **null response class** was accepted and NPE'd *later*, inside the caller's own future, at `isAssignableFrom(null)` (wrong time, wrong place); a **null requestId** — reachable only via a construction-bypassed carrier (the 6(n)/6(p) shape; the constructors seed the id in-field and can never produce one) — was silently accepted as a legal `HashMap` null key, so two such requests collide on ONE entry and a completion under that key resolved the *WRONG* pending future (talking past each other), and a null-id response carrier fell into the `pending == null` early return and was dropped with no trace — indistinguishable from the legitimate unknown-id discard, and masked in practice by the 5 s cancellation timeout. Both intakes now refuse at the method head in the 6(r)–6(t) IAE family — `getRequestFuture` refusing request / request id / response class before the executor or the map is touched, `completeRequest` refusing response / response id before the map lookup — carrying the legitimate-roundtrip-still-completes-the-waiting-caller and unknown-id-still-a-silent-no-op discriminators | `stage 6(u)` |
 | 6(v) | non-happy-path hardening (twentieth pass, the apply/data plane — the last raw in-process intake downstream of the sealed log: `LogsCommitted` — the last unguarded public event carrier — feeds `StateMachineBridge.onEvent`, which replays it into the `PartitionMap` write intakes, and neither side had a single gate. RED-confirmed pre-fix (the pins' first failures, both new test methods): the bridge constructor NPE'd at `eventBus.subscribe` on a null bus with the JDK-enriched message (indistinguishable from a failure deeper in the wiring), and *passed construction* on a null state machine to NPE later, silently, inside an applied write (wrong time, wrong place); `onEvent(null)` fell through into the silent unknown-event-ignore line (indistinguishable from a legitimate discard by another publisher on the shared bus); the carrier held the producer's mutable list by reference, so a nulled element — a shape `List.of` itself would refuse — rode past it, and a forged log (null term index, or null entry: shapes the `RaftLog` constructor never produces) was accepted and NPE'd inside the apply loop — in a mixed `[good, forged]` batch the good log was *applied first* (state changed, applied position moved) and only then the batch died: a half-applied commit; the store intakes bumped `globalVersion` *before* the NPE they threw (every refusal leaked one consumed version — a legitimate SET landed on version **5** where the contract says 1, a follow-up EXPIRE on **5** where it says 2), and `restore` NPE'd mid-restore over a construction-legit `HashMap` with a null key or a null `DataVersion` value. The intakes now refuse at the method head in the 6(r)–6(t) IAE family — constructor arguments refused as named NPEs (`eventBus`/`partitionMap`, the `adopt` `"snapshot"` family; the bus axis pins the message, since the JDK message differed pre-fix), the event refused naming the event while the ignore line narrows to *unknown, non-null* events, the WHOLE batch validated axis by axis (`term index`/`entry`) before anything is applied so a mixed batch is refused as a batch with zero state change and the applied index does not move, the `LogsCommitted` constructor taking `List.copyOf` of a required list (immutable and null-free at the handoff; safe — its only consumer iterates read-only), and the store axes `key` / `input`+`key`+`data` / `input`+`key`+`ttl` / `state` + per-entry `key`+value all refused BEFORE `incrementAndGet()` or any partition mutation — carrying the legitimate-commit-still-applies, refused-restore-leaves-existing-state-untouched-and-restore-then-works, and no-version-leak discriminators | `stage 6(v)` |
+| 6(w) | non-happy-path hardening (twenty-first pass, the value-axis layer 6(v) sealed at the boundary but left raw underneath: `DataVersion` — the entry payload of every stored value and of every `Snapshot` entry — held the producer's map in a LIVE `unmodifiableMap` view despite its own javadoc's "a detached copy" (a producer that put/cleared its map after construction still rewrote the installed value, the snapshot entry, and the ALREADY-PUBLISHED `SetDataEvent` payload — the exact mutable-by-reference shape 6(v) closed with `List.copyOf` for `LogsCommitted`); NPE'd a null map with the JDK-enriched "Cannot invoke `Map.getClass()` because `m` is null" (the JDK's own parameter name, indistinguishable from a failure deeper in the wiring); and silently ADMITTED null keys and null values its `Map.copyOf` siblings (`KeyDataInput`/`KeyDataOutput`) refuse at their own heads. And the three `KeyValue` value-writes had no head gate: `setData` STORED the null version first and only then NPE'd at `data.getData()` — leaving the key present but masquerading as never-written (`getData()` serving `Optional.empty`) with the event unpublished — while `updateExpiration`/`restore` stored null with NO exception at all (a snapshot-adopt path under the very guards 6(v) placed upstream). The carrier now holds a true detached copy (`Map.copyOf`) behind the named `"data must not be null"` NPE and the copy's own element NPEs (the `Snapshot`/`LogsCommitted` constructor family), and the three writes refuse a null version at the method head in the 6(v) IAE family before anything is stored, built, or published — carrying the stored-value-survives-a-refused-write, no-view-rewrite-after-construction, and null-map-names-the-axis discriminators | `stage 6(w)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -164,7 +165,20 @@ global version into the next legitimate write (a SET landing on version 5 instea
 an EXPIRE on 5 instead of 2) — and `restore` NPE'd mid-install over a null-keyed or
 null-valued `HashMap`; every intake in the chain now refuses at the method head in the
 6(r)–6(t) family, the whole commit batch is validated axis by axis before anything is
-applied, and no refusal consumes a version or mutates a partition; see §7).
+applied, and no refusal consumes a version or mutates a partition; see §7); and after stage 6(w): **397 tests green, 0 failures, 1
+pre-existing skip** (+8: the value-axis layer 6(v) sealed at the boundary but left raw
+underneath: `DataVersion` — the entry payload of every stored value and of every
+`Snapshot` entry — held the producer's map in a live `unmodifiableMap` view despite its
+own javadoc's "a detached copy" (a producer rewrite still reached the installed value
+and the already-published event payload), NPE'd a null map with the JDK's own parameter
+name, and admitted null keys and null values its `Map.copyOf` siblings refuse at their
+own heads; and `KeyValue`'s three value-writes had no head gate — `setData` stored the
+null version first and NPE'd later at `data.getData()` (the key left present but
+masquerading as never-written, the event unpublished), `updateExpiration`/`restore`
+stored null with no exception at all; the carrier now holds a true copy behind the
+named `"data must not be null"` guard and the three writes refuse a null version at the
+method head in the 6(v) IAE family before anything is stored, built, or published; see
+§7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1699,3 +1713,65 @@ that turns the sealed log into state, now refuses the shapes the house's own sea
 constructors can never produce: at the head of the bridge, at the head of the carrier,
 and at the head of every store intake, before a version is consumed or a partition is
 touched.
+
+**Non-happy-path hardening pass, twenty-first round (2026-11-24, stage 6(w))** — the
+value-axis layer: 6(v) sealed the apply/data plane *at the boundary* — every
+`PartitionMap` intake now refuses its null axes before a version is consumed or a
+partition is touched — but the values those intakes store sit on two carriers with no
+gate of their own: `DataVersion`, the entry payload of every stored value **and** of
+every `Snapshot` entry (the 6(v) `SnapshotInstalled` foreign-payload pin already shows
+hostile payload shapes arriving there), and `KeyValue`, the key into which the
+value-writes store the latest `DataVersion`. A construction-bypassed or deserialized
+carrier — the 6(n)/6(p) shape established at every intake above — reaches both:
+
+- **`DataVersion` constructor axes** (null map / null key / null value): a null map
+  NPE'd at `Collections.unmodifiableMap(null)` with the JDK-enriched "Cannot invoke
+  `Map.getClass()` because `m` is null" — the JDK's *own* parameter name,
+  indistinguishable from a failure deeper in the wiring; null keys and null values were
+  **silently admitted** (a legal `HashMap` shape); and the whole map was held *by
+  reference* — the constructor's own javadoc says "the data map is a **detached
+  copy**", but it was a live `unmodifiableMap` view, so a producer that rewrote or
+  cleared its map after construction still reached through it into the installed value,
+  the snapshot entry, and the `SetDataEvent` payload already published — the exact
+  mutable-by-reference shape 6(v) closed with `List.copyOf` for `LogsCommitted`, and an
+  element shape the `Map.copyOf` siblings (`KeyDataInput`/`KeyDataOutput`) already
+  refuse at their own heads.
+- **null `DataVersion` into the three `KeyValue` value-writes** (`setData` /
+  `updateExpiration` / `restore`): `setData` **stored** the null version first and only
+  then NPE'd at `data.getData()` — the refusal left the key present but masquerading as
+  never-written (`getData()` serving `Optional.empty`) and the `SetDataEvent` never
+  published; `updateExpiration` and `restore` stored null with **no exception at all**
+  — the snapshot-adopt path (`PartitionMap` → `KeyMap` → `KeyValue`) carrying the same
+  silent-absence shape under the very guards 6(v) placed upstream of it.
+
+The fix is the same two families 6(v) anchored, applied one layer down: the
+**constructor-carrier** family — `DataVersion` now holds a true detached copy
+(`Map.copyOf`), the null map refused as a *named* NPE (`"data must not be null"`, the
+`Snapshot` "entries" / `LogsCommitted` "logs" precedent) and the null elements refused
+with the copy's own NPE (the `Map.copyOf` element axis — type-only, the
+`LogsCommitted` element-pin style, since that NPE carries no message); and the
+**method-intake** family — all three `KeyValue` writes refuse a null version at the
+method head in the IAE family (`"data must not be null"`) **before** anything is
+stored, before an event is built, and before it is published.
+
+**Pin (RED-confirmed before the fix, then GREEN), new `DataVersionTest` (5) and
+`KeyValueTest` (3) in-package:** `DataVersionTest` — the null map is refused as NPE
+**naming the axis** (`"data must not be null"`, 2-arg and 3-arg alike; was the JDK's
+"'m' is null"); the **detached-copy pin** the javadoc already promised (a producer
+rewrite or clear after construction leaves the stored value byte-identical; pre-fix the
+rewrite was visible through the view); the null-key and null-value maps both refused at
+the constructor (pre-fix: silently admitted); and the stored map itself rejects
+mutation. `KeyValueTest` — each of the three writes refuses a null version IAE with the
+axis named, with the **already-stored value surviving** the refusal (pre-fix
+`setData`: key present but `getData()` empty and the event lost; pre-fix the other two:
+no exception at all), and the legitimate value still readable at its version — the
+intake usable after refusing.
+
+Isolated: `DataVersionTest` **5 green** and `KeyValueTest` **3 green** —
+**8 green / 0 fail / 0 skip**.
+Full suite at this point: **397 tests green, 0 failures, 1 pre-existing skip**
+(+8 over the 6(v) baseline of 389). The pointer+carrier family the house has been
+closing since 6(g) now closes the last raw layer underneath it: the carrier every
+stored value and every snapshot entry holds, and the write that stores it — refusing
+the shapes its own sealed constructors can never produce, before a value is stored,
+before a version is consumed, and before an event is published.

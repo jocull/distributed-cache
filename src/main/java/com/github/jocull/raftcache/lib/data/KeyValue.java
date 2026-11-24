@@ -20,6 +20,9 @@ class KeyValue {
     }
 
     public void setData(DataVersion data) {
+        if (data == null) {
+            throw new IllegalArgumentException("data must not be null");
+        }
         final SetDataEvent event;
         synchronized (this) {
             dataVersion = data;
@@ -32,8 +35,13 @@ class KeyValue {
      * Replaces the stored version without publishing a {@link SetDataEvent} -- the value is
      * unchanged, only its expiration moved (a replicated EXPIRE). Value-change events stay
      * reserved for {@link #setData(DataVersion)}.
+     *
+     * @throws IllegalArgumentException if {@code data} is null
      */
     public synchronized void updateExpiration(DataVersion data) {
+        if (data == null) {
+            throw new IllegalArgumentException("data must not be null");
+        }
         dataVersion = data;
     }
 
@@ -43,8 +51,13 @@ class KeyValue {
      * performing a new state-machine write, so neither a {@code SetDataEvent} nor a
      * {@code DeleteDataEvent} is expected. Unlike {@link #setData(DataVersion)} the data
      * itself changes; unlike {@link #updateExpiration(DataVersion)} no event is published.
+     *
+     * @throws IllegalArgumentException if {@code data} is null
      */
     public synchronized void restore(DataVersion data) {
+        if (data == null) {
+            throw new IllegalArgumentException("data must not be null");
+        }
         dataVersion = data;
     }
 }

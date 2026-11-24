@@ -1,8 +1,8 @@
 package com.github.jocull.raftcache.lib.data;
 
 import java.io.Serializable;
-import java.util.Collections;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * A value of a key at a point in the state machine's history.
@@ -15,7 +15,8 @@ import java.util.Map;
  * <em>absolute</em> deadline (not a relative TTL), so a captured value restores with
  * identical expiry semantics on a node whose clock differs.
  *
- * <p>Immutable: the data map is a detached copy.
+ * <p>Immutable: the data map is a detached copy &mdash; the producer may keep mutating
+ * (or clear) its map after construction and the stored value is unaffected.
  *
  * <p>{@link Serializable} so a {@link Snapshot} of these values can ride the wire as the
  * payload of an {@code InstallSnapshot} message (SNAPSHOTS.md stage 3): the wire is JDK
@@ -35,8 +36,12 @@ public class DataVersion implements Serializable {
         this(data, version, NO_EXPIRY);
     }
 
+    /**
+     * @throws NullPointerException if {@code data} is null, or it holds a null key or
+     *                              value (the detached copy itself refuses both)
+     */
     public DataVersion(Map<String, byte[]> data, long version, long expiresAtEpochMillis) {
-        this.data = Collections.unmodifiableMap(data);
+        this.data = Map.copyOf(Objects.requireNonNull(data, "data must not be null"));
         this.version = version;
         this.expiresAtEpochMillis = expiresAtEpochMillis;
     }
