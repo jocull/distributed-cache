@@ -25,9 +25,13 @@
     </properties>
 
     <dependencies>
+        <!-- Only the logging half of the old spring-boot-starter: the starter itself
+             (Spring Boot 2.4.0, bundled Spring 5.3.1) cannot parse this project's
+             Java-17-and-up bytecode, so no Spring context can ever start here. The parent
+             BOM still pins the version. -->
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter</artifactId>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
         </dependency>
         <dependency>
             <groupId>org.apache.commons</groupId>

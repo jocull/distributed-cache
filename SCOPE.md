@@ -174,8 +174,7 @@ Deliberately not in scope for phase 4 (see Decisions / Phase 3):
 - ~~EXPIRE / TTL (Follow-up #3)~~ — **done** under the Signed-off work plan, item 2
   (commit `f8e901d`): `KeyDataExpireInput` entry, checked-read + sweep expiration,
   `DistributedCache.expire(key, ttl)`.
-- `Main.java` cluster demo (Decision #7) and downed-follower quorum validation
-  (Decision #3, blocked on `disconnectFrom`).
+- Downed-follower quorum validation (Decision #3, blocked on `disconnectFrom`).
 
 Note: the map is internally partitioned (from day one: `PartitionMap(partitionCount)`), so
 phases 4 and 5 blur — "single shard" effectively means "one cluster".
@@ -365,8 +364,19 @@ subsequently decided, fixed, and regression-tested):
     `RaftLogs.java:119-121` is closed. Guarded by `testLargeLogAppendAtScale` (100k tail appends
     + deep mid-log re-append / replacement / commit / compaction, ~7s — O(n), not O(n²)); the
     6r/6s/6t guard suite is untouched and green.
-7. **`Main.java`** — left as the data-layer stress harness; it never had a cluster. Wiring a
-   production-style demo (one process = one manager + one map + one bridge) is a phase 3/4 concern.
+7. **`Main.java`** — *(resolved: infra-debt item 3, rewired as a live cluster demo, 2026-11-24)*.
+   It was the data-layer stress harness (`LargeThrashingTest` pushing into one shared
+   `PartitionMap`; no Raft at all); it now brings up an N-node (default 3) cluster on loopback
+   over real `SocketChannelMiddleware` sockets — per-node middleware/bus/node/map/facade, full
+   peer topology, then the `connectWithTopology` → `start` bootstrap — and drives a
+   put/get/expire/delete smoke against `DistributedCache`, asserting convergence on every node
+   before tearing down in reverse construction order. The now-orphaned `LargeThrashingTest`
+   stress harness was removed along with it. In the course of running it, the
+   `@SpringBootApplication` shell came off too: the `spring-boot-starter` 2.4.0 it depended on
+   (Spring 5.3.1) cannot parse this project's Java-17 bytecode, so a Spring context could never
+   have started here — the wrapper was effectively dead on arrival. `Main` is now a plain
+   `static main`, and `pom.xml` depends on `logback-classic` directly (version still pinned by
+   the `spring-boot-starter-parent` BOM).
 8. **Phase 3 — real-network ITs are the immediate focus; snapshots deferred** *(decided
    2026-11-21 — user direction)*. "This is a good place to start testing full network
    implementations": scope + log first (`NETWORKING.md`, committed alongside this entry), then
@@ -455,10 +465,11 @@ which stay the detailed record.
    the pre-failure leader; after restore, assert it is no longer LEADER at an overtaken term —
    stepping down to follower is fine, and winning a fresh election at a *higher* term (becoming
    the current leader again) is fine; staying LEADER while another node holds leadership is not.
-9. **Carried from Decisions** — `disconnectFrom` (Decision #3) and the `Main.java` cluster
-   demo (Decision #7), plus the phase 3 network transport. (`RaftLogs` performance,
-   Decision #6, resolved 2026-11-24 with the O(1) tail-append fast path; `Replica` stub,
-   Decision #4, resolved the same day by removing it as dead code.)
+9. **Carried from Decisions** — `disconnectFrom` (Decision #3) and the phase 3 network
+   transport. (`RaftLogs` performance, Decision #6, resolved 2026-11-24 with the O(1)
+   tail-append fast path; `Replica` stub, Decision #4, resolved the same day by removing it
+   as dead code; `Main.java` cluster demo, Decision #7, resolved the same day by rewiring the
+   demo as a 3-node loopback socket cluster driving the cache facade.)
 10. **Pre-Vote (optional Raft election extension)** — ~~explicitly deferred by the user on
     2026-11-20 ("Reframe now + Pre-Vote later")~~ **implemented 2026-11-21, commit
     `f35e60d` (242 tests green):** a follower's election timeout now runs a hypothetical
