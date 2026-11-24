@@ -15,7 +15,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(a) | chunked transfer: leader pins one serialization, follower assembles, offset cursor resumes at the returned offset | `35f4ec0` |
 | 6(b) | durable `SnapshotStore` (in-memory + file impls): save-on-compact (leader), save-on-install (follower — a failed save aborts before the trim), seed at startup before log replay; null/empty/corrupt/throwing stores warn and skip, startup is never blocked | `stage 6(b)` |
 | 6(c) | non-happy-path hardening: failing stores on both roles (leader compaction and follower install fail closed — log left untrimmed, no success reply so the leader retransmits), gap one below the trigger stays on the append-replay path, an exact-divisor chunk size ends cleanly on the last byte with no empty trailer, orphan `.tmp` files are invisible to `loadLatest` even when named for a higher boundary | `stage 6(c)` |
-| 6(d) | non-happy-path hardening (second pass): a throwing snapshot supplier or a payload that cannot be serialized in the laggard path falls back to appends instead of tearing down the heartbeat round (a healthy supplier recovers); a negative offset cursor in `InstallSnapshotResponse` is clamped to 0 (would otherwise AIOOBE the next `Arrays.copyOfRange`); `loadLatest` skips snapshot-shaped files with unparseable names while still recovering a valid one in the same directory, and picks strictly max-by-boundary (term-major) when two valid files coexist; the compaction gate stays fail-closed; a failed store `save` (e.g. read-only directory) is loud and leaves no `.tmp` behind | `stage 6(d)` |
+| 6(d) | non-happy-path hardening (second pass): a throwing snapshot supplier or a payload that cannot be serialized in the laggard path falls back to appends instead of tearing down the heartbeat round (a healthy supplier recovers); a negative offset cursor in `InstallSnapshotResponse` is clamped to 0 (would otherwise AIOOBE the next `Arrays.copyOfRange`); `loadLatest` skips snapshot-shaped files with unparseable names while still recovering a valid one in the same directory, and picks strictly max-by-boundary (term-major) when two valid files coexist; the compaction gate stays fail-closed; a failed store `save` (e.g. read-only directory) is loud and leaves no `.tmp` behind (the read-only premise is platform-gated after 6(n): non-POSIX platforms skip cleanly instead of erroring on `setPosixFilePermissions`, §7) | `stage 6(d)` |
 | 6(e) | non-happy-path hardening (third pass): the follower's `onInstallSnapshot` refuses a **negative `offset` cursor** (a byte position is never < 0) by tearing down the in-progress transfer and answering with the restart-at-byte-0 cursor — previously it would fall into the "duplicate" branch and re-advertise the stale cursor; an **explicit null payload** is refused like a non-`byte[]` one (tear-down + cursor-0 refusal, election timer rescheduled) — previously it NPEd at `chunk.length` and escaped the handler **with no reply at all** (unreachable via the public API: the `InstallSnapshot` constructor already null-guards the payload, a boundary pin now asserts that invariant); the leader's `onInstallSnapshotResponse` needed **no** change — the two untested edges of its completion predicate are pinned instead: a same-term reply that arrives with **no transfer in flight** (late/duplicated/mis-routed) completes cleanly (tail adopted, commit advanced, and nothing fabricated to retransmit, since no capture was ever pinned), and a reply whose **cursor runs past the last byte of the pinned capture** while its index stays below the boundary completes the transfer — the next pass is a FRESH install from byte 0 of the same pinned capture, never a "resume" that would AIOOBE `Arrays.copyOfRange` | `stage 6(e)` |
 | 6(f) | non-happy-path hardening (fourth pass): the other side of the leader's laggard decision — a follower **strictly below** the compacted start point receives the install even when its gap is BELOW `SNAPSHOT_TRIGGER_ENTRIES` (branch (a) has no threshold: an append replay there is a permanent empty stream, `getLogRange` serves nothing at or below the seed), a follower **AT** the boundary gets only empty heartbeats, no install (the "strictly below" edge pinned from the other side), and an `InstallSnapshotResponse` carrying a **lower** term is an ordinary completion on the index axis — leadership kept (step-down only on a *strictly higher* term, `onAcknowledgeEntries` parity), reported tail still adopted (no production change: three pins, and the pins themselves surfaced a test-hygiene gap — send-count assertions must be bounds + per-message properties, never exact counts, because the 50 ms background heartbeat timer legitimately interleaves) | `stage 6(f)` |
 | 6(g) | non-happy-path hardening (fifth pass): the last unguarded escape sites behind the 6d/6e-style guards, sharing one root mechanism — `TermIndex`'s constructor throws IAE on a negative term or index, and two handlers feed wire values into it **without guarding those axes**. Leader: the completion branch of `onInstallSnapshotResponse` adopts the reply's term/index into `new TermIndex(...)` (the 6d clamp covered the cursor axis only) — and *after* `snapshotsInFlight` has already been deleted, so the IAE escaped mid-cleanup, leaving the leader half-processed; each negative axis is now clamped to the closest legal value, 0 (a negative term never exceeds ours, so step-down semantics are unchanged). Follower: the accept path builds `new TermIndex(lastIncludedTerm, lastIncludedIndex)` *after* recording the sender as leader (the index axis is structurally S2-gated — strictly beyond the tail — the term axis is not), so a same-term peer with boundary term `-1` IAEd *post-mutation*; it is now refused before ANY state change, in the exact shape of the negative-offset guard (offset-0 reply + `scheduleNextElectionTimeout`, no half-transfer left to absorb the next chunk) | `stage 6(g)` |
@@ -65,7 +65,11 @@ inside an otherwise well-formed append entry, construction-guarded and thus appa
 unreachable, reached only via a deserialized/corrupted stream or the direct-handler
 surface, refused before the delete-then-NPE throw-after-mutation the accept path would
 have run; the full sealed matrix — sender, term/index, slot, and the ruled-out
-carriers — is recorded in §7; see §7).
+carriers — is recorded in §7; see §7). After the 6-stage series closed: the
+6(d) read-only test's non-POSIX (Windows) portability gate — a clean JUnit skip
+instead of a hard `UnsupportedOperationException` error, test-only, no production
+code, tally **unchanged on Linux** (the test still runs and is green there) — was
+recorded as its own change, `Windows portability`; see §7.
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -966,3 +970,30 @@ Isolated: `RaftNodeBehaviorFollowerInstallSnapshotTest` **35 green** (34 baselin
 373). The message-`field` null family is now closed across all carriers and all
 axes: the sealed matrix (term/index 6(g)–6(i), slot 6(j), payload 6(n), sender
 6(k)–6(m)) is recorded in the stage table and above.
+
+**Test portability fix, recorded after the 6(n) closure (2026-11-23 — separately
+tracked, test-only, `Windows portability`)** — the 6(d) read-only-directory test
+(`FileSnapshotStoreTest#saveIntoAReadOnlyDirectory_failsLoudlyAndLeavesNoTempFile`)
+builds its failure premise with `Files.setPosixFilePermissions`, which the JDK
+documents as throwing `UnsupportedOperationException` on filesystem providers without
+POSIX attributes (Windows: `setPosixFilePermissions` line 2166). That is a hard
+ERROR on every non-POSIX run, not a skip — and skipping is the only correct answer,
+because the precondition itself (a directory this user genuinely cannot write) is not
+constructible on those platforms: there is no NIO permission bit to clear. The fix
+probes FIRST — `Files.getFileAttributeView(dir, PosixFileAttributeView.class)`
+returns the view on POSIX (Linux/Mac) providers and null (the documented contract for
+an unsupported view; never an exception) elsewhere — and a single
+`Assumptions.assumeTrue(view != null)` turns the non-POSIX case into a clean JUnit
+skip before any permission mutation. The probe is therefore platform-name-free (it
+asks the filesystem, not `os.name`) and runs ahead of both the `setPermissions`
+helper calls (which now take the view — `attributeView.setPermissions(...)`) and the
+existing ROOT gate (a user who can still write a read-only directory — the test's
+premise does not hold — still a clean skip; unchanged). The test body, the save/
+no-temp-file contract, and the restore in `finally` are otherwise untouched, and no
+production code changed. Verification: isolated `FileSnapshotStoreTest` **11 green /
+0 fail / 0 skip** (both gates pass on this Linux / uid-1000 box, the test still runs
+fully), full suite **374 tests green, 0 failures, 1 pre-existing skip** — the tally
+is unchanged on Linux; the gate only changes the outcome ON NON-POSIX platforms,
+where the test now SKIPs by design instead of ERRORing on every run. The "1
+pre-existing skip" of the 6(k)–6(n) series is a different test (the read-only premise
+holds on this Linux box, so it runs and is green).

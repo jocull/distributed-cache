@@ -7,6 +7,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Optional;
@@ -189,12 +190,19 @@ class FileSnapshotStoreTest {
         // leader's compaction gate is fail-closed on exactly this), and the temp-file cleanup
         // still runs — no stray raft-snapshot-*.snap.tmp left in the directory. Note the read-only
         // premise does not hold for root (POSIX permissions are bypassed); the probe below turns
-        // that into a clean skip instead of a false failure.
+        // that into a clean skip instead of a false failure. Non-POSIX platforms (Windows) have no
+        // NIO permission bit to clear at all: setPosixFilePermissions throws UnsupportedOperationException,
+        // so the platform gate probes the view first and turns that into the same clean skip.
+        final PosixFileAttributeView attributeView =
+                Files.getFileAttributeView(dir, PosixFileAttributeView.class);
+        Assumptions.assumeTrue(attributeView != null,
+                "no POSIX file attribute view (non-POSIX platform); a read-only directory cannot be constructed");
+
         final FileSnapshotStore store = new FileSnapshotStore(dir);
         store.save(new TermIndex(5, 10L), PAYLOAD_A);
 
         try {
-            setPermissions(dir, false);
+            setPermissions(attributeView, false);
             boolean readOnly = true;
             try {
                 final Path probe = Files.createTempFile(dir, "probe", ".txt");
@@ -218,20 +226,17 @@ class FileSnapshotStoreTest {
             assertEquals(new TermIndex(5, 10L), stored.boundary(), "loadLatest returns the last successful one");
             assertArrayEquals(PAYLOAD_A, stored.payload());
         } finally {
-            try {
-                setPermissions(dir, true);
-            } catch (IOException restoreFailed) {
-                throw new IllegalStateException("failed to restore directory permissions after the test", restoreFailed);
-            }
+            setPermissions(attributeView, true);
         }
     }
 
-    private static void setPermissions(Path dir, boolean writable) throws IOException {
+    private static void setPermissions(PosixFileAttributeView attributeView, boolean writable) throws IOException {
         // Owner bits are what matter: the test process is the owner. Keep the EXECUTE bit
         // both ways — POSIX directories need it for traversal (listing, deleting, path
         // resolution), and a directory that lost it breaks even JUnit's temp-dir cleanup.
         // The WRITE bit is the only thing toggled (execute stays set for both): the
-        // 9-character POSIX form, writable "rwxrwxrwx", read-only "r-xr-xr-x".
-        Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString(writable ? "rwxrwxrwx" : "r-xr-xr-x"));
+        // 9-character POSIX form, writable "rwxrwxrwx", read-only "r-xr-xr-x". A null view
+        // never reaches here (the platform gate already skipped the test).
+        attributeView.setPermissions(PosixFilePermissions.fromString(writable ? "rwxrwxrwx" : "r-xr-xr-x"));
     }
 }
