@@ -116,8 +116,6 @@ class RaftLogs {
         return appendLogInternal(new TermIndex(term, currentTail().getIndex() + 1), rawLog);
     }
 
-    // TODO: Profiling shows bad performance in this section.
-    //       Needs to be optimized as it gets much worse as log size grows.
     private <T> CompletableRaftLog<T> appendLogInternal(TermIndex termIndex, T rawLog) {
         // (6s) Same hostile-carrier guard family as the 6r compact/commit guards, at the
         // one append intake that is not construction-guarded: the int overloads route
@@ -142,6 +140,37 @@ class RaftLogs {
         if (rawLog == null) {
             throw new IllegalArgumentException("append entry must not be null (pointer " + termIndex + ")");
         }
+        // Closes the profiling TODO that was above: the old append walked the WHOLE log
+        // from the seed for every entry, O(log length) per append. The deque is index
+        // ordered and, by construction, its terms are non-decreasing along it: a
+        // successful append only lodges a term at least as high as the record it
+        // replaced or extended (the walk below ISE'd otherwise), and compact and rollback
+        // both keep the survivors in order. The 6s guards above refuse all the forged
+        // carriers that could break either property before the deque is touched.
+        //
+        // So the common case -- a new index beyond the last record (every leader write,
+        // every accepted follower AppendEntries continuation) -- settles on the LAST
+        // record alone, O(1): no earlier record can be a replacement (isReplacementOf
+        // needs the new index at or below its own, and none is), and "some earlier record
+        // outranks the append in term" reduces to "the last does" under non-decreasing
+        // terms. Everything is appended at the tail, exactly as before.
+        final CompletableRaftLog<?> last = logs.getLast();
+        if (termIndex.getIndex() > last.getTermIndex().getIndex()) {
+            if (last.getTermIndex().getTerm() > termIndex.getTerm()) {
+                throw new IllegalStateException("Unexpected log gap! " + last.getTermIndex() + " vs " + termIndex);
+            }
+            LOGGER.trace("Added new log @ {}", termIndex);
+            final CompletableRaftLog<T> raftLog = new CompletableRaftLog<>(termIndex, rawLog);
+            logs.add(raftLog);
+            if (termIndex.compareTo(currentTermIndex) > 0) {
+                currentTermIndex = termIndex;
+            }
+            eventBus.publish(new AppendLog(raftLog));
+            return raftLog;
+        }
+        // Mid-log append (idempotent re-append, a §5.3 conflict replacement, or a gap):
+        // rare, and the full walk below is unchanged, which pins every hostile shape
+        // exactly as before.
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
             final CompletableRaftLog<?> next = iterator.next();

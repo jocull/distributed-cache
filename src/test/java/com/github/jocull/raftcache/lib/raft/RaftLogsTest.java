@@ -91,6 +91,51 @@ public class RaftLogsTest {
     }
 
     @Test
+    void testLargeLogAppendAtScale() {
+        // Decision #6 pin: the tail-append path must stay O(1) in log length while
+        // preserving the full walk's append / commit / replace / re-append semantics
+        // exactly. n^2/2 = 5e9 walk steps on the old per-append scan; the fast path is
+        // n.
+        final int n = 100_000;
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        for (int i = 0; i < n; i++) {
+            raftLogs.appendLog(1, "entry-" + i);
+        }
+        assertEquals(n, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals(1, raftLogs.getCurrentTermIndex().getTerm());
+
+        // Idempotent re-append at depth (the mid-log path) still returns the existing record
+        final RaftLog<String> dup = raftLogs.appendLog(new TermIndex(1, 1_000L), "entry-999");
+        assertEquals("entry-999", dup.getEntry());
+        assertEquals(n, raftLogs.getCurrentTermIndex().getIndex());
+
+        // Commit deep into the log; the log still serves across the commit line
+        raftLogs.commit(new TermIndex(1, n / 2L));
+        assertEquals(n / 2L, raftLogs.getCommittedTermIndex().getIndex());
+        assertTrue(raftLogs.getLogRange(new TermIndex(1, n / 2L - 1), 2).size() == 2);
+
+        // A §5.3 conflict replacement mid-log (the mid-log path) tears out the fork and tail
+        raftLogs.appendLog(new TermIndex(2, n / 2L), "fork");
+        assertEquals(n / 2L, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals("fork", raftLogs.getLogRange(new TermIndex(1, n / 2L - 1), 2).get(0).getEntry());
+
+        // Tail appends keep running past the fork (n/2 + n/2 = n)
+        for (int i = 0; i < n / 2; i++) {
+            raftLogs.appendLog(2, "fork-" + i);
+        }
+        assertEquals(n, raftLogs.getCurrentTermIndex().getIndex());
+
+        // Compaction reseeds the deque; tail appends continue off the boundary as start point
+        raftLogs.commit(new TermIndex(2, n));
+        raftLogs.compact(new TermIndex(2, n), "payload");
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(2, n)));
+        final RaftLog<String> next = raftLogs.appendLog(2, "after-compact");
+        assertEquals(1L + n, next.getTermIndex().getIndex());
+        assertEquals(1L + n, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals(List.of("after-compact"), raftLogs.getLogRange(new TermIndex(2, n), 5, RaftLog::getEntry));
+    }
+
+    @Test
     void testFutureRaftLogsCommit() throws ExecutionException, InterruptedException, TimeoutException {
         final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
         assertEquals(0, raftLogs.getCurrentTermIndex().getTerm());

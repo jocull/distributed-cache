@@ -346,7 +346,18 @@ subsequently decided, fixed, and regression-tested):
    completes only after the entry is committed **and** applied (apply-then-acknowledge).
    Guarded by 3 bridge-level tests (apply, absent-key no-op, re-delivery idempotency) and
    DELETE e2e in `DistributedCacheTest` (3-node and single-node).
-6. **`RaftLogs` performance** — `RaftLogs.java:68-69` notes walk-the-deque scaling; out of scope here.
+6. **`RaftLogs` performance** — *(resolved: infra-debt item 1, 2026-11-24)*. The original
+    cut: `appendLogInternal` walked the whole deque from the seed for every append, O(log
+    length) per append. **Resolution.** `appendLogInternal(TermIndex, T)` now takes an
+    O(1) tail fast path: the deque is index-ordered with non-decreasing terms along it
+    (invariant over every successful mutation, pinned by the existing guard tests), so when
+    the new index is beyond the last record's, that one record decides the append — replacement
+    is structurally impossible and the "earlier record outranks" check reduces to the last
+    record outranking. Mid-log appends (idempotent re-append, §5.3 conflict replacement, a gap)
+    keep the original verbatim walk with identical ISE semantics. The profiling TODO at
+    `RaftLogs.java:119-121` is closed. Guarded by `testLargeLogAppendAtScale` (100k tail appends
+    + deep mid-log re-append / replacement / commit / compaction, ~7s — O(n), not O(n²)); the
+    6r/6s/6t guard suite is untouched and green.
 7. **`Main.java`** — left as the data-layer stress harness; it never had a cluster. Wiring a
    production-style demo (one process = one manager + one map + one bridge) is a phase 3/4 concern.
 8. **Phase 3 — real-network ITs are the immediate focus; snapshots deferred** *(decided
@@ -438,8 +449,9 @@ which stay the detailed record.
    stepping down to follower is fine, and winning a fresh election at a *higher* term (becoming
    the current leader again) is fine; staying LEADER while another node holds leadership is not.
 9. **Carried from Decisions** — `disconnectFrom` (Decision #3), `Replica` stub (Decision #4),
-   `RaftLogs` performance (Decision #6), `Main.java` cluster demo (Decision #7), and the
-   phase 3 network transport.
+   and the `Main.java` cluster demo (Decision #7), plus the phase 3 network transport.
+   (`RaftLogs` performance, Decision #6, resolved 2026-11-24 with the O(1) tail-append
+   fast path.)
 10. **Pre-Vote (optional Raft election extension)** — ~~explicitly deferred by the user on
     2026-11-20 ("Reframe now + Pre-Vote later")~~ **implemented 2026-11-21, commit
     `f35e60d` (242 tests green):** a follower's election timeout now runs a hypothetical
