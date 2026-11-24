@@ -26,6 +26,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(l) | non-happy-path hardening (tenth pass): the 6(k) identity family on the **vote surface as a whole** — the last audited vote surface the identity guard did not reach: all six handlers (follower/candidate/leader × `onVoteRequest`/`onVoteResponse`) now **refuse a null-sender before any term comparison or conversion** (one inline `sender.getRemoteNodeId() == null` check at the top of each, the 6(k) refusal shape: warn, zero state change, <i>no reply</i> — the vote surface has the reply machinery of the hostile-tail family available, but a grant-shaped reply would be strictly worse, so the family's no-reply form holds). Malformed-by-construction and unreachable on the live wire (`onIntroduction` is the only binder of `remoteNodeId`; `NodeConnectionOutboundImpl.receive` throws on an unbound non-bootstrap carrier) — defense-in-depth for the direct-handler surface (tests, middleware, future dispatch paths), where the handler-top check is the only line of defense. Three closed vectors: a follower grant recording `votedForNodeId = null`, which the same-term guard (`votedForNodeId != null`) <i>silently bypasses</i> — a second vote in the same term, Raft §5.2; a candidate tally via `votes.add(null)` (legal for a `HashSet`) — one phoney unattributed grant crossing `getMajorityCount()` (with the candidate's own vote already tallied, the null grant ALONE) into an illegitimate `convertToLeader`; and any-role step-downs handing free term recognition (a `convertToFollower(ForVote)` to an unattributable sender) before any guard hit | `stage 6(l)` |
 | 6(m) | non-happy-path hardening (eleventh pass): the 6(k) identity family on the **append / pre-vote-response / install-snapshot surface** — the last audited handler surface the null-sender guard had not reached: the follower's `onAppendEntries` / `onPreVoteResponse` / `onInstallSnapshot` plus the candidate's and the leader's `onAppendEntries` now each **refuse a null sender before any term comparison, conversion, tally, grant, or install** (the 6(k) shape: warn, zero state change, no reply — a success-shaped ack would be strictly worse than silence). Malformed-by-construction and unreachable on the live wire (defense-in-depth for the direct-handler surface, as 6(l)); audit of the remaining surfaces (pre-vote request, candidate/leader pre-vote response, both ack paths, the leader's snapshot-response path) records why each needs no identity guard — see §7. Five closed vectors: a follower conversion with a high-term append under a null leader plus rollback of the uncommitted tail and a true `AcknowledgeEntries` to a connection nobody could name; a follower pre-vote tally where `preVoteGrants.add(null)` (legal for a `HashSet`) reaches the 3-node majority on ONE unattributed grant; a follower install-snapshot (payload adopt, log re-anchor, `SnapshotInstalled` publish, reply) for an unattributable leader; a candidate conversion to a null-leader follower before the re-dispatch even reaches the follower handler; and a live-leader step-down for an unauthenticated carrier | `stage 6(m)` |
 | 6(n) | non-happy-path hardening (twelfth pass): the last open axis of the message-`field` null family the 6(k)–6(m) identity passes left — not the sender (6(k)–6(m)), not a hostile term/index (6(g)–6(i)), not a null <i>slot</i> (6(j)), but a null <i>payload</i> inside an otherwise well-formed append entry. The wire `AppendEntries.RaftLog` constructor null-guards `entry` (`requireNonNull`), which made the shape look unreachable — but Java deserialization reconstructs fields without calling constructors, so a hostile or corrupted stream carries the payload past the construction guard, and on the direct-handler surface that is the one vector that reaches the accept path with an entry the construction layer never accepted. Without the extension the refusal was never even reached: `RaftLogs.appendLogInternal` deletes conflicting entries FIRST (real log state torn out) and only then NPEs out of `CompletableRaftLog` construction — the throw-after-mutation family 6(e)/6(g)/6(h) closed on the other axes, here through a different field. `hasHostileWireTermIndex` now classifies `entry.getEntry() == null` in the same per-entry pass (alongside the 6(h) hostile term/index and the 6(j) null slot), so the follower's `onAppendEntries` refuses in the established 6(g)/6(h)/6(j) shape before ANY mutation — before `containsStartPoint`, before the leader install, before the append — one false ack answering in OUR term with OUR unchanged tail, zero state change (no leader, no append, no commit move, nothing applied). A null payload is structurally invalid exactly like a null slot or a missing term/index, so it is refused, not negotiated (no clamping); the full message-`field` null audit — the sealed matrix of every remaining carrier and why each needs no guard (consumer-inert reads, primitive-only fields, and the construction-guarded rest) — is recorded in §7 | `stage 6(n)` |
+| 6(o) | non-happy-path hardening (thirteenth pass, audit sweep of the `SnapshotStore` file surface): the empty-<i>body</i> axis of the 6(d) family — a file whose NAME parses to a valid boundary but whose body is ZERO BYTES (`raft-snapshot-99-99.snap` in a shared directory, left by a crashed or foreign writer: both `save()`s reject an empty payload, so the shape cannot come from this store) — was being handed back as a `Stored` (the record null-checks the payload but not its length) and, named for a higher boundary than the real snapshot, MAX-BY-BOUNDARY masked the real one. `loadLatest` now warns and skips empty-payload files in the collect pass — parallel to the 6(d) unparseable-name skip (a hollow body is a no-snapshot, left in place, never allowed to blow up an otherwise clean load), and the `Stored` record completes the invariant symmetric with `save()` by rejecting an empty payload (defense-in-depth; the skip in `loadLatest` is the behavioral fix). Two pins: a hollow file named for a higher boundary is invisible to `loadLatest` (the real snapshot still wins, bytes intact, hollow file left in place) and a hollow-only directory loads as `Optional.empty()` instead of a `Stored` with an empty payload | `stage 6(o)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -69,7 +70,12 @@ carriers — is recorded in §7; see §7). After the 6-stage series closed: the
 6(d) read-only test's non-POSIX (Windows) portability gate — a clean JUnit skip
 instead of a hard `UnsupportedOperationException` error, test-only, no production
 code, tally **unchanged on Linux** (the test still runs and is green there) — was
-recorded as its own change, `Windows portability`; see §7.
+recorded as its own change, `Windows portability`; see §7; and after stage 6(o): **376 tests
+green, 0 failures, 1 pre-existing skip** (+2: the empty-<i>body</i> axis of the
+6(d) family — a valid-named zero-byte snapshot file in a shared directory is now
+a no-snapshot that `loadLatest` warns and skips instead of a `Stored` that
+max-by-boundary could use to MASK the real one; the `Stored` record also completes
+the invariant symmetric with `save()`; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -997,3 +1003,51 @@ is unchanged on Linux; the gate only changes the outcome ON NON-POSIX platforms,
 where the test now SKIPs by design instead of ERRORing on every run. The "1
 pre-existing skip" of the 6(k)–6(n) series is a different test (the read-only premise
 holds on this Linux box, so it runs and is green).
+
+**Non-happy-path hardening pass, thirteenth round (2026-11-24, stage 6(o))** — the
+empty-<i>body</i> axis of the `SnapshotStore` file surface. With the message-`field`
+null family sealed, the audit turned to the store-level surface 6(c)/6(d) had
+established — `FileSnapshotStore.loadLatest` — and found the one residual hole in its
+"looks like a snapshot, is not one" contract: a file whose NAME parses to a valid
+boundary but whose BODY is EMPTY. Both `save()`s reject `payload.length == 0` (an
+empty payload is a caller error, so the shape cannot come from this store), which is
+exactly why this is the 6(d) threat model — a crashed writer or a foreign tool in a
+shared directory — one step along its axis. The old behavior was the 6(c)/6(d) failure
+re-run on the body instead of the name: `parseBoundary` (the 6(d) guard) passed,
+`readAllBytes` returned `new byte[0]` (non-null), `new Stored(...)` passed (the record
+null-checked the payload, not its length), and `loadLatest` happily returned a hollow
+`Stored` — a state a `save()` can never produce. The masking pin shows the sharp form:
+the hollow file NAMES a higher boundary than the real snapshot, so the max-by-boundary
+selection (the 6(d) invariant) picked the EMPTY one and the real one was masked — a
+silent wrong-selection, not a throw, which is precisely why it evaded the earlier
+passes (nothing blew up; the wrong file simply won).
+
+The fix stays in the same place the family established — classify at collection, never
+mid-accept:
+- `loadLatest`'s collect pass now probes a `hasPayload` (a `Files.size > 0`, not a
+  read — cheap, and deliberately codec-free: collection does not decode, the consumer
+  already degrades on undecodable bytes) AFTER the 6(d) name check, and a zero-byte
+  file is WARNED and SKIPPED, left on disk (load is read-only, the 6(d) contract), so
+  "latest among VALID snapshots" still holds. A file that has vanished or cannot be
+  stat'ed is treated as hollow (skip) — never allowed to masquerade as a valid one.
+- The `Stored` record in `SnapshotStore.java` now ALSO rejects `payload.length == 0`,
+  symmetric with `save()`'s null-and-empty rejection. That is defense-in-depth one
+  layer up, not the behavioral fix (the `loadLatest` skip is the behavior); it closes
+  the door the record left open (null checked, length unchecked) so a future
+  implementation that constructs a `Stored` by hand cannot reintroduce the hollow
+  shape.
+
+**Pins, two total:** `FileSnapshotStoreTest#aHollowSnapshot_namedForAHigherBoundary_isInvisibleToLoadLatest`
+— a real snapshot at `(5,10)` plus a zero-byte `raft-snapshot-99-99.snap`; asserts the
+boundary is still `(5,10)`, the payload bytes intact, and the hollow file LEFT IN
+PLACE (read-only). And `FileSnapshotStoreTest#aDirectoryWhoseOnlySnapshotIsHollow_loadsAsEmpty`
+— a directory whose only file is a zero-byte snapshot must load as `Optional.empty()`
+(the fresh-store contract), not a hollow `Stored` and not an exception.
+
+Isolated `FileSnapshotStoreTest`: **13 green / 0 fail / 0 skip** (11 baseline + 2
+pins; the read-only test still runs green on this Linux box). Full suite at this
+point: **376 tests green, 0 failures, 1 pre-existing skip** (+2 over the 6(n)
+baseline of 374). The file-surface family is now closed across all three axes
+6(c)/6(d)/6(o) map it — a name that does not parse (6(d)), a body that is empty
+(6(o)), and the max-by-boundary selection invariant both rely on — with `save()`,
+`loadLatest`, and the `Stored` record agreeing on what a legitimate `Stored` is.

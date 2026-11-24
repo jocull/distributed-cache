@@ -184,6 +184,56 @@ class FileSnapshotStoreTest {
     }
 
     @Test
+    void aHollowSnapshot_namedForAHigherBoundary_isInvisibleToLoadLatest(@TempDir Path dir) {
+        // (6o) The last hollow member of the "looks like a snapshot but is not" family
+        // 6(c)/6(d) closed on the file surface: a valid NAME with an EMPTY body — e.g.
+        // raft-snapshot-99-99.snap left in a shared directory by a crashed or foreign
+        // writer (a save() that wrote it would have been rejected: an empty payload is a
+        // caller error, so this shape can only come from outside this store). 6(d) made
+        // an UNPARSEABLE name invisible; this makes a hollow body invisible the same
+        // way — skipped with a warning, left in place — so max-by-boundary still recovers
+        // the real snapshot instead of handing back a store() could never have produced.
+        final FileSnapshotStore store = new FileSnapshotStore(dir);
+        store.save(new TermIndex(5, 10L), PAYLOAD_A);
+
+        try {
+            // Named for a HIGHER boundary than the real snapshot: if hollow files were
+            // candidates, max-by-boundary would "recover" the zero-byte one and the real
+            // snapshot would be masked — exactly the failure the 6(c) orphan-.tmp pin
+            // closes on the name axis.
+            Files.write(dir.resolve("raft-snapshot-99-99.snap"), new byte[0]);
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to seed the hollow snapshot", e);
+        }
+
+        assertEquals(2, files(dir).size(), "sanity: the hollow file physically sits next to the real snapshot");
+        final SnapshotStore.Stored stored = store.loadLatest().orElseThrow();
+        assertEquals(new TermIndex(5, 10L), stored.boundary(),
+                "a hollow file is a no-snapshot, not a snapshot: the real one still wins max-by-boundary");
+        assertArrayEquals(PAYLOAD_A, stored.payload(), "loadLatest returns the REAL snapshot's bytes, not an empty array");
+        assertTrue(Files.exists(dir.resolve("raft-snapshot-99-99.snap")),
+                "load is read-only: a file it does not understand is left in place (the 6(d) contract)");
+    }
+
+    @Test
+    void aDirectoryWhoseOnlySnapshotIsHollow_loadsAsEmpty(@TempDir Path dir) {
+        // (6o) With nothing to fall back behind, a hollow-only directory must read as "no
+        // snapshot" — the same Optional.empty() a fresh store gives — not throw (the 6(d)
+        // clean-load contract: an unknown file must not blow up an otherwise clean load)
+        // and not hand back a Stored with an empty payload (a state save() rejects).
+        try {
+            Files.write(dir.resolve("raft-snapshot-3-7.snap"), new byte[0]);
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to seed the hollow snapshot", e);
+        }
+
+        assertTrue(new FileSnapshotStore(dir).loadLatest().isEmpty(),
+                "a zero-byte file is not a snapshot: the directory holds nothing loadable");
+        assertTrue(Files.exists(dir.resolve("raft-snapshot-3-7.snap")),
+                "load is read-only: the hollow file is left in place");
+    }
+
+    @Test
     void saveIntoAReadOnlyDirectory_failsLoudlyAndLeavesNoTempFile(@TempDir Path dir) throws IOException {
         // (6d) A save can fail MID-WRITE (a revoked permission, a disk fulling, a read-only mount
         // landing mid-lifetime). Two contracts the node relies on: the failure is LOUD (the

@@ -117,10 +117,13 @@ public class FileSnapshotStore implements SnapshotStore {
     @Override
     public Optional<Stored> loadLatest() {
         try (Stream<Path> files = Files.list(directory)) {
-            // A file that LOOKS like a snapshot (name shape) but does not NAME a boundary --
-            // e.g. raft-snapshot-foo.snap from a crashed writer or a foreign tool -- is ignored
-            // with a warning rather than allowed to blow up an otherwise clean load: every
-            // VALID snapshot in the directory must still be recoverable (stage 6d).
+            // A file that LOOKS like a snapshot (name shape) but is not one -- e.g.
+            // raft-snapshot-foo.snap from a crashed writer or a foreign tool (stage 6d), or a
+            // valid name with a ZERO-BYTE body (stage 6o) -- is ignored with a warning rather
+            // than allowed to blow up an otherwise clean load: every VALID snapshot in the
+            // directory must still be recoverable. A hollow body cannot be the product of a
+            // save (an empty payload is a caller error it rejects), so it is a no-snapshot,
+            // exactly like an unparseable name.
             final List<Path> snapshots = new ArrayList<>();
             files.filter(this::isSnapshotFile).forEach(p -> {
                 try {
@@ -128,6 +131,11 @@ public class FileSnapshotStore implements SnapshotStore {
                 } catch (RuntimeException e) {
                     LOGGER.warn("Ignoring snapshot file {} in {}: its name does not name a valid boundary ({})",
                             p.getFileName(), directory, e.getMessage());
+                    return;
+                }
+                if (!hasPayload(p)) {
+                    LOGGER.warn("Ignoring snapshot file {} in {}: it carries no payload (a save would never write a zero-byte snapshot)",
+                            p.getFileName(), directory);
                     return;
                 }
                 snapshots.add(p);
@@ -177,6 +185,25 @@ public class FileSnapshotStore implements SnapshotStore {
     private boolean isSnapshotFile(Path file) {
         final String name = file.getFileName().toString();
         return name.startsWith(PREFIX) && name.endsWith(SUFFIX) && !name.endsWith(TMP_SUFFIX);
+    }
+
+    /**
+     * Whether a snapshot file actually carries a payload. A {@link #save} always writes
+     * non-empty bytes (an empty payload is a caller error it rejects), so a file whose name
+     * parses to a boundary but whose body is zero bytes could never have been produced by
+     * this store: it is a crashed or foreign writer in a shared directory, the threat class
+     * 6(d) established on the name axis. It is skipped on load, not handed back as a
+     * snapshot the state machine cannot decode. A file that has vanished or cannot be
+     * stat'ed is treated as hollow (skip) — never allowed to masquerade as a valid one.
+     */
+    private boolean hasPayload(Path file) {
+        try {
+            return Files.size(file) > 0L;
+        } catch (IOException e) {
+            LOGGER.warn("Skipping snapshot file {} in {}: it cannot be stat'ed ({})",
+                    file.getFileName(), directory, e.toString());
+            return false;
+        }
     }
 
     /**

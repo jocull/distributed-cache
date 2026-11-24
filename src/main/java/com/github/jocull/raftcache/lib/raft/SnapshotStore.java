@@ -79,6 +79,9 @@ public interface SnapshotStore {
             if (payload == null) {
                 throw new IllegalArgumentException("Stored payload must not be null");
             }
+            if (payload.length == 0) {
+                throw new IllegalArgumentException("Stored payload must not be empty (a save would have rejected it; a store must not hand it back)");
+            }
             if (boundary.getIndex() < 0) {
                 throw new IllegalArgumentException("Stored boundary index must not be negative: " + boundary);
             }
