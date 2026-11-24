@@ -496,6 +496,64 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
         }
     }
 
+    // ---- Stage 6n: a null payload on an otherwise well-formed entry is refused, not stored ----
+
+    /**
+     * Stage 6n: the payload axis of {@link AppendEntries.RaftLog} — a well-formed entry
+     * (valid term/index, present slot) whose {@code entry} field is nonetheless null. The wire
+     * constructor refuses to build one ({@code requireNonNull(entry)}), but a hostile or
+     * corrupted stream deserialized past it can — Java serialization reconstructs fields without
+     * calling the constructor — and without this check the accept path would hand it to
+     * {@code RaftLogs.appendLog}, which tears out any conflicting log entries (real state) and
+     * only then NPEs out of {@code CompletableRaftLog} construction. The sibling 6(h)/6(j) pins
+     * cover the hostile term/index and the null <i>slot</i>; this one isolates the null
+     * <i>payload</i> on an otherwise clean entry. The refusal carries the family shape: one
+     * false ack, our unchanged tail, zero state change.
+     */
+    @Test
+    void appendCarryingANullEntryPayload_isRefusedWithoutThrowing() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // Well-formed term/index, present slot — only the payload is hostile, which is
+            // exactly what distinguishes 6n from the 6(h) (term/index) and 6(j) (null slot)
+            // siblings. The constructor forbids building one, so forge it reflectively: the
+            // shape a deserialized hostile stream would deliver.
+            final AppendEntries.RaftLog forged = new AppendEntries.RaftLog(wire(0, 0), "placeholder");
+            setPayload(forged, null);
+
+            follower.currentReceiver().onAppendEntries(leader,
+                    new AppendEntries(0, wire(0, 0), wire(0, 0), List.of(forged)));
+
+            assertEquals(1, leader.acknowledges().size(), "an append carrying a null payload must be answered");
+            assertFalse(leader.acknowledges().get(0).isSuccess(), "an entry with a null payload must be rejected");
+            assertEquals(0L, leader.acknowledges().get(0).getCurrentTermIndex().getIndex(),
+                    "the refusal carries our unchanged (epoch) tail");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(),
+                    "an append we refuse must not install a leader");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is untouched by the refusal");
+            assertEquals(0L, follower.logs.getCommittedTermIndex().getIndex(), "the commit point is untouched by the refusal");
+            assertEquals(0L, bridge.getLastAppliedIndex(), "nothing is applied to the state machine");
+        }
+    }
+
+    /** Forge a payload (or null) onto a wire entry, bypassing the constructor's null guard. */
+    private static void setPayload(AppendEntries.RaftLog raftLog, Object payload) {
+        try {
+            final java.lang.reflect.Field entry = AppendEntries.RaftLog.class.getDeclaredField("entry");
+            entry.setAccessible(true);
+            entry.set(raftLog, payload);
+        } catch (final ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the wire entry payload", e);
+        }
+    }
+
     // ---- Stage 6k: structurally invalid bootstrap traffic is refused before any mutation ----
     //
     // The bootstrap handlers (onIntroduction / onAnnounceClusterTopology, stage 6(k))

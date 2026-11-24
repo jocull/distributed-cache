@@ -326,6 +326,18 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
      * construction-time NPE blocks them at the boundary) — and the accept path dereferences
      * every slot (each entry's term/index, the last entry's tail, the append loop). Without
      * this check the guard itself would throw while classifying them: refuse, don't throw.
+     *
+     * <p>Stage 6(n) (SNAPSHOTS.md stage 6(n)): and so is a null <i>payload</i> inside a
+     * well-formed entry — the 6(h)/6(j) pins cover hostile term/indexes and null <i>slots</i>,
+     * but not a present entry whose {@code entry} field is missing. A wire
+     * {@code AppendEntries.RaftLog} is construction-guarded ({@code requireNonNull(entry)}),
+     * but Java deserialization reconstructs fields without calling the constructor, so a
+     * hostile/corrupted stream can carry a null payload past it. Without this check the accept
+     * path hands it to {@code RaftLogs.appendLog}, which tears out any conflicting log entries
+     * (real state — the deletion runs first) and only then NPEs out of
+     * {@code CompletableRaftLog} construction. A null payload is structurally invalid exactly
+     * like a null slot or a missing term/index, so it is refused by this same guard — pre-
+     * mutation, false-ack, zero-state-change.
      */
     private static boolean hasHostileWireTermIndex(AppendEntries appendEntries) {
         if (isHostileWireTermIndex(appendEntries.getPreviousLogTermIndex())
@@ -333,7 +345,7 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             return true;
         }
         for (AppendEntries.RaftLog entry : appendEntries.getEntries()) {
-            if (entry == null || isHostileWireTermIndex(entry.getTermIndex())) {
+            if (entry == null || isHostileWireTermIndex(entry.getTermIndex()) || entry.getEntry() == null) {
                 return true;
             }
         }

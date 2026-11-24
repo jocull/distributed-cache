@@ -25,6 +25,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(k) | non-happy-path hardening (ninth pass): the two base-class **bootstrap handlers** — `onIntroduction` / `onAnnounceClusterTopology`, the only surface the hostile-wire audit left, flagged in the §7 sweep as a *separate carrier family* (null id / null nodeAddress in the bootstrap carriers; `Introduction` and `messages.NodeIdentifier` are bare null-permitting, unlike the term/index family that the domain constructors reject) — both now **refuse before any mutation** (the no-reply refusal shape: warn, zero state change): an intro carrying a null id or null address is refused before `setRemoteNodeId`, before `register`, and before the announce reply (previously: a null-bound connection feeding the follower vote/leader-handoff paths, a null map key in the topology — a `HashMap` null key, which inflates `getMajorityCount()` and votes can never name the unnameable member, a quorum DoS — and the null-address entry propagating to peers inside the reply built from `getTopology()`); an announce with a null slot / null id / null address anywhere in its list is refused wholesale (the 6(i) whole-list convention) and an unbound sender must be resolvable against the held topology <i>or its announced list</i> (real nodes announce themselves, so legitimate bootstrap still resolves) — all checks now run **before** `register`, making the post-registration `locate` `orElseThrow` ISE an unreachable invariant tripwire that used to fire after the topology had moved (the throw-after-mutation surface, closed for the follower-append path in 6(j), now on the bootstrap surface); the "exhausted" claim of the 6(i)/6(j) closure is re-scoped to the term/index family (see §7) | `stage 6(k)` |
 | 6(l) | non-happy-path hardening (tenth pass): the 6(k) identity family on the **vote surface as a whole** — the last audited vote surface the identity guard did not reach: all six handlers (follower/candidate/leader × `onVoteRequest`/`onVoteResponse`) now **refuse a null-sender before any term comparison or conversion** (one inline `sender.getRemoteNodeId() == null` check at the top of each, the 6(k) refusal shape: warn, zero state change, <i>no reply</i> — the vote surface has the reply machinery of the hostile-tail family available, but a grant-shaped reply would be strictly worse, so the family's no-reply form holds). Malformed-by-construction and unreachable on the live wire (`onIntroduction` is the only binder of `remoteNodeId`; `NodeConnectionOutboundImpl.receive` throws on an unbound non-bootstrap carrier) — defense-in-depth for the direct-handler surface (tests, middleware, future dispatch paths), where the handler-top check is the only line of defense. Three closed vectors: a follower grant recording `votedForNodeId = null`, which the same-term guard (`votedForNodeId != null`) <i>silently bypasses</i> — a second vote in the same term, Raft §5.2; a candidate tally via `votes.add(null)` (legal for a `HashSet`) — one phoney unattributed grant crossing `getMajorityCount()` (with the candidate's own vote already tallied, the null grant ALONE) into an illegitimate `convertToLeader`; and any-role step-downs handing free term recognition (a `convertToFollower(ForVote)` to an unattributable sender) before any guard hit | `stage 6(l)` |
 | 6(m) | non-happy-path hardening (eleventh pass): the 6(k) identity family on the **append / pre-vote-response / install-snapshot surface** — the last audited handler surface the null-sender guard had not reached: the follower's `onAppendEntries` / `onPreVoteResponse` / `onInstallSnapshot` plus the candidate's and the leader's `onAppendEntries` now each **refuse a null sender before any term comparison, conversion, tally, grant, or install** (the 6(k) shape: warn, zero state change, no reply — a success-shaped ack would be strictly worse than silence). Malformed-by-construction and unreachable on the live wire (defense-in-depth for the direct-handler surface, as 6(l)); audit of the remaining surfaces (pre-vote request, candidate/leader pre-vote response, both ack paths, the leader's snapshot-response path) records why each needs no identity guard — see §7. Five closed vectors: a follower conversion with a high-term append under a null leader plus rollback of the uncommitted tail and a true `AcknowledgeEntries` to a connection nobody could name; a follower pre-vote tally where `preVoteGrants.add(null)` (legal for a `HashSet`) reaches the 3-node majority on ONE unattributed grant; a follower install-snapshot (payload adopt, log re-anchor, `SnapshotInstalled` publish, reply) for an unattributable leader; a candidate conversion to a null-leader follower before the re-dispatch even reaches the follower handler; and a live-leader step-down for an unauthenticated carrier | `stage 6(m)` |
+| 6(n) | non-happy-path hardening (twelfth pass): the last open axis of the message-`field` null family the 6(k)–6(m) identity passes left — not the sender (6(k)–6(m)), not a hostile term/index (6(g)–6(i)), not a null <i>slot</i> (6(j)), but a null <i>payload</i> inside an otherwise well-formed append entry. The wire `AppendEntries.RaftLog` constructor null-guards `entry` (`requireNonNull`), which made the shape look unreachable — but Java deserialization reconstructs fields without calling constructors, so a hostile or corrupted stream carries the payload past the construction guard, and on the direct-handler surface that is the one vector that reaches the accept path with an entry the construction layer never accepted. Without the extension the refusal was never even reached: `RaftLogs.appendLogInternal` deletes conflicting entries FIRST (real log state torn out) and only then NPEs out of `CompletableRaftLog` construction — the throw-after-mutation family 6(e)/6(g)/6(h) closed on the other axes, here through a different field. `hasHostileWireTermIndex` now classifies `entry.getEntry() == null` in the same per-entry pass (alongside the 6(h) hostile term/index and the 6(j) null slot), so the follower's `onAppendEntries` refuses in the established 6(g)/6(h)/6(j) shape before ANY mutation — before `containsStartPoint`, before the leader install, before the append — one false ack answering in OUR term with OUR unchanged tail, zero state change (no leader, no append, no commit move, nothing applied). A null payload is structurally invalid exactly like a null slot or a missing term/index, so it is refused, not negotiated (no clamping); the full message-`field` null audit — the sealed matrix of every remaining carrier and why each needs no guard (consumer-inert reads, primitive-only fields, and the construction-guarded rest) — is recorded in §7 | `stage 6(n)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -58,7 +59,13 @@ install-snapshot surface — null `remoteNodeId` refused at the top of the five 
 audited handler sites (follower × append/pre-vote-response/install-snapshot, candidate
 × append, leader × append), each pin paired with a bound-sender discriminator proving
 the legitimate path survives; the identity family now covers every audited handler
-surface; see §7).
+surface; see §7); and after stage 6(n): **374 tests green, 0 failures, 1 pre-existing
+skip** (+1: the message-`field` null family closes its last axis — a null <i>payload</i>
+inside an otherwise well-formed append entry, construction-guarded and thus apparently
+unreachable, reached only via a deserialized/corrupted stream or the direct-handler
+surface, refused before the delete-then-NPE throw-after-mutation the accept path would
+have run; the full sealed matrix — sender, term/index, slot, and the ruled-out
+carriers — is recorded in §7; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -892,3 +899,70 @@ every driven dispatch (the warn lines — "is unbound (null remoteNodeId) - refu
 — visible once per dispatch in the surefire output). Final suite: **373 tests
 green, 0 failures, 1 pre-existing skip** (+5 over the 6(l) baseline of 368).
 The structural-backlog handoff stands as recorded in the 8th-round closure.
+
+**Non-happy-path hardening pass, twelfth round (2026-11-23, stage 6(n))** — the
+message-`field` null family: 6(g)–6(i) closed the hostile term/index axes, 6(j) the null
+<i>slot</i> axis, and 6(k)–6(m) the sender-identity family. The post-6(m) field audit
+walks every `AppendEntries` carrier field the follower's `onAppendEntries` accepts and
+rules each axis out on its own terms — `previousLogTermIndex` /
+`leaderCommitTermIndex` / each entry's `termIndex` are already classified by
+`hasHostileWireTermIndex` (6(g)/6(h)/6(i)) and refused at handler entry BEFORE any
+mutation; a null <i>slot</i> is already hostile (6(j)); and the one remaining
+unclassified shape — a well-formed entry (clean term/index, present slot) whose
+<i>payload</i> is null — is the one the wire constructor refuses to build
+(`AppendEntries.RaftLog`'s `requireNonNull(entry)`), which looked like a non-vector.
+
+It is not. The construction guard is a property of construction: Java deserialization
+reconstructs fields straight off the stream WITHOUT calling the constructor (the exact
+bypass this codebase's own `WireSerializationTest` relies on to round-trip its
+carriers), and the direct-handler surface (tests, middleware, a future
+deserialize-and-dispatch path) can hand a handler an entry the constructor never
+saw. That is the one vector that reaches the accept path carrying an entry the
+construction layer never accepted — and it is the worst kind this project has already
+closed, because the failure is not in the guard, it is in the order of the accept
+path itself: `RaftLogs.appendLogInternal` deletes conflicting entries FIRST (real log
+state torn out — the throw-after-mutation surface 6(e)/6(g)/6(h) closed on the
+term/index axes) and only then hands the entry to `CompletableRaftLog` construction,
+whose `super` call trips `RaftLog`'s `requireNonNull(entry)` and throws. The deletion
+is committed before the NPE fires; the node is left with its conflicting entries gone
+and an uncaught throw where a refusal should have been.
+
+So the guard moves ahead of the accept path, exactly as the family established:
+`hasHostileWireTermIndex` classifies a null payload in the same per-entry pass as
+the null slot and the hostile term/index —
+
+    for (AppendEntries.RaftLog entry : appendEntries.getEntries()) {
+        if (entry == null || isHostileWireTermIndex(entry.getTermIndex()) || entry.getEntry() == null) {
+            return true;
+        }
+    }
+
+— and `onAppendEntries` refuses it in the established 6(g)/6(h)/6(j) shape at the
+classification call, BEFORE `containsStartPoint`, BEFORE the leader install, BEFORE
+the append. One false ack answering in OUR term with OUR unchanged tail, zero state
+change (no leader, no append, no commit move, nothing applied). A null payload is
+structurally invalid exactly like a null slot or a missing term/index, so it is
+refused, not negotiated — no clamping, because there is no legal value to clamp to.
+The method javadoc and the inline comment both carry the 6(n) axis and its
+destructive-order rationale so the next auditor sees why the check must stay in the
+classification pass, not the accept branch.
+
+**Pin, one total:** `RaftNodeBehaviorFollowerInstallSnapshotTest`
+`appendCarryingANullEntryPayload_isRefusedWithoutThrowing` — a well-formed `(0,0)`
+entry whose payload is forged null via reflection on `AppendEntries.RaftLog.entry`
+(the exact shape a deserialized hostile stream would deliver, and the one shape the
+constructor forbids — the pin must bypass construction, so the guard is proven on
+this vector, not on a construction-time NPE). Asserts the family contract: one ack,
+`isSuccess == false`, tail at our epoch (term 0), no leader installed,
+`logs.getCurrentTermIndex().getIndex() == 0`,
+`logs.getCommittedTermIndex().getIndex() == 0`,
+`bridge.getLastAppliedIndex() == 0` — the 6(h)/6(j) null-index and null-slot
+siblings stay green in the same class, so the null-payload axis is isolated, not
+conflated with its predecessors.
+
+Isolated: `RaftNodeBehaviorFollowerInstallSnapshotTest` **35 green** (34 baseline +
+1 pin), the guard firing on the driven dispatch in the surefire output. Final suite:
+**374 tests green, 0 failures, 1 pre-existing skip** (+1 over the 6(m) baseline of
+373). The message-`field` null family is now closed across all carriers and all
+axes: the sealed matrix (term/index 6(g)–6(i), slot 6(j), payload 6(n), sender
+6(k)–6(m)) is recorded in the stage table and above.
