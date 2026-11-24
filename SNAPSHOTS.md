@@ -30,6 +30,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(p) | non-happy-path hardening (fourteenth pass, the store `save()` argument surface on a 6(g)-family axis): the negative-<i>term</i> axis — the `TermIndex` constructor rejects BOTH negative axes (the 6(g) root mechanism), which made the axis look unreachable to the store guards, but a deserialized/construction-bypassed boundary reaches `save()` with one; both `save()`s guarded `boundary.getIndex() < 0` and never `boundary.getTerm() < 0`, so a `(-3,10)` boundary wrote `raft-snapshot--3-10.snap` — a name `parseBoundary` can never read back (the first dash is at position 0) — AFTER `deleteSuperseded` had torn out the valid snapshot: a "successful" save leaving the store EMPTY, data loss with no exception (worse than the 6(o) masking, where the real snapshot still existed); `InMemorySnapshotStore` stored the forged boundary and handed it back. Both `save()`s now refuse a negative term before any temp file, write, or delete (the shape of the sibling index guard), and the shared `Stored` record completes the axis (defense-in-depth, symmetrical with the 6(o) empty-payload completion) | `stage 6(p)` |
 | 6(q) | non-happy-path hardening (fifteenth pass, the <i>type</i> axis of the 6(d)/6(o) "looks like a snapshot but is not one" family on the file surface): 6(d) sealed the NAME axis (unparseable → warn+skip), 6(o) the BODY axis (zero bytes) — but neither gate could express TYPE, because 6(o)'s `hasPayload` is a stat and a directory's stat legitimately reports a positive size (the only question a directory answers with "no" is "am I a regular file?", which the code never asked). A save() writes regular files and nothing else, yet a NON-REGULAR foreign entry named like a snapshot (a directory `raft-snapshot-99-99.snap` in a shared directory) passed every gate that existed: name shape, `parseBoundary`, "has payload". Load path: max-by-boundary "recovered" it (a foreign writer can always name it ABOVE the real snapshot — the 6(o) masking mechanism), `readAllBytes` threw (`Is a directory`), and the one VALID snapshot sitting next to it became unrecoverable — a seed-at-startup node starting unseeded over a log already compaction-truncated to the real boundary. Save path: `deleteSuperseded` visited it as superseded — throwing on a non-EMPTY foreign directory (the failure escapes `save()` as a `RuntimeException`, not the `IllegalStateException` family it wraps, and reaches the caller AFTER the new snapshot is already in place: a partial save reported as one), or silently tearing down an empty foreign object as collateral. Fix: ONE root-cause predicate on both paths — only a regular file is a snapshot — `loadLatest` warns and skips non-regular entries (the 6(o) skip shape; a vanished entry lands on the same guard, still skipped) and `deleteSuperseded` spares them (inert under our naming scheme: never read, never torn out); three pins in `FileSnapshotStoreTest` including the distinguishing valid-snapshot-must-still-load assertion | `stage 6(q)` |
 | 6(r) | non-happy-path hardening (sixteenth pass, the 6(g) term axis on the `RaftLogs` intake — the last consumer in the chain behind the sealed wire guards): `compact()` guarded `index < 0` but never `term < 0`, and `commit()` had no guard at all but the index bounds (a null NPEd out of `getIndex()`; a forged `(-1,k)` passes both), sticking into `snapshotBoundary`/`startSeed`/`currentTermIndex` (full install) or `committedTermIndex`, inverting the term-first `TermIndex.compareTo` the committed filter and `rollback()` depend on — committed entries re-served (double-apply) or the pending ones dropped with their acks, and `rollback()` tearing out the committed prefix alongside the uncommitted tail. The axis had looked sealed because the existing negative-<i>index</i> pin was actually pinning the `TermIndex` constructor (it throws inside the pin's own expression) — the same construction-guard illusion that blinded the 6(p) store audit. Both intakes now refuse a null or negative-axis pointer (IAE, the `isHostileWireTermIndex` shape) before ANY state change, with pins carrying the zero-state-change contract and the double-serve/drop discriminator | `stage 6(r)` |
+| 6(s) | non-happy-path hardening (seventeenth pass, the `RaftLogs` content intake — the one append path not construction-guarded): all four public append overloads funnel into `appendLogInternal(TermIndex, T)`, and the int overloads reach it only through the `TermIndex` constructor (IAE on both negative axes) — so the raw overload is the one intake a 6(n)/6(p)-shaped construction-bypassed carrier or a null can reach, and it had no guards at all, right next to the 6(r) guards that had just sealed its sibling intakes. Four live shapes, all RED-confirmed pre-fix: **null pointer** NPE'd in the conflict walk (the log is never empty — it is seeded with the epoch); a **forged negative term** could replace nothing (a negative term outranks no existing entry) but is also never "before" one under the term-first `compareTo`, so it fell out of the walk as an ISE "log gap" — the wrong family for a contract refusal; a **forged negative index** tripped `isReplacementOf` against the epoch seed (1 > 0 and -1 <= 0) and the conflict sweep destroyed the ENTIRE log before the forged record lodged below the true tail — state-destroying, with a completed future for index -1 in the caller's hand and the recorded tail a phantom the deque no longer holds; and a **null entry** NPE'd out of the record construction at a new index while silently no-oping (returning the existing record, the entry never read) at an existing one. The gate now refuses the null pointer, the negative-axis pointer, and the null entry at the head of the method, before the iterator touches the deque — one guard covering all four overloads through the funnel, carrying the zero-state-change and next-append-lands-past-the-tail discriminators | `stage 6(s)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -110,7 +111,17 @@ boundary pointers or the committed pointer and, via the term-first
 `TermIndex.compareTo`, inverted the committed filter and `rollback()` —
 committed entries re-served (double-apply) or pending ones dropped; both
 intakes now refuse a null or negative-axis pointer before any state change;
-see §7).
+see §7); and after stage 6(s): **385 tests green, 0 failures, 1 pre-existing
+skip** (+2: the content intake of the same log — all four append overloads
+funnel into `appendLogInternal(TermIndex, T)`, and the int overloads reach it
+only through the `TermIndex` constructor, so this raw overload is the one
+append path a construction-bypassed carrier or a null can touch — and it had
+no guards at all: a null pointer NPE'd in the conflict walk, a forged
+negative term fell out as an ISE "log gap", a forged negative index tripped
+`isReplacementOf` against the epoch seed and the sweep destroyed the entire
+log before the forged record lodged, and a null entry NPE'd at a new index
+while silently no-oping at an existing one; the gate now refuses all four
+before the deque is touched; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1321,3 +1332,71 @@ delta). Full suite at this point: **383 tests green, 0 failures, 1 pre-existing 
 (6(o)–6(p)), log (6(r)) — now has one answer at every in-process entry point: a pointer
 is legitimate iff it is non-null and both axes non-negative — the `TermIndex`
 constructor's contract, enforced at every API the constructor does not reach.
+
+**Non-happy-path hardening pass, seventeenth round (2026-11-24, stage 6(s))** — the
+CONTENT intake of the same log its 6(r) sibling sealed: `appendLog` / `appendFutureLog`.
+The pointer half of 6(r) closed `compact` and `commit`; the fourth intake of the class —
+the one the whole log exists to append through — sat directly below those two guards with
+none of its own, and its "sealed" appearance was built from the 6(n)/6(p) construction
+illusion in the strongest form: every guard the reader could name belonged to the
+`TermIndex` constructor, but only the int overloads route through it.
+
+The surface. All four public append overloads funnel into the private
+`appendLogInternal(TermIndex, T)`: the int overloads `appendLog(int, int, T)` and
+`appendFutureLog(int, int, T)` construct their pointer with `new TermIndex(term, index)`
+— IAE on either negative axis, NPE on null args, construction-sealed — while the
+`TermIndex`-typed overloads `appendLog(TermIndex, T)` (L97) and
+`appendFutureLog(TermIndex, T)` (L89) hand the pointer to `appendLogInternal` raw. So
+this one private method is the single intake a construction-bypassed carrier (the
+6(n)/6(p) shape, on either axis) or a null can reach from inside the process — exactly
+the gap 6(r) had noted its sibling guards were designed to prevent.
+
+The pre-fix behaviors (all RED-confirmed by the pins before the fix):
+- **null pointer**: NPE inside the conflict walk at `isReplacementOf` — the deque is
+  never empty (the constructor seeds the epoch entry), so the dereference is
+  deterministic. Zero state change, wrong family (NPE, not IAE).
+- **forged negative term** `(-1, k)`: `isReplacementOf` can never fire (nothing outranks
+  a negative term) AND the term-first `compareTo` can never rank it "before" an entry —
+  it falls out of the walk as ISE `"Unexpected log gap!"`. Zero state change, wrong
+  family (ISE, not IAE).
+- **forged negative index** `(1, -1)` — the worst shape: `isReplacementOf` fires against
+  the epoch seed (`1 > 0 && -1 <= 0`), so the conflict walk **sweeps the entire log**,
+  lodges the forged record, returns a *completed future* for index `-1`, and the next
+  computed append continues from `currentTail().getIndex() + 1 = 0`. State destroyed,
+  caller handed success.
+- **null entry**: at a NEW index, NPE out of the `RaftLog` constructor's
+  `requireNonNull(entry)`; at an EXISTING pointer, the walk matches and returns the
+  existing record without ever reading the raw entry — a silent no-op. One intake, two
+  behaviors; a uniform gate is the only answer.
+
+**The fix, in `RaftLogs`**, at the head of `appendLogInternal(TermIndex termIndex, T
+rawLog)` — before the iterator touches the deque, so one guard covers all four public
+overloads through the funnel, in the `isHostileWireTermIndex` / 6(r) family:
+`termIndex == null` → IAE `"append termIndex must not be null"`; `getTerm() < 0 ||
+getIndex() < 0` → IAE `"append termIndex must not be negative: …"`; `rawLog == null` →
+IAE `"append entry must not be null (pointer …)"`. Deliberately NOT a protocol-level
+refusal of any higher-term-at-lower-index shape — that is Raft's legitimate conflict
+truncation (`isReplacementOf`) and the guard must never eat it.
+
+**Pins (both RED-confirmed before the fix, then GREEN), in `RaftLogsTest`:**
+`testAppendGuards`, new (modeled on `testCommitGuards`) — `appendLog(null, "hostile")`
+throws IAE (pre-fix: NPE@L116), `appendFutureLog(null, "hostile")` throws IAE (mirror
+pin, holds the funnel), `appendLog(forgeTerm(-1, 1L), "hostile")` throws IAE (pre-fix:
+ISE "log gap"), and `appendLog(new TermIndex(1, 1L), null)` (existing pointer — the
+silent-no-op shape) and `appendLog(new TermIndex(1, 9L), null)` (new pointer — the NPE
+shape) both throw IAE; the refusal is zero-state-change (both records intact, tail at 2,
+full range `["a","b"]`) and then `appendLog(1, "c")` at (1,3) still resolves — the
+legitimate-append-lands-past-tail discriminator. `testAppendGuardsRefuseForgedNegativeIndex`,
+separate, on its own fresh `RaftLogs` instance (isolation: the destructive shape must not
+leak state into the other pin) — `appendLog(forgeIndex(1, -1L), "hostile")` throws IAE
+(pre-fix: nothing thrown, log destroyed), then the zero-state-change assertions (`[a, b]`
+intact, tail at 2, legitimate (1,3) append lands). The new `forgeIndex` helper mirrors
+`forgeTerm` — reflectively set the `index` field of a freshly-constructed `TermIndex` —
+completing the two-axis forging idiom of 6(n)/6(p)/6(r) in `RaftLogsTest`.
+
+Isolated: `RaftLogsTest` **12 green / 0 fail / 0 skip** (10 baseline + the two new
+methods). Full suite at this point: **385 tests green, 0 failures, 1 pre-existing skip**
+(+2 over the 6(r) baseline of 383). The pointer+content family of the `RaftLogs` intake —
+compact (6(r) term+index), commit (6(r) term+index), append (6(s) pointer + entry) — now
+refuses every hostile shape at every public surface that takes one, before any mutation of
+the deque.

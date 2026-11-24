@@ -108,6 +108,29 @@ class RaftLogs {
     // TODO: Profiling shows bad performance in this section.
     //       Needs to be optimized as it gets much worse as log size grows.
     private <T> CompletableRaftLog<T> appendLogInternal(TermIndex termIndex, T rawLog) {
+        // (6s) Same hostile-carrier guard family as the 6r compact/commit guards, at the
+        // one append intake that is not construction-guarded: the int overloads route
+        // through the TermIndex constructor (which refuses both negative axes), but this
+        // overload takes the pointer raw, so a construction-bypassed carrier (the
+        // 6(n)/6(p) shape) or a null arrives unguarded. A null pointer derefs to NPE in
+        // the conflict walk (the log is never empty -- it is seeded with the epoch); a
+        // forged negative term falls out as an ISE "log gap" (a negative term replaces
+        // nothing and is never "before" an entry under the term-first compareTo); a
+        // forged negative index is the worst shape -- it trips isReplacementOf against
+        // the epoch seed (e.g. 1 > 0 and -1 <= 0) and the sweep destroys the ENTIRE log
+        // before the forged record lodges below the true tail -- with a completed future
+        // for the caller. A null entry, meanwhile, NPEs out of the record construction
+        // at a new index and silently no-ops at an existing one. The gate refuses all of
+        // them as contract violations, before the deque is touched.
+        if (termIndex == null) {
+            throw new IllegalArgumentException("append termIndex must not be null");
+        }
+        if (termIndex.getTerm() < 0 || termIndex.getIndex() < 0) {
+            throw new IllegalArgumentException("append termIndex must not be negative: " + termIndex);
+        }
+        if (rawLog == null) {
+            throw new IllegalArgumentException("append entry must not be null (pointer " + termIndex + ")");
+        }
         final Iterator<CompletableRaftLog<?>> iterator = logs.iterator();
         while (iterator.hasNext()) {
             final CompletableRaftLog<?> next = iterator.next();

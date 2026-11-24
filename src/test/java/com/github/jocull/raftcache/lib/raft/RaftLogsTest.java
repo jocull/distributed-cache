@@ -327,6 +327,70 @@ public class RaftLogsTest {
         assertEquals(new TermIndex(1, 2L), raftLogs.getCommittedTermIndex());
     }
 
+    @Test
+    void testAppendGuards() {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        raftLogs.appendLog(1, "a"); // (1,1)
+        raftLogs.appendLog(1, "b"); // (1,2)
+
+        // (6s) Same hostile-carrier guard family as the 6r compact/commit guards, at the
+        // log's main content intake: the int overloads are construction-guarded (the
+        // TermIndex constructor refuses both negative axes), but the TermIndex overloads
+        // take the pointer raw, so a construction-bypassed carrier (the 6(n)/6(p) shape)
+        // or a null arrives unguarded.
+        // A null pointer derefs to NPE in the conflict walk (the log is never empty --
+        // it is seeded with the epoch): the wrong family for a contract refusal.
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.appendLog(null, "hostile"));
+        // The same intake's future-returning overload: one mirror pin to hold the funnel.
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.appendFutureLog(null, "hostile"));
+
+        // A forged negative term is no higher than the epoch's, so it replaces nothing
+        // and is never "before" an entry either under the term-first compareTo: it falls
+        // out of the walk as an IllegalStateException "log gap" -- again the wrong family.
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.appendLog(forgeTerm(-1, 1L), "hostile"));
+
+        // A null entry is a contract refusal uniform in the pointer: at an existing one
+        // the happy path silently returns the existing record (the entry is never read),
+        // at a new one it NPEs out of the record construction.
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.appendLog(new TermIndex(1, 1L), null));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.appendLog(new TermIndex(1, 9L), null));
+
+        // Refusal is zero-state-change: every real record intact, the tail did not move,
+        // and the legitimate sequence still resolves all the way to the end.
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 1L)));
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 2L)));
+        assertEquals(2L, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals(List.of("a", "b"), raftLogs.getLogRange(new TermIndex(0, 0L), 2, RaftLog::getEntry));
+        raftLogs.appendLog(1, "c"); // (1,3)
+        assertEquals(3L, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals(List.of("a", "b", "c"), raftLogs.getLogRange(new TermIndex(0, 0L), 3, RaftLog::getEntry));
+    }
+
+    @Test
+    void testAppendGuardsRefuseForgedNegativeIndex() {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        raftLogs.appendLog(1, "a"); // (1,1)
+        raftLogs.appendLog(1, "b"); // (1,2)
+
+        // (6s) The one hostile shape that mutates: a forged negative index "replaces"
+        // the epoch seed under isReplacementOf (1 > 0 and -1 <= 0), so the conflict walk
+        // sweeps the ENTIRE log and lodges the forged record below the true tail -- all
+        // before any check in the current code, handing the caller a completed future for
+        // index -1 while the next computed append would continue from index 0. The guard
+        // must fire before the iterator touches the deque.
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.appendLog(forgeIndex(-1L), "hostile"));
+
+        // Zero-state-change: both real records intact and the tail unmoved -- had the
+        // sweep run first (pre-fix), the log would hold only the forged (1,-1) and every
+        // one of these would fail.
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 1L)));
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 2L)));
+        assertEquals(2L, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals(List.of("a", "b"), raftLogs.getLogRange(new TermIndex(0, 0L), 2, RaftLog::getEntry));
+        raftLogs.appendLog(1, "c"); // (1,3) still lands exactly one past the tail
+        assertEquals(3L, raftLogs.getCurrentTermIndex().getIndex());
+    }
+
     /**
      * Forge a pointer the {@link TermIndex} constructor would never produce (a negative
      * term): build a legal one, then set the field directly -- the exact shape a
@@ -342,6 +406,23 @@ public class RaftLogsTest {
             return base;
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("failed to forge the pointer term", e);
+        }
+    }
+
+    /**
+     * Forge a pointer the {@link TermIndex} constructor would never produce (a negative
+     * index): the same construction-bypass shape as {@link #forgeTerm(int, long)} on the
+     * index axis -- the carrier the append intake must refuse no matter how it arrived.
+     */
+    private static TermIndex forgeIndex(long index) {
+        final TermIndex base = new TermIndex(1, 0L);
+        try {
+            final java.lang.reflect.Field field = TermIndex.class.getDeclaredField("index");
+            field.setAccessible(true);
+            field.set(base, index);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the pointer index", e);
         }
     }
 }
