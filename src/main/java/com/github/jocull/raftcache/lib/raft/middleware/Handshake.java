@@ -18,8 +18,8 @@ public class Handshake implements Serializable {
     private final NodeAddress target;
 
     public Handshake(NodeAddress client, NodeAddress target) {
-        this.client = Objects.requireNonNull(client);
-        this.target = Objects.requireNonNull(target);
+        this.client = Objects.requireNonNull(client, "client");
+        this.target = Objects.requireNonNull(target, "target");
     }
 
     public NodeAddress getClient() {

@@ -38,11 +38,11 @@ public class InstallSnapshot implements Serializable {
     public InstallSnapshot(int term, String leaderId, long lastIncludedIndex, int lastIncludedTerm,
                            long offset, Object payload, boolean done) {
         this.term = term;
-        this.leaderId = Objects.requireNonNull(leaderId);
+        this.leaderId = Objects.requireNonNull(leaderId, "leaderId");
         this.lastIncludedIndex = lastIncludedIndex;
         this.lastIncludedTerm = lastIncludedTerm;
         this.offset = offset;
-        this.payload = Objects.requireNonNull(payload);
+        this.payload = Objects.requireNonNull(payload, "payload");
         this.done = done;
     }
 

@@ -58,7 +58,7 @@ public class AppendEntries implements Serializable {
         private final Object entry;
 
         public RaftLog(TermIndex termIndex, Object entry) {
-            Objects.requireNonNull(entry);
+            Objects.requireNonNull(entry, "entry");
 
             this.termIndex = termIndex;
             this.entry = entry;

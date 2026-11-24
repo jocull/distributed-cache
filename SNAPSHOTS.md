@@ -39,6 +39,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(y) | non-happy-path hardening (twenty-third pass, the fan-out root no round visited: `EventBus` — the shared bus every sealed subscriber (the `StateMachineBridge` intake, the leader's `AppendLog` subscriber, `Replica`) sits on — had NO gate of its own: `subscribe(null)` silently parked a null element in the `CopyOnWriteArrayList` (null elements are legal there), so the next legitimate publish NPE'd AT DISPATCH (`s.onEvent` on a null subscriber), starving every subscriber after the null one in list order — a bus-level crash triggered by a shape no sealed intake above can emit; `unsubscribe(null)` was a silent no-op indistinguishable from removing a never-subscribed handle; `publish(null)` fanned the null event OUT to the null-tolerant `instanceof`-shaped subscribers (which swallow anything non-matching, including null) and was only refused deep, by the sealed `StateMachineBridge` intake, mid-iteration — aborting delivery to the subscribers after it (6(v) sealed that axis only at the consumer side, the fan-out itself was raw). The three intakes now refuse at the method head in the 6(v) IAE family (`"subscriber must not be null"` for `subscribe` and `unsubscribe`; `"event must not be null"` for `publish` — the same axis name the `StateMachineBridge` intake already speaks on the consumer side, now spoken by the producer BEFORE any subscriber is invoked), with zero state change and zero fan-out on refusal — carrying the no-crash-at-dispatch (a refused subscription leaves both neighboring subscribers still served the legitimate event), installed-subscribers-untouched, zero-fan-out (a refused publish reaches neither of two null-tolerant recorders, where pre-fix the null rode to ALL subscribers silently, or was refused only mid-iteration by the bridge), and legitimate-intake-still-works (subscribe → publish → served exactly once; unsubscribe → publish → not served again) discriminators | `stage 6(y)` |
 | 6(z) | non-happy-path hardening (twenty-fourth pass, the public client API boundary — the last unsealed surface on the data plane): `DistributedCache` — the phase-4 facade every caller touches (`put`/`delete`/`expire`/`get`, and the constructor that wires the bus, the nodes, and the map) — still spoke the pre-campaign style: seven bare `Objects.requireNonNull` calls with no message, in the WRONG FAMILY — the method intakes NPE'd (the messageless JDK call) where the sealed layer below (`PartitionMap`, 6(v)) throws NAMED IAEs (`key`/`data`/`ttl must not be null`), so `put(key, null)` / `put(null, data)` / `delete(null)` / `expire(null, ttl)` / `expire(key, null)` were indistinguishable from a failure deep in the wiring, and `get(null)` NPE'd at the facade head while the sealed seam one layer below has already spoken the named axis since 6(v); the three constructor NPEs (`clusterEventBus`/`nodes`/`partitionMap`) carried no message either — the one boundary in the data plane whose carriers do not name their dependencies (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs", `PartitionMap` "eventBus"/"clock"). The guards sat in the right PLACE (before `findLeaderNode()`/`submit()` — the only barrier standing a null-key entry from riding `leader.submit` into the raft log) but refused unnamed and in the wrong family; the five method intakes now refuse at the head in the 6(v) IAE family — key/data in `put`, key in `delete`, key/ttl in `expire`, key in `get` — before leader resolution, before `submit`, before any state change, and the constructor carriers now name their dependencies (`clusterEventBus`/`nodes`/`partitionMap`), the empty-nodes IAE kept — carrying the zero-submissions (a recording stub leader proves a refused write never reaches the log), the empty-list-IAE-still-holds, and the legitimate-intake-still-routes (a legitimate `put` reaches the leader exactly once and a legitimate `get` is still served) discriminators | `stage 6(z)` |
 | 7(a) | non-happy-path hardening (twenty-fifth pass, the entry-payload carrier layer — the log-entry payloads every sealed surface rides: `KeyDataInput` / `KeyDataOutput` / `KeyDataDeleteInput` / `KeyDataExpireInput`): the last unnamed constructor family in the data plane — all four heads still spoke the pre-campaign style, seven bare messageless `Objects.requireNonNull` calls whose `NullPointerException.getMessage()` is `null`, so a refused `null` was indistinguishable from a failure deep in the wiring, while the house constructor-carrier family names the dependency it refuses (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs", and since 6(z) the facade's own `clusterEventBus`/`nodes`/`partitionMap`) — now every head names its axis at the constructor (`key` in all four, `data` in Input/Output, `ttl` in Expire), `KeyDataExpireInput`'s named `"ttl must be positive. Provided: …"` IAE and its key → null-ttl → positivity ordering kept intact — carrying the axis-named refusals (a refused carrier never exists), the positivity-IAE-still-holds (zero and negative `ttl`), and the legitimate-construction-still-succeeds (a well-formed carrier still builds and its getters still read back) discriminators | `stage 7(a)` |
+| 7(b) | non-happy-path hardening (twenty-sixth pass, the raft-core bootstrap/transport carrier layer — the layer every sealed surface addresses: `NodeAddress` (topology identity — the address every connection dials and every `AnnounceClusterTopology` list carries), `Handshake` (the bootstrap frame every connection writes first), `InstallSnapshot` (the 6(g) message boundary the 6-series hostile pins refuse at construction), and the `AppendEntries.RaftLog` entry carrier (the log entries the sealed leader/follower seams apply)): the family still spoke the pre-campaign style — six bare messageless `Objects.requireNonNull` calls whose `NullPointerException.getMessage()` is `null`, so a refused `null` was indistinguishable from a failure deep in the wiring, while the house constructor-carrier family names the dependency it refuses — now every head names its axis at the constructor (`address` in `NodeAddress`, `client`/`target` in `Handshake`, `leaderId`/`payload` in `InstallSnapshot`, `entry` in `RaftLog`), a pure message rename (the guards stay in place, the exception type unchanged — the 6(g) class-only pin `aNullPayload_isBlockedAtTheMessageBoundary_soTheFollowerNeverSeesOne` and every 6-series hostile-shape pin keep building and rejecting exactly as before), while the bare identity family (`messages.NodeIdentifier`, `topology.NodeIdentifier`/`NodeIdentifierAddress`, `Introduction`) and `RaftLog`'s sibling `termIndex` axis stay deliberately bare by the 6(i)/6(k) decision (the receiver seams refuse those axes, and the 6(i) hostile-carrier pin constructs them on purpose) — carrying the axis-named refusals (a refused carrier never exists) and the legitimate-construction-still-succeeds (a well-formed carrier still builds and its getters still read back) discriminators | `stage 7(b)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -224,7 +225,19 @@ surface rides, still spoke the pre-campaign style: seven bare messageless
 `Objects.requireNonNull` calls naming no axis — a refused `null` produced an NPE with
 a `null` message — while the house constructor-carrier family names the dependency it
 refuses; now every head names `key`/`data`/`ttl` at the constructor and the
-`"ttl must be positive. Provided: …"` IAE is kept; see §7).
+`"ttl must be positive. Provided: …"` IAE is kept; see §7); and
+after stage 7(b): **443 tests green, 0 failures, 1 pre-existing skip** (+10:
+the raft-core bootstrap/transport carrier layer — `NodeAddress` (topology
+identity), `Handshake` (the bootstrap frame), `InstallSnapshot` (the 6(g)
+message boundary), and the `AppendEntries.RaftLog` entry carrier — still spoke
+the pre-campaign style: six bare messageless `Objects.requireNonNull` calls
+naming no axis — a refused `null` produced an NPE with a `null` message — while
+the house constructor-carrier family names the dependency it refuses; now every
+head names `address`/`client`/`target`/`leaderId`/`payload`/`entry` at the
+constructor — a pure message rename: the guards stay in place, the message-agnostic
+6(g) boundary pin and the 6-series hostile-shape pins keep building and
+rejecting exactly as before — while the bare identity family and `RaftLog`'s
+`termIndex` axis stay deliberately bare by the 6(i)/6(k) decision; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -2086,3 +2099,69 @@ now names its dependency end-to-end across the data plane, including the
 carrier layer every sealed surface rides on: the entry payloads
 `StateMachineBridge` applies, `PartitionMap` stores, and `DistributedCache` submits
 (code `stage 7(a)`).
+
+**Non-happy-path hardening pass, twenty-sixth round (2026-11-24, stage 7(b))** — the
+raft-core bootstrap/transport carrier layer: 7(a) sealed the data-plane entry payloads,
+but the carriers the sealed surfaces *address* — `NodeAddress` (topology identity — the
+address every connection dials and every `AnnounceClusterTopology` list carries),
+`Handshake` (the bootstrap frame every connection writes first), `InstallSnapshot`
+(the 6(g) message boundary the 6-series hostile pins refuse at construction), and the
+`AppendEntries.RaftLog` entry carrier (the log entries the sealed leader/follower seams
+apply) — still carried six bare guards:
+
+- **Constructor carriers — the axes never named, the message `null`.** All six axes —
+  `NodeAddress.address`, `Handshake.client`/`target`, `InstallSnapshot.leaderId`/
+  `payload`, `AppendEntries.RaftLog.entry` — guarded their null axes with bare messageless
+  `Objects.requireNonNull` calls: a refused `null` produced a `NullPointerException` whose
+  `getMessage()` is `null`. The refusal sat in the right family (the house
+  constructor-carrier rule — named since 7(a) — names the dependency it refuses:
+  `Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs", `PartitionMap`
+  "eventBus"/"clock", the facade's `clusterEventBus`/`nodes`/`partitionMap") and the
+  seams sat in the right layer, so a refusal was indistinguishable from a failure deep
+  in the wiring: the caller could not tell "you passed null" from "the wiring produced
+  a null" — in `InstallSnapshot`'s case the guard is the *only* barrier standing a null
+  leader/payload from reaching the follower, and in `Handshake`'s a null frame would
+  die inside the channel read loop, not at the seam.
+
+The 7(b) fix moves the six constructor heads to the named 2-arg form
+(`Objects.requireNonNull(x, <axis>)`), each axis named, in the house
+constructor-carrier family — a pure message rename: the guards stay in place, the
+exception type is unchanged, so the 6(g) class-only pin
+(`aNullPayload_isBlockedAtTheMessageBoundary_soTheFollowerNeverSeesOne`, which asserts
+the NPE *class*, not the message) and every 6-series hostile-shape pin (the 6(i) pin
+constructs `new NodeIdentifier(null, new NodeAddress("hostileAddress"))` on purpose;
+the 6-series entry pins build `new RaftLog(null, "hostile-entry")` on purpose) keep
+building and rejecting exactly as before:
+
+- `NodeAddress` — constructor names `address`;
+- `Handshake` — constructor names `client`, then `target`;
+- `InstallSnapshot` — constructor names `leaderId`, then `payload`; the 6(g) boundary
+  invariant and its pin kept (a `null` payload still cannot be built);
+- `AppendEntries.RaftLog` — constructor names `entry`; the sibling `termIndex` axis
+  stays deliberately bare at the carrier level — the 6(i)/6(k) decision: the receiver
+  seams refuse that axis, and the hostile-entry pins construct the bare shape; the same
+  exception keeps the identity family (`messages.NodeIdentifier`,
+  `topology.NodeIdentifier`/`NodeIdentifierAddress`, `Introduction`) bare, so 7(b)
+  renames only axes that are already guarded.
+
+**Pin (RED-confirmed before the fix, then GREEN), 10 across four test classes, one per
+carrier (in `lib/topology`, `lib/raft/middleware`, and `lib/raft/messages`):** RED
+re-confirmed against the pre-fix carriers — all six axis pins failed
+`expected: <address|client|target|leaderId|payload|entry> but was: <null>` (the
+`NullPointerException` WAS thrown — the guard sat in the right place, the constructor
+head — its message was the JDK `null`), with exactly the four legitimate-construction
+sanities green. Then GREEN: the six axis pins assert the NPE names the axis (a refused
+carrier never exists — zero construction, zero state change before or after the
+refusal), and the four `testValidConstructionSanity` controls pin the
+legitimate-intake-discrimination: a well-formed carrier still builds and its getters
+still read back (a guard that refuses everything is as broken as one that refuses
+nothing).
+
+Isolated (`NodeAddressTest` / `HandshakeTest` / `InstallSnapshotTest` /
+`AppendEntriesTest`): **10 green / 0 fail / 0 skip**.
+Full suite at this point: **443 tests green, 0 failures, 1 pre-existing skip**
+(+10 over the 7(a) baseline of 433). With this the house constructor-carrier family
+names its dependency end-to-end across the raft-core bootstrap/transport layer as well
+— the identity every connection dials, the frame every connection writes, the snapshot
+boundary the 6(g) follower refuses, and the log entry the sealed seams apply (code
+`stage 7(b)`).

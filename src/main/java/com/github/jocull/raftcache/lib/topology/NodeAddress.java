@@ -9,7 +9,7 @@ public class NodeAddress implements Serializable {
     private final String address;
 
     public NodeAddress(String address) {
-        Objects.requireNonNull(address);
+        Objects.requireNonNull(address, "address");
 
         this.address = address;
     }
