@@ -27,11 +27,11 @@ public class PartitionMap {
      * expiring key's clock to exercise TTL expiry deterministically.
      */
     public PartitionMap(EventBus eventBus, int size, Clock clock) {
-        Objects.requireNonNull(eventBus);
+        Objects.requireNonNull(eventBus, "eventBus must not be null");
         if (size < 1) {
             throw new IllegalArgumentException("Size must be > 0. Provided: " + size);
         }
-        Objects.requireNonNull(clock);
+        Objects.requireNonNull(clock, "clock must not be null");
 
         this.eventBus = eventBus;
         this.clock = clock;
@@ -59,6 +59,9 @@ public class PartitionMap {
     }
 
     public Partition getPartitionForKey(String key) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         return new Partition(Math.abs(key.hashCode() % partitionMap.size()));
     }
 

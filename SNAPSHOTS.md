@@ -35,6 +35,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(u) | non-happy-path hardening (nineteenth pass, the pending-request registry — the last raw in-process intake sitting between the sealed wire (6(g)–6(n)) and the sealed log (6(r)–6(t)): `NodeRequests` is the sole request/response correlation point; `NodeConnectionOutboundImpl` is its only caller and funnels BOTH `sendStateRequest` and `receive(StateResponse)` through it, yet neither intake had a single gate. RED-confirmed pre-fix (the pin's first two failures): a **null request** NPE'd synchronously at the `pendingRequests.put(request.getRequestId(), …)` key dereference while the already-scheduled delayed-cancellation task NPE'd a SECOND time, invisibly, 5 s later inside the common pool; a **null response** into `completeRequest` NPE'd at `response.getRequestId()` (the wrong family, both). The remaining shapes are confirmed from the same source walk and guarded in the same pass: a **null response class** was accepted and NPE'd *later*, inside the caller's own future, at `isAssignableFrom(null)` (wrong time, wrong place); a **null requestId** — reachable only via a construction-bypassed carrier (the 6(n)/6(p) shape; the constructors seed the id in-field and can never produce one) — was silently accepted as a legal `HashMap` null key, so two such requests collide on ONE entry and a completion under that key resolved the *WRONG* pending future (talking past each other), and a null-id response carrier fell into the `pending == null` early return and was dropped with no trace — indistinguishable from the legitimate unknown-id discard, and masked in practice by the 5 s cancellation timeout. Both intakes now refuse at the method head in the 6(r)–6(t) IAE family — `getRequestFuture` refusing request / request id / response class before the executor or the map is touched, `completeRequest` refusing response / response id before the map lookup — carrying the legitimate-roundtrip-still-completes-the-waiting-caller and unknown-id-still-a-silent-no-op discriminators | `stage 6(u)` |
 | 6(v) | non-happy-path hardening (twentieth pass, the apply/data plane — the last raw in-process intake downstream of the sealed log: `LogsCommitted` — the last unguarded public event carrier — feeds `StateMachineBridge.onEvent`, which replays it into the `PartitionMap` write intakes, and neither side had a single gate. RED-confirmed pre-fix (the pins' first failures, both new test methods): the bridge constructor NPE'd at `eventBus.subscribe` on a null bus with the JDK-enriched message (indistinguishable from a failure deeper in the wiring), and *passed construction* on a null state machine to NPE later, silently, inside an applied write (wrong time, wrong place); `onEvent(null)` fell through into the silent unknown-event-ignore line (indistinguishable from a legitimate discard by another publisher on the shared bus); the carrier held the producer's mutable list by reference, so a nulled element — a shape `List.of` itself would refuse — rode past it, and a forged log (null term index, or null entry: shapes the `RaftLog` constructor never produces) was accepted and NPE'd inside the apply loop — in a mixed `[good, forged]` batch the good log was *applied first* (state changed, applied position moved) and only then the batch died: a half-applied commit; the store intakes bumped `globalVersion` *before* the NPE they threw (every refusal leaked one consumed version — a legitimate SET landed on version **5** where the contract says 1, a follow-up EXPIRE on **5** where it says 2), and `restore` NPE'd mid-restore over a construction-legit `HashMap` with a null key or a null `DataVersion` value. The intakes now refuse at the method head in the 6(r)–6(t) IAE family — constructor arguments refused as named NPEs (`eventBus`/`partitionMap`, the `adopt` `"snapshot"` family; the bus axis pins the message, since the JDK message differed pre-fix), the event refused naming the event while the ignore line narrows to *unknown, non-null* events, the WHOLE batch validated axis by axis (`term index`/`entry`) before anything is applied so a mixed batch is refused as a batch with zero state change and the applied index does not move, the `LogsCommitted` constructor taking `List.copyOf` of a required list (immutable and null-free at the handoff; safe — its only consumer iterates read-only), and the store axes `key` / `input`+`key`+`data` / `input`+`key`+`ttl` / `state` + per-entry `key`+value all refused BEFORE `incrementAndGet()` or any partition mutation — carrying the legitimate-commit-still-applies, refused-restore-leaves-existing-state-untouched-and-restore-then-works, and no-version-leak discriminators | `stage 6(v)` |
 | 6(w) | non-happy-path hardening (twenty-first pass, the value-axis layer 6(v) sealed at the boundary but left raw underneath: `DataVersion` — the entry payload of every stored value and of every `Snapshot` entry — held the producer's map in a LIVE `unmodifiableMap` view despite its own javadoc's "a detached copy" (a producer that put/cleared its map after construction still rewrote the installed value, the snapshot entry, and the ALREADY-PUBLISHED `SetDataEvent` payload — the exact mutable-by-reference shape 6(v) closed with `List.copyOf` for `LogsCommitted`); NPE'd a null map with the JDK-enriched "Cannot invoke `Map.getClass()` because `m` is null" (the JDK's own parameter name, indistinguishable from a failure deeper in the wiring); and silently ADMITTED null keys and null values its `Map.copyOf` siblings (`KeyDataInput`/`KeyDataOutput`) refuse at their own heads. And the three `KeyValue` value-writes had no head gate: `setData` STORED the null version first and only then NPE'd at `data.getData()` — leaving the key present but masquerading as never-written (`getData()` serving `Optional.empty`) with the event unpublished — while `updateExpiration`/`restore` stored null with NO exception at all (a snapshot-adopt path under the very guards 6(v) placed upstream). The carrier now holds a true detached copy (`Map.copyOf`) behind the named `"data must not be null"` NPE and the copy's own element NPEs (the `Snapshot`/`LogsCommitted` constructor family), and the three writes refuse a null version at the method head in the 6(v) IAE family before anything is stored, built, or published — carrying the stored-value-survives-a-refused-write, no-view-rewrite-after-construction, and null-map-names-the-axis discriminators | `stage 6(w)` |
+| 6(x) | non-happy-path hardening (twenty-second pass, the partition-intake layer directly beneath the 6(v)/6(w) boundary: `KeyMap` — the per-partition key store every `PartitionMap` data intake delegates to, and the silent state-machine path `StateMachineBridge` applies through — had NO gate of its own: `setEntry(null, dv)` rode HashMap's legal-null-key slot straight in, installing a `KeyValue` under a null key AND publishing the `SetDataEvent` naming an unnameable key (a silent install *with* a bus trace — the campaign's worst admission shape); `setEntry(key, null)` installed the shell FIRST and threw only deep (the 6(w) shape one layer up — the shell survived, and a later `deleteEntry` removed it, publishing a `DeleteDataEvent` for a key never written); `getEntry`/`deleteEntry`/`expireEntry` served empty/false on null silently (asymmetric with the IAE family one layer above on the exact same axis); `restore` CLEARED the partition before validating its state map, so a forged null-key/null-value map (construction-legit: `HashMap` admits both, `capture()` would never emit them) silently installed the null-key phantom with the legitimate entries dropped, or threw the version's `DataVersion` IAE after the clear (mutate-then-throw, partial install reached the `capture()` pin); and `PartitionMap`'s two constructor-carrier NPEs carried NO message — the one constructor in the data plane missing the house named-NPE rule (`Snapshot` "entries", `DataVersion` "data", `LogsCommitted` "logs") — and `getPartitionForKey(null)` NPE'd at `key.hashCode()` where every data-plane intake IAEs. The intakes now refuse at the method head in the 6(v) IAE family (`"key must not be null"` in all four `KeyMap` intakes; `"data must not be null"` in `setEntry` before the shell is computed or any event published; `restore` pre-validates the whole state — state/key/state value — before the synchronized clear-install, mirroring the `PartitionMap.restore` template with zero state change on refusal); the constructor carriers now name their dependency (`"eventBus must not be null"`, `"clock must not be null"`); `getPartitionForKey` refuses a null key naming the axis — carrying the legitimate-install-still-works, no-event-published-on-refused-write, shell-not-left-behind (a later `deleteEntry` neither returns true nor publishes), and refused-restore-leaves-the-installed-state-untouched (no clear, no partial install, no phantom) discriminators | `stage 6(x)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -178,7 +179,19 @@ masquerading as never-written, the event unpublished), `updateExpiration`/`resto
 stored null with no exception at all; the carrier now holds a true copy behind the
 named `"data must not be null"` guard and the three writes refuse a null version at the
 method head in the 6(v) IAE family before anything is stored, built, or published; see
-§7).
+§7); and after stage 6(x): **407 tests green, 0 failures, 1
+pre-existing skip** (+10: the partition-intake layer 6(v) sealed at the `PartitionMap`
+boundary but left raw underneath: `KeyMap` — the per-partition key store every data
+intake delegates to, and the apply path — silently admitted `setEntry(null, …)`
+(installing AND publishing the event under a null key), left the `setEntry(key, null)`
+shell for a later `deleteEntry` to remove with a `DeleteDataEvent`, served empty/false
+on the other three intakes for null with no exception at all, and `restore` cleared the
+partition BEFORE validating (a forged null-key/null-value map dropped the legitimate
+entries and installed the phantom, or threw the deep `DataVersion` IAE after the clear);
+`PartitionMap`'s two constructor-carrier NPEs were unnamed and `getPartitionForKey(null)`
+NPE'd where its intakes IAE; the intakes now refuse at the method head in the 6(v) IAE
+family — key/data before any shell install or event publish, whole-state pre-validation
+before any clear — and the constructor carriers name their dependencies; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1775,3 +1788,76 @@ closing since 6(g) now closes the last raw layer underneath it: the carrier ever
 stored value and every snapshot entry holds, and the write that stores it — refusing
 the shapes its own sealed constructors can never produce, before a value is stored,
 before a version is consumed, and before an event is published.
+
+**Non-happy-path hardening pass, twenty-second round (2026-11-24, stage 6(x))** — the
+partition-intake layer: 6(v) sealed the apply/data plane *at the boundary* — every
+`PartitionMap` intake now refuses its null axes before a version is consumed or a
+partition is touched — and 6(w) sealed the *carriers* those intakes store — but the
+layer between them, `KeyMap`, had no gate of its own: it is the per-partition key
+store **every** sealed `PartitionMap` intake delegates to, and the store
+`StateMachineBridge` applies committed state into through. A construction-bypassed
+caller — the 6(n)/6(p) shape at every intake above — or the apply path reaches it
+directly:
+
+- **null key into the four `KeyMap` intakes** (`setEntry` / `getEntry` / `deleteEntry`
+  / `expireEntry`): `HashMap` admits null keys (construction-legit — `capture()` would
+  never emit one, but a raw caller can), so `setEntry(null, dv)` installed a `KeyValue`
+  under a null key **and published** the `SetDataEvent` naming an unnameable key — a
+  silent install *with* a bus trace, the campaign's worst admission shape, precisely
+  because the trace exists and could be read as legitimate; the read/delete/expire
+  intakes served `Optional.empty` / `false` with **no exception at all** — asymmetric
+  with the exact same axis one layer above (`PartitionMap.getData(null)` IAEs `"key
+  must not be null"` since 6(v)).
+- **null version into `setEntry` (the 6(w) shape, one layer up)**: the `KeyValue` shell
+  was computed into the map FIRST, and only then did the deep IAE (`"data must not be
+  null"`, sealed 6(w)) fire — the pin observed on the *map*, not the exception: a later
+  `deleteEntry` **returned true** and published a `DeleteDataEvent` for a key that was
+  never written.
+- **null map / forged state elements into `restore`**: `restore(null)` NPE'd mid-
+  iteration (the raw JDK shape where the `restore` one layer above — sealed 6(v) — IAEs
+  naming the state); a construction-legit `HashMap` carrying a null key **cleared the
+  partition first** (dropping the legitimate entries) and then installed the null-key
+  phantom *successfully, with no exception at all*; a forged null value threw the
+  version's `DataVersion` IAE **after** the clear (naming the version rather than the
+  state slot) — mutate-then-throw with a partial install the `capture()` pin could
+  reach. `PartitionMap.restore`'s whole-state pre-validation (zero state change) is
+  the template `KeyMap.restore` lacked underneath it.
+- **`PartitionMap` constructor carriers + `getPartitionForKey(null)`**:
+  `Objects.requireNonNull(eventBus)` / `(clock)` carried **no message** — the one
+  constructor in the data plane missing the house named-NPE rule (`Snapshot` "entries",
+  `DataVersion` "data", `LogsCommitted` "logs") — and `getPartitionForKey(null)` NPE'd
+  at `key.hashCode()` where every data-plane intake IAEs naming the axis.
+
+The fix is the same two families 6(v) anchored, applied one layer down: **method
+intake** — `"key must not be null"` at the head of all four `KeyMap` intakes, `"data
+must not be null"` in `setEntry` **before** the shell is computed or any event built or
+published, and `restore` pre-validating the WHOLE state map (a null state IAEs `"state
+must not be null"`; every entry's key and value is refused naming the axis) **before**
+the synchronized clear-install, so a refusal leaves the partition byte-identical — no
+clear, no partial install, no phantom — mirroring the `PartitionMap.restore` template;
+**constructor carriers** — the two `PartitionMap` NPEs now name the dependency
+(`"eventBus must not be null"`, `"clock must not be null"`), and `getPartitionForKey`
+refuses a null key in the IAE family.
+
+**Pin (RED-confirmed before the fix, then GREEN), new `KeyMapTest` (8) in-package
+(`lib.data`) and `PartitionMapTest` +2:** `KeyMapTest` — each of the four intakes
+refuses a null key IAE naming the axis, with the zero-state-change discriminators
+(`setEntry`: no phantom in `capture()` AND no event on the bus; `deleteEntry`: no
+event; and `setEntry(key, null)`: a later `deleteEntry` still returns **false** — the
+shell is not left behind, the observable pin the exception alone could not give);
+`restore`'s null map / null-key / null-value refusals all IAE naming the axis, with the
+installed state intact — one entry, its original value, nothing installed; `new KeyMap`
+plus a live `PartitionMap` parent, so the bus pins observe the real publish path.
+`PartitionMapTest` — the constructor refuses a null bus / null clock **naming the bus
+and the clock** (pre-fix: the JDK's parameter-less NPE, message `null`), and
+`getPartitionForKey(null)` IAEs `"key must not be null"` (pre-fix: raw NPE in
+`hashCode`).
+
+Isolated: `KeyMapTest` **8 green** + `PartitionMapTest` **16 green** —
+**24 green / 0 fail / 0 skip**.
+Full suite at this point: **407 tests green, 0 failures, 1 pre-existing skip**
+(+10 over the 6(w) baseline of 397). The pointer+carrier family the house has been
+closing since 6(g) now closes the layer its boundary sealed in 6(v) delegated to: the
+key store every data intake writes through and every committed state applies through —
+refusing the shapes the sealed intakes above it can never produce, before a shell is
+installed, before a version is consumed, and before an event is published.

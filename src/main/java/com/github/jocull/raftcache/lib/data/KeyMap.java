@@ -26,6 +26,9 @@ class KeyMap {
     }
 
     public Optional<DataVersion> getEntry(String key) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         final KeyValue keyValue;
         synchronized (keyMap) {
             keyValue = keyMap.get(key);
@@ -44,6 +47,17 @@ class KeyMap {
     }
 
     public void setEntry(String key, DataVersion dataVersion) {
+        // Both intakes are refused at the head, before any map mutation: a null key
+        // (a legal but unnameable HashMap slot) installs nothing and publishes nothing;
+        // a null version previously left a KeyValue shell -- installed before the deep
+        // throw fired -- that a later deleteEntry could then remove (publishing a
+        // DeleteDataEvent for a key never written)
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        if (dataVersion == null) {
+            throw new IllegalArgumentException("data must not be null");
+        }
         final KeyValue keyValue;
         synchronized (keyMap) {
             keyValue = keyMap.compute(key, (k, v) -> {
@@ -57,6 +71,9 @@ class KeyMap {
     }
 
     public boolean deleteEntry(String key, long version) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         final KeyValue removed;
         synchronized (keyMap) {
             removed = keyMap.remove(key);
@@ -78,6 +95,9 @@ class KeyMap {
      * {@link KeyValue#updateExpiration(DataVersion)}).
      */
     public boolean expireEntry(String key, long version, long nowEpochMillis, long ttlMillis) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         final KeyValue keyValue;
         synchronized (keyMap) {
             keyValue = keyMap.get(key);
@@ -155,6 +175,22 @@ class KeyMap {
      * {@code SetDataEvent}/{@code DeleteDataEvent} is published.
      */
     public synchronized void restore(Map<String, DataVersion> state) {
+        // Validate every entry before the state is touched at all (the same
+        // pre-validation PartitionMap.restore performs for the whole data plane):
+        // a null key or value -- a shape a captured state would never carry, but a
+        // HashMap would -- refuses the whole restore with zero state change (no clear,
+        // no partial install) instead of the pre-fix clear-then-throw shape
+        if (state == null) {
+            throw new IllegalArgumentException("state must not be null");
+        }
+        for (final Map.Entry<String, DataVersion> entry : state.entrySet()) {
+            if (entry.getKey() == null) {
+                throw new IllegalArgumentException("key must not be null");
+            }
+            if (entry.getValue() == null) {
+                throw new IllegalArgumentException("state value must not be null");
+            }
+        }
         synchronized (keyMap) {
             keyMap.clear();
             for (final Map.Entry<String, DataVersion> entry : state.entrySet()) {

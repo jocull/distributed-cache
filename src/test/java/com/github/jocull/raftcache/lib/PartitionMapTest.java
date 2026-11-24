@@ -32,6 +32,27 @@ public class PartitionMapTest {
     }
 
     @Test
+    void testConstructorNamesItsDependencies() {
+        final NullPointerException busRefusal = assertThrows(NullPointerException.class,
+                () -> new PartitionMap(null, 16));
+        assertEquals("eventBus must not be null", busRefusal.getMessage(),
+                "A null bus must name the bus, not the JDK's parameter name");
+
+        final NullPointerException clockRefusal = assertThrows(NullPointerException.class,
+                () -> new PartitionMap(eventBus, 16, null));
+        assertEquals("clock must not be null", clockRefusal.getMessage(),
+                "A null clock must name the clock");
+    }
+
+    @Test
+    void testGetPartitionForKeyRefusesNullKey() {
+        final PartitionMap pm = new PartitionMap(eventBus, 16);
+        final IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> pm.getPartitionForKey(null));
+        assertEquals("key must not be null", refusal.getMessage(), "A null key must name the key");
+    }
+
+    @Test
     void testPartitionSize() {
         final PartitionMap pm1 = new PartitionMap(eventBus, 16);
         final PartitionMap pm2 = new PartitionMap(eventBus, 256);
