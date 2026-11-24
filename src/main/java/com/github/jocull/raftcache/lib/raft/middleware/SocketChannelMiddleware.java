@@ -518,6 +518,17 @@ public class SocketChannelMiddleware implements ChannelMiddleware, AutoCloseable
         public void setReceiver(Consumer<Object> receiver) {
             connection.setReceiver(receiver);
         }
+
+        /**
+         * Closes the underlying socket (dropping it from this middleware's registry). Closing
+         * the socket also ends the peer side's reader (EOF / SocketException), so the link dies
+         * both ways; see {@link Connection#closeQuietly()}. Idempotent.
+         */
+        @Override
+        public void close() {
+            connections.remove(connection);
+            connection.closeQuietly();
+        }
     }
 
     // ---------------------------------------------------------------------------

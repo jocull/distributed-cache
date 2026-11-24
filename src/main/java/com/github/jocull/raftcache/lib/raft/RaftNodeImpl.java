@@ -244,8 +244,18 @@ class RaftNodeImpl implements RaftNode {
     }
 
     private void disconnectFromInternal(NodeConnectionOutbound connection) {
-        LOGGER.debug("{} Disconnecting from {}", id, connection.getRemoteNodeAddress().getAddress());
-        throw new UnsupportedOperationException("Disconnect not yet implemented!");
+        final NodeAddress remote;
+        synchronized (activeConnections) {
+            remote = connection.getRemoteNodeAddress();
+            // Idempotent: re-disconnecting from an already-removed connection is a no-op remove.
+            activeConnections.removeIf(c -> c == connection);
+        }
+        LOGGER.debug("{} Disconnecting from {}", id, remote.getAddress());
+        try {
+            ((NodeConnectionOutboundImpl) connection).close();
+        } catch (Throwable t) {
+            LOGGER.warn("{} Tearing down the channel to {} failed", id, remote.getAddress(), t);
+        }
     }
 
     // endregion

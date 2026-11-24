@@ -139,6 +139,15 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
         channel.send(message);
     }
 
+    /**
+     * Closes the underlying channel side — see {@link ChannelMiddleware.ChannelSide#close()}.
+     * Deliberately NOT on the four-line {@link NodeConnectionOutbound} interface: it is an
+     * implementation-level teardown used by the owning node, reached via a same-package cast.
+     */
+    void close() {
+        channel.close();
+    }
+
     @Override
     public void sendIntroduction(Introduction introduction) {
         send(introduction);

@@ -926,6 +926,78 @@ public class RaftNodeTest {
         }
     }
 
+    // Regression pin for item 4 (`disconnectFrom`): it made the leader's "no active
+    // connections" world reachable in MULTI-node clusters for the first time — a 2-node
+    // leader can now drop its only peer (by call, not by fault) and submit again. The
+    // commit path must NOT read an empty connection list as "1-node cluster, self is the
+    // whole quorum": a 1-of-2 commit would violate Raft safety (the entry is lost, or
+    // already diverged, if the leader crashes afterwards). Commit is gated on the
+    // TOPOLOGY's majority instead (leader's own vote + follower acks reach
+    // majority(cluster)), so a leader with one vote against majority(2) is one short —
+    // and the write below must stay pending. A commit gate that regressed onto the
+    // connection state would land it in these assertions on the spot.
+    @ParameterizedTest
+    @MethodSource("provideIterationsShort")
+    void testDisconnectOnlyPeerQuorumUnavailable(int iteration) throws InterruptedException {
+        final InMemoryTopologyDiscovery inMemoryTopologyDiscovery = new InMemoryTopologyDiscovery();
+        final PartitionMap partitionMap = new PartitionMap(new EventBus(), 4);
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(inMemoryTopologyDiscovery, middleware);
+             final StateMachineBridge bridge = new StateMachineBridge(raftManager.getEventBus(), partitionMap)) {
+            final RaftNode nodeA = raftManager.newNode("nodeA", new NodeAddress("addressA"));
+            final RaftNode nodeB = raftManager.newNode("nodeB", new NodeAddress("addressB"));
+            inMemoryTopologyDiscovery
+                    .addKnownNode(nodeA.getNodeAddress())
+                    .addKnownNode(nodeB.getNodeAddress());
+            middleware.addNode(nodeA).addNode(nodeB);
+
+            // Starting the nodes will begin election timeouts
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.connectWithTopology().join());
+            middleware.getAddressRaftNodeMap().values().forEach(raftNode -> raftNode.start().join());
+
+            final ClusterNodes nodes = assertResultWithinTimeout("Did not get expected leader and follower", 5, TimeUnit.SECONDS, () -> {
+                final ClusterNodes result = getRaftLeaderAndFollowers(middleware);
+                if (result.leader() != null && result.followers().size() == 1) {
+                    return result;
+                }
+                return null;
+            });
+            final RaftNode leader = nodes.leader();
+
+            // Baseline: with the peer up, a 2-of-2 entry commits (quorum(2) = 2).
+            final KeyDataInput baselineWrite = new KeyDataInput("quorum-pin", Map.of("value", "paired".getBytes(StandardCharsets.UTF_8)));
+            assertDoesNotThrow(() -> leader.submit(baselineWrite).get(5, TimeUnit.SECONDS),
+                    "Expected the two-node cluster to commit while the peer is up");
+
+            // Drop the leader's only peer over the new API — every link it holds to a node
+            // other than itself (exactly one here).
+            final List<NodeConnectionOutbound> leaderLinks = ((RaftNodeImpl) leader)
+                    .getActiveConnections().stream()
+                    .filter(link -> !link.getRemoteNodeAddress().equals(leader.getNodeAddress()))
+                    .toList();
+            assertEquals(1, leaderLinks.size(), "Expected exactly one link, to the peer");
+            leaderLinks.forEach(link -> leader.disconnectFrom(link).join());
+
+            // Peer gone, the leader holds 1-of-2: no quorum, no commit. The submit future
+            // completes only on commit (RaftLogs#notifyCommitted), so "still pending" is a
+            // commit assertion — deterministic in the post-gate world (unreachable without a
+            // second vote) that a pre-gate shortcut would have completed in milliseconds.
+            final KeyDataInput orphanWrite = new KeyDataInput("quorum-pin", Map.of("value", "orphan".getBytes(StandardCharsets.UTF_8)));
+            final CompletableFuture<RaftLog<KeyDataInput>> pending = leader.submit(orphanWrite);
+            Thread.sleep(1_000); // room for a (buggy) commit to surface; the right world never commits
+            assertFalse(pending.isDone(),
+                    "A two-node cluster committed 1-of-2 with its only peer disconnected — the commit gate must use the topology's majority, not the connection state");
+
+            // And the state machine must not have moved either: apply is gated on commit, so
+            // exactly the baseline write is present.
+            final KeyDataOutput applied = partitionMap.getData("quorum-pin")
+                    .orElseThrow(() -> new AssertionError("Expected the baseline write to be applied"));
+            assertEquals("paired", new String(applied.getData().get("value"), StandardCharsets.UTF_8),
+                    "The orphan write leaked into the state machine");
+            assertEquals(1L, applied.getVersion(), "Exactly the one committed write, applied exactly once");
+        }
+    }
+
     @SuppressWarnings("BusyWait")
     @ParameterizedTest
     @MethodSource("provideIterationsShort")

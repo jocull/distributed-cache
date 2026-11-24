@@ -205,6 +205,12 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
         private PassThruChannelSide paired;
         private Consumer<Object> receiver;
         private volatile boolean interrupted = false;
+        /**
+         * Closed by {@link #close()} and its peer, independently of the {@code interrupted} fault
+         * seal — {@link #restoreFor} clears only {@code interrupted}, so a closed channel can
+         * never be reopened by a fault restore.
+         */
+        private volatile boolean closed = false;
 
         private PassThruChannelSide(RaftNode raftNode) {
             this.raftNode = raftNode;
@@ -246,7 +252,7 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
 
         @Override
         public void send(Object message) {
-            if (interrupted) {
+            if (interrupted || closed) {
                 return;
             }
             final NodeFault fault = profile(ownAddress());
@@ -256,14 +262,14 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
                 return;
             }
             schedule(baselineDelayMillis() + fault.latencyFloorMillis, () -> {
-                if (!interrupted) {
+                if (!interrupted && !closed) {
                     paired.receive(message);
                 }
             }, "Send");
         }
 
         private void receive(Object message) {
-            if (interrupted) {
+            if (interrupted || closed) {
                 return;
             }
             final NodeFault fault = profile(ownAddress());
@@ -273,6 +279,20 @@ public class PassThruMiddleware implements ChannelMiddleware, AutoCloseable {
                 return;
             }
             schedule(baselineDelayMillis() + fault.latencyFloorMillis, () -> receiver.accept(message), "Receive");
+        }
+
+        /**
+         * Seals BOTH sides of this pair: once closed, sends from either side are dropped at the
+         * door (and any hop already in flight dies on the receiver's closed check), so the link
+         * is bidirectionally dead. Independent of the fault-injection seal (see {@code closed}).
+         * Idempotent.
+         */
+        @Override
+        public void close() {
+            this.closed = true;
+            if (paired != null) {
+                paired.closed = true;
+            }
         }
 
         private void schedule(long delayMillis, Runnable hop, String label) {

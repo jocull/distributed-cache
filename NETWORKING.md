@@ -233,7 +233,9 @@ Existing bar: **242 green / 0 fail / 1 skip** (the only skip is the pre-existing
 ## 6. Recorded, not blocking
 
 1. **Auto-reconnect.** A dead channel stays dead; re-establishment is via `connectWithTopology`.
-   Policy (backoff, who-dials-whom) is a follow-up once `disconnectFrom` (Decision #3) lands.
+   Policy (backoff, who-dials-whom) remains a follow-up — `disconnectFrom` (Decision #3) has
+   landed (2026-11-24, infra-debt item 4), and its javadoc explicitly notes that reconnection is
+   *not* automatic.
 2. **Cross-JVM / multi-host.** The per-node-server design already dials real host:port strings, so a
    node in another JVM is addressable; not exercised here (single-JVM IT) and would need the
    serialization decision revisited for cross-version compatibility.

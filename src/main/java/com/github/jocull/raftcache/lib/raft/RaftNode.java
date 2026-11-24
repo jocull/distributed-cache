@@ -49,6 +49,20 @@ public interface RaftNode {
 
     CompletableFuture<NodeConnectionOutbound> acceptConnection(ChannelMiddleware.ChannelSide incoming);
 
+    /**
+     * Tears down a live outbound connection: it is removed from this node's active
+     * connections, and the underlying channel is closed — on sockets this ends the peer side
+     * of the wire link too, so the peer stops receiving from us as well. Local cleanup
+     * semantics only: the node keeps operating with the remaining quorum and does NOT
+     * auto-reconnect; re-establishment is an explicit {@link #connectWithTopology()} or
+     * {@link #connectTo(NodeAddress)} (reconnect policy is a recorded follow-up,
+     * {@code NETWORKING.md} 6.1). Idempotent: disconnecting a connection that is already gone
+     * succeeds as a no-op.
+     *
+     * @param connection the outbound connection to close (as returned by
+     *                   {@link #connectWithTopology()}/{@link #connectTo(NodeAddress)}, or a live
+     *                   one such as an accepted inbound link)
+     */
     CompletableFuture<Void> disconnectFrom(NodeConnectionOutbound connection);
 
     CompletableFuture<Optional<StateResponse>> getLeader();

@@ -68,7 +68,7 @@ Flagged deviations / gaps (see Decisions below):
 | ~~A 2-node cluster can never commit: majority is computed as `size/2+1` but the leader only counted follower acks~~ — **fixed in this branch**: the leader's own log now counts toward the commit majority | `ClusterTopology.java:34-36`, `RaftNodeBehaviorLeader.updateCommittedIndex` |
 | ~~A 1-node cluster could never elect a leader (and therefore never commit or serve)~~ — **fixed in this branch**: the candidate recognizes its own vote as a majority when it is the only voter | `RaftNodeBehaviorCandidate.java` ctor |
 | ~~No snapshot install / log compaction (Raft §7)~~ — **investigated 2026-11-21 (item 4), implemented 2026-11-23:** full Raft §7 delivered per `SNAPSHOTS.md` stages 1→6(b), commits `47d9f9f`…`stage 6(b)`; Follow-up #5 closed | `InstallSnapshotExample.java` sketch (do-not-modify, untouched); plan + evidence in `SNAPSHOTS.md`; implementation in `lib/raft` |
-| `disconnectFrom` throws `UnsupportedOperationException` | `RaftNodeImpl.java:166-169` |
+| ~~`disconnectFrom` throws `UnsupportedOperationException`~~ — **resolved 2026-11-24 (infra-debt item 4)**: `RaftNode#disconnectFrom` tears down a live link (local cleanup only, idempotent, no auto-reconnect); the downed-follower quorum path it blocked is now pinned (`RaftNodeTest#testDisconnectOnlyPeerQuorumUnavailable`) and exercised over the real wire (`RaftNodeDisconnectTest`) | `RaftNode#disconnectFrom`, `RaftNodeImpl#disconnectFromInternal`, `ChannelSide#close` + both middleware impls |
 
 ### Phase 2 — Basic state machine fed by Raft — 🔨 completed in this branch
 
@@ -174,7 +174,13 @@ Deliberately not in scope for phase 4 (see Decisions / Phase 3):
 - ~~EXPIRE / TTL (Follow-up #3)~~ — **done** under the Signed-off work plan, item 2
   (commit `f8e901d`): `KeyDataExpireInput` entry, checked-read + sweep expiration,
   `DistributedCache.expire(key, ttl)`.
-- Downed-follower quorum validation (Decision #3, blocked on `disconnectFrom`).
+- ~~Downed-follower quorum validation (Decision #3, blocked on `disconnectFrom`)~~ — **done 2026-11-24
+  (infra-debt item 4)**: with `disconnectFrom` landed, the leader's commit path became reachable
+  from an isolated multi-node cluster — and the commit gate already counts the leader's own vote
+  against the TOPOLOGY's majority (`RaftNodeBehaviorLeader.updateCommittedIndex`), so a 2-node
+  leader with its only peer disconnected holds 1-of-2 and cannot commit; pinned by
+  `RaftNodeTest#testDisconnectOnlyPeerQuorumUnavailable`, exercised over real sockets by
+  `RaftNodeDisconnectTest`.
 
 Note: the map is internally partitioned (from day one: `PartitionMap(partitionCount)`), so
 phases 4 and 5 blur — "single shard" effectively means "one cluster".
@@ -257,9 +263,15 @@ These are behavioral (not merely additive) changes, made because they were requi
   waiting up to one 50 ms heartbeat. `EventBus.publish` is synchronous on the publisher's thread,
   so no new executors are introduced. The ack-window gate in `shouldSendNextEntries` is untouched.
 - **Empty-cluster commit shortcut** — in `appendEntries`, if `self.activeConnections.isEmpty()`
-  (a true 1-node cluster; `activeConnections` is append-only until `disconnectFrom` exists), the
-  leader calls `updateCommittedIndex()` directly and skips the heartbeat timer, instead of
+  (today: a true 1-node cluster, or a multi-node leader that has `disconnectFrom`'d every peer),
+  the leader calls `updateCommittedIndex()` directly and skips the heartbeat timer, instead of
   busy-rescheduling at a 0 ms delay that keeps re-firing against an empty connection list.
+  Safety after `disconnectFrom` (2026-11-24): the gateway was already topology-safe —
+  `updateCommittedIndex` commits only once the leader's own vote plus follower acks reach the
+  TOPOLOGY's majority (`ClusterTopology.getMajorityCount()`), so a 2-node leader with its only
+  peer disconnected holds 1-of-2 and cannot commit. Now pinned by
+  `RaftNodeTest#testDisconnectOnlyPeerQuorumUnavailable`, with `RaftNodeDisconnectTest` covering
+  the same path over the real wire plus re-joining.
 - **A vote denial does not burn the node's one vote** (commit `77638bd`, sign-off'd protocol fix)
   — a follower that denied a stale candidate was writing `votedForNodeId` to its own id, which
   latched the once-per-term guard for the whole term; a *fresher* candidate arriving later in the
@@ -327,10 +339,24 @@ subsequently decided, fixed, and regression-tested):
    before log replay — null/empty/throwing/corrupt stores warn and skip, startup is never
    blocked (`stage 6(b)`). Final suite: **320 tests green, 0 failed, 1 pre-existing skip**
    (`/tmp/opencode/mvn-phase4-final.log`). Closes Decision #2 in full and Follow-up #5.
-3. **`disconnectFrom`** — `RaftNodeImpl.java:166-169` throws `UnsupportedOperationException`;
-   node removal is not part of phase 2. (Consequence: the downed-follower quorum path — a leader
-   with a live follower disconnected — is untestable until this exists; the quorum fix above was
-   verified with 1- and 2-node *up* clusters instead.)
+3. **`disconnectFrom`** — *(resolved: infra-debt item 4, 2026-11-24)*. The original cut:
+   `RaftNodeImpl.java:166-169` threw `UnsupportedOperationException`; node removal was not part
+   of phase 2. (Consequence: the downed-follower quorum path — a leader with a live follower
+   disconnected — is untestable until this exists; the quorum fix above was verified with
+   1- and 2-node *up* clusters instead.) **Resolution.** `RaftNode#disconnectFrom(NodeConnectionOutbound)`
+   (javadoc: local cleanup only, idempotent, no auto-reconnect) removes the target link from the
+   connection list and closes the `ChannelSide` — a new abstract `ChannelSide#close`, implemented
+   per middleware: `SocketChannelSide#close` drops the connection and closes the socket (the peer
+   sees EOF and self-heals); `PassThruChannelSide#close` seals both sides — a `closed` seal that is
+   independent of the `interrupted` flag, so a sealed link cannot be re-opened even after
+   `restoreFor`. `NodeConnectionOutboundImpl#close` delegates to the channel, and the public
+   entry `RaftNodeImpl#disconnectFrom` runs `disconnectFromInternal` on the node executor,
+   mirroring `connectWithTopology`. Two new tests: `RaftNodeDisconnectTest` (3-node loopback
+   socket cluster — a 2-of-3 write commits while one follower is disconnected and frozen at v1,
+   idempotent re-disconnect is a no-op, `connectWithTopology()` re-dials and the target catches up
+   to v2) and `RaftNodeTest#testDisconnectOnlyPeerQuorumUnavailable` (2-node quorum pin — v1
+   commits with the peer up, `disconnectFrom` isolates the leader, a new v2 write stays pending
+   and the state machine holds only v1).
 4. **`Replica` stub** — *(resolved: infra-debt item 2, removed as dead code, 2026-11-24)*.
    The original cut: `lib/replication/Replica.java:15-19` was an empty `SetDataEvent`
    subscriber ("Do something here!"). It represented the *map → replication* direction; the
@@ -437,8 +463,9 @@ which stay the detailed record.
    3-node and single-node clusters sharing one `MutableClock`.
 4. **Fixed cluster topology** *(user-deferred)* — membership is fixed at startup; changing it
    today means taking the cluster down and rolling it over. No join/leave protocol, no joint
-   consensus, no member transitions. This also keeps Decisions #3 (`disconnectFrom`) relevant
-   until real removal semantics exist.
+   consensus, no member transitions. (`disconnectFrom`, Decision #3, has since been implemented
+   as a link-level operation — it tears down individual live links, which composes with a fixed
+   topology — but consensus-driven join/leave remains deferred under this entry.)
 5. **Snapshots / log compaction** — **done 2026-11-23** *(investigated 2026-11-21; item 4 first delivered as the design document `SNAPSHOTS.md`, then all implementation stages landed 2026-11-23, commits `47d9f9f` → `stage 6(b)`)* — Decisions #2, design in `SNAPSHOTS.md`. Ground truth: committed entries are **never** compacted (only the uncommitted tail is trimmed, `RaftLogs.rollback()`), no snapshot message / follower install / leader trigger exists, and `PartitionMap.getSnapshot()` — the exact state a snapshot must capture — is already implemented but never called. Remaining work is the staged plan (`SNAPSHOTS.md` §4): Stage 1 state capture + `replaceState`/`adopt`; Stage 2 `RaftLogs` snapshot boundary + `compact()` (closing the `containsStartPoint` TODOs); Stage 3 `InstallSnapshot`/`Response` messages (sketch-shaped: term, leaderId, lastIncluded index/term, payload, offset/done); Stage 4 follower install behind the S2 progress-only guard; Stage 5 leader laggard detection + send + compaction trigger behind the S1 bound. Stages 1–2 are isolated and testable without protocol risk. `InstallSnapshotExample` / `proto/raft/*` remain the working notes (do not delete, see Decisions #2). The staged plan has since been implemented in full (stages 1→6(b), 2026-11-23, commits `47d9f9f` → `stage 6(b)`; per-stage evidence in `SNAPSHOTS.md`'s header table and §7; final suite 320 green, 0 failed, 1 pre-existing skip) — this follow-up is closed.
 6. **Election up-to-date rule** *(done in this branch)* — Decisions #1. The candidate's
    `VoteRequest` now reports the last log entry's term/index per Raft §5.4.1 (commit
@@ -465,8 +492,11 @@ which stay the detailed record.
    the pre-failure leader; after restore, assert it is no longer LEADER at an overtaken term —
    stepping down to follower is fine, and winning a fresh election at a *higher* term (becoming
    the current leader again) is fine; staying LEADER while another node holds leadership is not.
-9. **Carried from Decisions** — `disconnectFrom` (Decision #3) and the phase 3 network
-   transport. (`RaftLogs` performance, Decision #6, resolved 2026-11-24 with the O(1)
+9. **Carried from Decisions** — the phase 3 network
+   transport. (`disconnectFrom`, Decision #3, resolved 2026-11-24 as infra-debt item 4:
+   `RaftNode#disconnectFrom` + `ChannelSide#close` on both middlewares, pinned by the 2-node
+   quorum test and exercised over the real wire in `RaftNodeDisconnectTest`; `RaftLogs`
+   performance, Decision #6, resolved 2026-11-24 with the O(1)
    tail-append fast path; `Replica` stub, Decision #4, resolved the same day by removing it
    as dead code; `Main.java` cluster demo, Decision #7, resolved the same day by rewiring the
    demo as a 3-node loopback socket cluster driving the cache facade.)

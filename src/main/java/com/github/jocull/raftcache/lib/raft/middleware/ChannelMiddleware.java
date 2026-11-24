@@ -18,5 +18,11 @@ public interface ChannelMiddleware {
         NodeAddress getAddress();
         void send(Object message);
         void setReceiver(Consumer<Object> receiver);
+
+        /**
+         * Tears this side down: further sends/receives are dropped, and the peer side stops
+         * delivering. Idempotent.
+         */
+        void close();
     }
 }
