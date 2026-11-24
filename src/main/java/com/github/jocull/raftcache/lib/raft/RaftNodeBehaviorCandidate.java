@@ -184,6 +184,18 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
 
     @Override
     public void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries) {
+        // Stage 6(m) (SNAPSHOTS.md stage 6(m)): unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Without this, a same- or higher-term append converts us to
+        // follower with a null leader (the conversion itself — term advance and behavior
+        // replacement — before the re-dispatch even reaches the guarded follower handler) and
+        // the null-leader follower then appends and acks. Refuse before any comparison or
+        // conversion. Identity-family shape: warn, zero state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} AppendEntries from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         // "If AppendEntries RPC received from new leader: convert to follower"
         if (appendEntries.getTerm() >= term) {
             LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term);

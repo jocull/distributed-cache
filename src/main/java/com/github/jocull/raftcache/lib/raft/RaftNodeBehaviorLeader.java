@@ -478,6 +478,19 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
 
     @Override
     public void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries) {
+        // Stage 6(m) (SNAPSHOTS.md stage 6(m)): unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Without this, a higher-term append steps a LEADER down to
+        // follower with a null leader (the conversion — term advance, rollback, behavior
+        // replacement — happens before the re-dispatch reaches the guarded follower handler)
+        // and the null-leader follower then appends and acks to the unauthenticated carrier.
+        // Refuse before any comparison or conversion. Identity-family shape: warn, zero
+        // state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} AppendEntries from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         if (appendEntries.getTerm() > term) {
             LOGGER.info("{} Received append entries from {} for term {} will move from term {} as follower", self.getId(), sender.getRemoteNodeId(), appendEntries.getTerm(), term);
             self.convertToFollowerForNewLeader(sender.getRemoteNodeId(), appendEntries)

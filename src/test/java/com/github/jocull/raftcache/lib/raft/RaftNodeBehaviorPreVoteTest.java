@@ -487,6 +487,49 @@ class RaftNodeBehaviorPreVoteTest {
         }
     }
 
+    // ---- Identity vector (stage 6(m)): an unbound-sender grant must never count ----
+
+    @Test
+    void follower_collector_unboundSenderGrant_neverCounts() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = (RaftNodeImpl) raftManager.newNode("node", new NodeAddress("node-addr"));
+            middleware.addNode(node);
+            registerPeer(node, "peerA");
+            registerPeer(node, "peerB"); // 3 nodes -> majority 2: self + 1 grant
+            node.start().join();
+            appendLog(node, OWN_LAST_INDEX); // deterministic last log the round reports
+
+            ((RaftNodeBehaviorFollower) node.currentReceiver()).onElectionTimeout(); // round for term 1
+            assertEquals(NodeStates.FOLLOWER, stateOf(node), "an in-flight round below majority must not convert");
+
+            // Stage 6(m): the grant is unattributable. Without the guard, preVoteGrants.add(null)
+            // is legal for a HashSet, and in this 3-node cluster self (+1) + {null} = 2 = the
+            // majority — ONE phoney unattributed grant alone converts us to candidate.
+            final RecordingSender unbound = new RecordingSender(null);
+            node.currentReceiver().onPreVoteResponse(unbound, new PreVoteResponse(1, true));
+
+            assertTrue(unbound.preVoteResponses().isEmpty(), "an unbound sender must be refused without a reply");
+            assertEquals(NodeStates.FOLLOWER, stateOf(node), "an unattributed grant must not count toward the majority");
+            assertEquals(0, termOf(node), "an unattributed grant must not advance the term");
+
+            // THE DISCRIMINATOR: the legitimate path is alive — one REAL grant (self + peerA)
+            // reaches the majority and converts to candidate, which also proves the unbound
+            // refusal neither latched the handler nor tore down our in-flight round.
+            final RecordingSender peerA = new RecordingSender("peerA");
+            node.currentReceiver().onPreVoteResponse(peerA, new PreVoteResponse(1, true));
+            assertEquals(NodeStates.CANDIDATE, stateOf(node), "a majority of real grants must convert to candidate");
+            assertEquals(1, termOf(node), "the conversion must advance the term exactly once (0 -> 1)");
+
+            // ...and the candidate treats further pre-vote responses as foreign (pre-vote
+            // responses never advance the term), so a second grant must be inert.
+            final RecordingSender peerB = new RecordingSender("peerB");
+            node.currentReceiver().onPreVoteResponse(peerB, new PreVoteResponse(1, true));
+            assertEquals(NodeStates.CANDIDATE, stateOf(node), "a grant after conversion must be ignored by the candidate");
+            assertEquals(1, termOf(node), "a grant after conversion must not advance the term again");
+        }
+    }
+
     /**
      * A minimal {@link NodeConnectionOutbound} that identifies itself as a given peer and
      * records the {@link VoteResponse}s and {@link PreVoteResponse}s it is asked to send.

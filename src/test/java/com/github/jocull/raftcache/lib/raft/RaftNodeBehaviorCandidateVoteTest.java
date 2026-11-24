@@ -159,6 +159,44 @@ class RaftNodeBehaviorCandidateVoteTest {
         }
     }
 
+    // ---- Append-entries vector (stage 6(m)): a higher-term unbound append must not convert us ----
+
+    @Test
+    void unboundSender_appendEntries_higherTerm_doesNotConvert() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl node = newCandidate(middleware, raftManager);
+
+            // Without the guard this would convertToFollowerForNewLeader(TERM + 1) with a NULL
+            // leader (the conversion happens before the re-dispatch even reaches the guarded
+            // follower handler), and the null-leader follower would then append and send a true
+            // ack to the unattributable carrier — free term recognition, a null-leader state, and
+            // a positive reply, all in one unauthenticated message.
+            final RecordingSender unbound = new RecordingSender(null);
+            node.currentReceiver().onAppendEntries(unbound,
+                    new AppendEntries(TERM + 1, ti(0, 0L), ti(0, 0L), List.of()));
+
+            assertTrue(unbound.acknowledges().isEmpty(), "an unbound sender must be refused without acknowledging");
+            assertEquals(NodeStates.CANDIDATE, stateOf(node), "an unbound higher-term append must not convert the candidate");
+            assertEquals(TERM, termOf(node), "an unbound higher-term append must not advance the term (no conversion)");
+
+            // THE DISCRIMINATOR: the legitimate path is alive — the SAME message from a BOUND
+            // sender steps the candidate down to a follower of that term under that leader and
+            // is acknowledged. (The conversion rolls back our uncommitted term-1 tail, so the
+            // accepted prev/commit pair is the fresh epoch tail — exactly what a legitimate
+            // leader re-syncs to.)
+            final RecordingSender bound = new RecordingSender("boundLeader");
+            node.currentReceiver().onAppendEntries(bound,
+                    new AppendEntries(TERM + 1, ti(0, 0L), ti(0, 0L), List.of()));
+            assertEquals(NodeStates.FOLLOWER, stateOf(node), "a bound higher-term append still converts the candidate to follower");
+            assertEquals(TERM + 1, termOf(node), "a bound higher-term append still advances the term");
+            assertEquals("boundLeader", ((RaftNodeBehaviorFollower) node.currentReceiver()).getLeaderId(), "the bound sender is recorded as leader");
+            assertEquals(1, bound.acknowledges().size(), "the bound heartbeat at our tail must be acknowledged");
+            assertTrue(bound.acknowledges().get(0).isSuccess(), "the bound heartbeat must be accepted");
+            closeCurrent(node);
+        }
+    }
+
     // ---- Vote-request vector: a higher-term null-sender request must not convert us ----
 
     @Test
@@ -187,6 +225,7 @@ class RaftNodeBehaviorCandidateVoteTest {
     private static final class RecordingSender implements NodeConnectionOutbound {
         private final String remoteNodeId;
         private final List<VoteResponse> voteResponses = new ArrayList<>();
+        private final List<AcknowledgeEntries> acknowledges = new ArrayList<>();
 
         RecordingSender(String remoteNodeId) {
             this.remoteNodeId = remoteNodeId;
@@ -277,6 +316,7 @@ class RaftNodeBehaviorCandidateVoteTest {
 
         @Override
         public void sendAcknowledgeEntries(AcknowledgeEntries acknowledgeEntries) {
+            acknowledges.add(acknowledgeEntries);
         }
 
         @Override
@@ -289,6 +329,10 @@ class RaftNodeBehaviorCandidateVoteTest {
 
         List<VoteResponse> voteResponses() {
             return List.copyOf(voteResponses);
+        }
+
+        List<AcknowledgeEntries> acknowledges() {
+            return List.copyOf(acknowledges);
         }
     }
 }

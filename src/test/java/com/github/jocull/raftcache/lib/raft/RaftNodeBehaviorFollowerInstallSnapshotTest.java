@@ -1178,6 +1178,90 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
         }
     }
 
+    // ---- Stage 6(m): unbound-sender refusals on the replication and snapshot surfaces ----
+
+    @Test
+    void unboundSenderAppendEntries_higherTerm_doesNotConvert() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            // Stage 6(m): without the guard, this higher-term append converts us to a follower
+            // of term 7 with a NULL leader (the conversion happens before the re-dispatch
+            // reaches the guarded follower handler), then appends and sends a true ack to the
+            // unattributable carrier -- free term recognition plus an acknowledged append.
+            final RecordingSender unbound = new RecordingSender(null);
+            follower.currentReceiver().onAppendEntries(unbound,
+                    new AppendEntries(7, wire(0, 0L), wire(0, 0L), List.of()));
+
+            assertTrue(unbound.acknowledges().isEmpty(), "an unbound sender must be refused without acknowledging");
+            assertTrue(follower.currentReceiver() instanceof RaftNodeBehaviorFollower, "an unbound append must not convert the role");
+            assertEquals(0, ((RaftNodeBehavior) follower.currentReceiver()).term, "an unbound append must not advance the term");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(), "an unbound append must not name anyone as leader");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "fail-safe: the log is untouched");
+
+            // THE DISCRIMINATOR: the legitimate path is alive -- the SAME message from a BOUND
+            // sender converts the term, names the leader, and is acknowledged.
+            final RecordingSender leader = new RecordingSender("leader");
+            follower.currentReceiver().onAppendEntries(leader,
+                    new AppendEntries(7, wire(0, 0L), wire(0, 0L), List.of()));
+            assertEquals(7, ((RaftNodeBehavior) follower.currentReceiver()).term, "a bound higher-term append must advance the term");
+            assertTrue(follower.currentReceiver() instanceof RaftNodeBehaviorFollower, "a bound higher-term append must convert to follower");
+            assertEquals("leader", ((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(), "the bound sender is recorded as leader");
+            assertEquals(1, leader.acknowledges().size(), "the bound append must be acknowledged");
+            assertTrue(leader.acknowledges().get(0).isSuccess(), "the bound heartbeat at our tail must be accepted");
+        }
+    }
+
+    @Test
+    void unboundSenderInstallSnapshot_higherTerm_neitherConvertsNorInstalls() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            // Stage 6(m): without the guard, this higher-term snapshot first converts the node
+            // to a follower of term 7 with a NULL leader, then installs the payload, re-anchors
+            // the log and the state machine -- all on behalf of an unattributable leader. The
+            // message SELF-CLAIMS a leader (the wire always names one); the guard the pin
+            // exercises is the sender's identity, which the transport could not bind.
+            final Snapshot snapshot = new Snapshot(9L, 20L, Map.of("key1", value("term9-state")));
+            final RecordingSender unbound = new RecordingSender(null);
+            follower.currentReceiver().onInstallSnapshot(unbound,
+                    new InstallSnapshot(7, "claimedLeader", 20L, 9, 0L, chunk(snapshot), true));
+
+            assertTrue(unbound.snapshotResponses().isEmpty(), "an unbound install must not acknowledge success");
+            assertTrue(follower.currentReceiver() instanceof RaftNodeBehaviorFollower, "an unbound install must not convert the role");
+            assertEquals(0, ((RaftNodeBehavior) follower.currentReceiver()).term, "an unbound install must not advance the term");
+            assertNull(((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(), "an unbound install must not name anyone as leader");
+            assertFalse(follower.logs.hasStartPointSnapshot(), "fail-safe: the log is not re-anchored on an unbound install");
+            assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "fail-safe: the log is untouched");
+            assertEquals(0L, bridge.getLastAppliedIndex(), "fail-safe: the applied position is not advanced");
+            assertTrue(partitionMap.getData("key1").isEmpty(), "fail-safe: the state machine never adopted the payload");
+
+            // THE DISCRIMINATOR: the legitimate path is alive -- the SAME snapshot from a BOUND
+            // sender converts the term, names the leader, installs, and acknowledges.
+            final RecordingSender leader = new RecordingSender("leader");
+            follower.currentReceiver().onInstallSnapshot(leader,
+                    new InstallSnapshot(7, leader.getRemoteNodeId(), 20L, 9, 0L, chunk(snapshot), true));
+            assertEquals(7, ((RaftNodeBehavior) follower.currentReceiver()).term, "a bound higher-term install must advance the term");
+            assertEquals("leader", ((RaftNodeBehaviorFollower) follower.currentReceiver()).getLeaderId(), "the bound sender is recorded as leader");
+            assertEquals(1, leader.snapshotResponses().size(), "the bound install must be acknowledged");
+            assertEquals(7, leader.snapshotResponses().get(0).getTerm(), "the reply carries the new term");
+            assertEquals(20L, leader.snapshotResponses().get(0).getIndex(), "the reply carries the new tail");
+            assertEquals(20L, follower.logs.getCurrentTermIndex().getIndex(), "the boundary is the new tail");
+            assertEquals(new TermIndex(9, 20L), follower.logs.getStartTermIndex(), "the log is anchored on the boundary");
+            assertEquals(20L, bridge.getLastAppliedIndex(), "the applied position is re-anchored");
+            assertEquals(9L, bridge.getLastAppliedTerm(), "the applied term follows the boundary");
+            assertTrue(partitionMap.getData("key1").isPresent(), "the state machine adopted the payload");
+        }
+    }
+
     /**
      * A minimal {@link NodeConnectionOutbound} that identifies itself as the sender and
      * RECORDS what it is told to do: the {@link InstallSnapshotResponse}/{@link

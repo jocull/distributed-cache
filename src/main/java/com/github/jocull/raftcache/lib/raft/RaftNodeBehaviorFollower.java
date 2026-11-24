@@ -260,6 +260,19 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
     @Override
     public void onPreVoteResponse(NodeConnectionOutbound sender, PreVoteResponse preVoteResponse) {
+        // Stage 6(m) (SNAPSHOTS.md stage 6(m)): unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Without this, preVoteGrants.add(null) below is legal for a
+        // HashSet and the null grant counts in 1 + preVoteGrants.size(): in a 3-node cluster
+        // that is self (+1) + {null} = 2 = the majority, so ONE unattributed grant converts
+        // us to candidate (inflation is capped at one by set semantics, but it is exactly
+        // majority-reachable in 3 nodes). Refuse before any round bookkeeping.
+        // Identity-family shape: warn, zero state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} PreVoteResponse from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         if (!preVoteRoundActive) {
             // A late grant for a round that already concluded (we reached a majority, a
             // leader appeared, or we were converted away). Acting on it now could restart
@@ -329,6 +342,20 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
 
     @Override
     public void onAppendEntries(NodeConnectionOutbound sender, AppendEntries appendEntries) {
+        // Stage 6(m) (SNAPSHOTS.md stage 6(m)): an unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Without this, a higher-term message steps us down and installs
+        // a null leaderId, and an equal-term message walks the accept path to a null-leader
+        // append + commit move + true ack to an unauthenticated carrier. The guard also must
+        // precede the pre-vote invalidation below: zero state change includes not tearing down
+        // OUR OWN in-flight pre-vote round for a message whose sender we cannot even name.
+        // Identity-family shape: warn, zero state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} AppendEntries from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
+
         // A live leader just spoke: any in-flight pre-vote round is moot. Invalidate it
         // immediately so late grants cannot resurrect a round and hijack the next
         // election.
@@ -476,6 +503,19 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
      */
     @Override
     public void onInstallSnapshot(NodeConnectionOutbound sender, InstallSnapshot installSnapshot) {
+        // Stage 6(m) (SNAPSHOTS.md stage 6(m)): unbound sender is malformed by construction
+        // (the transport layer throws on the live path); guarding is defense-in-depth for the
+        // direct-handler surface. Without this, a higher-term snapshot steps us down with a
+        // null leader installed, and an equal-term one can reach the leaderId install and
+        // the full adopt/compact path (the bigger mutation this surface allows) — both for
+        // an unattributed carrier and with no refusal to speak for it. Refuse before any
+        // term comparison, conversion, or leaderId write. Identity-family shape: warn,
+        // zero state change, no reply.
+        if (sender.getRemoteNodeId() == null) {
+            LOGGER.warn("{} InstallSnapshot from {} is unbound (null remoteNodeId) - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
         final int incomingTerm = installSnapshot.getTerm();
         final long lastIncludedIndex = installSnapshot.getLastIncludedIndex();
 
