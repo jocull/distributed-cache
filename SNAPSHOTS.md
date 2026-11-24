@@ -29,6 +29,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(o) | non-happy-path hardening (thirteenth pass, audit sweep of the `SnapshotStore` file surface): the empty-<i>body</i> axis of the 6(d) family — a file whose NAME parses to a valid boundary but whose body is ZERO BYTES (`raft-snapshot-99-99.snap` in a shared directory, left by a crashed or foreign writer: both `save()`s reject an empty payload, so the shape cannot come from this store) — was being handed back as a `Stored` (the record null-checks the payload but not its length) and, named for a higher boundary than the real snapshot, MAX-BY-BOUNDARY masked the real one. `loadLatest` now warns and skips empty-payload files in the collect pass — parallel to the 6(d) unparseable-name skip (a hollow body is a no-snapshot, left in place, never allowed to blow up an otherwise clean load), and the `Stored` record completes the invariant symmetric with `save()` by rejecting an empty payload (defense-in-depth; the skip in `loadLatest` is the behavioral fix). Two pins: a hollow file named for a higher boundary is invisible to `loadLatest` (the real snapshot still wins, bytes intact, hollow file left in place) and a hollow-only directory loads as `Optional.empty()` instead of a `Stored` with an empty payload | `stage 6(o)` |
 | 6(p) | non-happy-path hardening (fourteenth pass, the store `save()` argument surface on a 6(g)-family axis): the negative-<i>term</i> axis — the `TermIndex` constructor rejects BOTH negative axes (the 6(g) root mechanism), which made the axis look unreachable to the store guards, but a deserialized/construction-bypassed boundary reaches `save()` with one; both `save()`s guarded `boundary.getIndex() < 0` and never `boundary.getTerm() < 0`, so a `(-3,10)` boundary wrote `raft-snapshot--3-10.snap` — a name `parseBoundary` can never read back (the first dash is at position 0) — AFTER `deleteSuperseded` had torn out the valid snapshot: a "successful" save leaving the store EMPTY, data loss with no exception (worse than the 6(o) masking, where the real snapshot still existed); `InMemorySnapshotStore` stored the forged boundary and handed it back. Both `save()`s now refuse a negative term before any temp file, write, or delete (the shape of the sibling index guard), and the shared `Stored` record completes the axis (defense-in-depth, symmetrical with the 6(o) empty-payload completion) | `stage 6(p)` |
 | 6(q) | non-happy-path hardening (fifteenth pass, the <i>type</i> axis of the 6(d)/6(o) "looks like a snapshot but is not one" family on the file surface): 6(d) sealed the NAME axis (unparseable → warn+skip), 6(o) the BODY axis (zero bytes) — but neither gate could express TYPE, because 6(o)'s `hasPayload` is a stat and a directory's stat legitimately reports a positive size (the only question a directory answers with "no" is "am I a regular file?", which the code never asked). A save() writes regular files and nothing else, yet a NON-REGULAR foreign entry named like a snapshot (a directory `raft-snapshot-99-99.snap` in a shared directory) passed every gate that existed: name shape, `parseBoundary`, "has payload". Load path: max-by-boundary "recovered" it (a foreign writer can always name it ABOVE the real snapshot — the 6(o) masking mechanism), `readAllBytes` threw (`Is a directory`), and the one VALID snapshot sitting next to it became unrecoverable — a seed-at-startup node starting unseeded over a log already compaction-truncated to the real boundary. Save path: `deleteSuperseded` visited it as superseded — throwing on a non-EMPTY foreign directory (the failure escapes `save()` as a `RuntimeException`, not the `IllegalStateException` family it wraps, and reaches the caller AFTER the new snapshot is already in place: a partial save reported as one), or silently tearing down an empty foreign object as collateral. Fix: ONE root-cause predicate on both paths — only a regular file is a snapshot — `loadLatest` warns and skips non-regular entries (the 6(o) skip shape; a vanished entry lands on the same guard, still skipped) and `deleteSuperseded` spares them (inert under our naming scheme: never read, never torn out); three pins in `FileSnapshotStoreTest` including the distinguishing valid-snapshot-must-still-load assertion | `stage 6(q)` |
+| 6(r) | non-happy-path hardening (sixteenth pass, the 6(g) term axis on the `RaftLogs` intake — the last consumer in the chain behind the sealed wire guards): `compact()` guarded `index < 0` but never `term < 0`, and `commit()` had no guard at all but the index bounds (a null NPEd out of `getIndex()`; a forged `(-1,k)` passes both), sticking into `snapshotBoundary`/`startSeed`/`currentTermIndex` (full install) or `committedTermIndex`, inverting the term-first `TermIndex.compareTo` the committed filter and `rollback()` depend on — committed entries re-served (double-apply) or the pending ones dropped with their acks, and `rollback()` tearing out the committed prefix alongside the uncommitted tail. The axis had looked sealed because the existing negative-<i>index</i> pin was actually pinning the `TermIndex` constructor (it throws inside the pin's own expression) — the same construction-guard illusion that blinded the 6(p) store audit. Both intakes now refuse a null or negative-axis pointer (IAE, the `isHostileWireTermIndex` shape) before ANY state change, with pins carrying the zero-state-change contract and the double-serve/drop discriminator | `stage 6(r)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -98,7 +99,18 @@ NON-REGULAR foreign entry named like a snapshot was "recovered" by
 `loadLatest` (the read then throws and the one VALID snapshot beside it is
 lost) and visited by `deleteSuperseded` (throwing mid-save after the new
 file is in place, or silently torn down as collateral); only a regular file
-is a snapshot, now, on both paths; see §7).
+is a snapshot, now, on both paths; see §7); and after stage 6(r): **383 tests green, 0
+failures, 1 pre-existing skip** (+1: the term axis of the 6(g) pointer-family
+reaching the `RaftLogs` intake itself — the last consumer behind every sealed
+wire guard: `compact()` guarded the null and <i>index</i> half of its boundary
+but never the <i>term</i> half, and `commit()` guarded neither (a null NPE'd
+out of its first index bound, a forged `(-1,k)` passed both) — so a
+construction-bypassed carrier (the 6(n)/6(p) shape) stuck into the seed and
+boundary pointers or the committed pointer and, via the term-first
+`TermIndex.compareTo`, inverted the committed filter and `rollback()` —
+committed entries re-served (double-apply) or pending ones dropped; both
+intakes now refuse a null or negative-axis pointer before any state change;
+see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1238,3 +1250,74 @@ over the 6(p) baseline of 379). The family — name (6(d)), body (6(o)), type (6
 is now closed on the file surface: an entry is a snapshot iff it is a regular file
 whose name names a boundary and whose body is non-empty, and every other shape under
 our naming scheme is warned about on load, spared on save, and left in place on both.
+
+**Non-happy-path hardening pass, sixteenth round (2026-11-24, stage 6(r))** — the
+term axis of the 6(g) pointer family reaching the `RaftLogs` intake itself — the last
+consumer in the chain behind the wire guard sealed by 6(g)–6(n) and the store argument
+surface sealed by 6(o)–6(p). A consumer feeding the log directly from inside the process
+bypasses every one of those guards at once, and the log's two intake points both carried
+a guard that *looked* complete and was half-sealed:
+
+- `compact(boundary, payload)` guarded `boundary == null` and `boundary.getIndex() < 0`
+  — but never `boundary.getTerm() < 0`. The axis had looked sealed because the shape is
+  unbuildable by construction: the `TermIndex` constructor throws IAE on either negative
+  axis. That is exactly the 6(n)/6(p) mechanism — and the tell is that the pre-existing
+  negative-<i>index</i> pin in `testCompactGuards` (`compact(new TermIndex(1, -1L), …)`)
+  was pinning the CONSTRUCTOR: the IAE it asserted was thrown inside the pin's own
+  expression, so the guard it claimed to pin had never actually been exercised. A
+  construction-bypassed carrier (deserialized or reflected — the 6(n) pin idiom) carries
+  `(-1, k)` past both checks.
+- `commit(termIndex)` guarded neither. `termIndex == null` NPE'd out of the first index
+  bound (`Cannot invoke "TermIndex.getIndex()"`); a forged negative term passed both
+  index comparisons, because they only test the index.
+
+Pre-fix damage (both RED-confirmed during the pin cycle):
+
+- `compact(forgeTerm(-1, 2L))` was ACCEPTED — the log line proves it: `Compacted log to
+  boundary TermIndex{term=-1, index=2} (dropped 2 record(s), 0 kept)`. Both real records
+  dropped and the forged boundary reseeding the deque: start point, `snapshotBoundary`,
+  and (full install) the recorded tail all become `(-1, 2)` — a term no `TermIndex` may
+  legally hold, served back through `getStartTermIndex()` onto the wire, where the
+  6(g)-guarded install path refuses it forever, and into the term-first `compareTo`
+  ordering `commit` and `rollback` depend on.
+- `commit(null)` surfaced as an NPE — the wrong exception family for a contract refusal.
+  `commit(forgeTerm(-1, 1L))` was accepted silently into `committedTermIndex`. The
+  committed filter is `r.compareTo(prevCommit) > 0 && r.compareTo(newCommit) <= 0` — both
+  term-first — so with the committed pointer at term `−1` the next legitimate
+  `commit((1, 2))` RE-SERVES an already-committed entry (a double-apply against the
+  apply-then-acknowledge ordering the method exists to protect), and `rollback()`
+  (`compareTo(committed) > 0`) reports committed entries as uncommitted.
+
+The fix is the 6(o)/6(p) guard shape on the two last intakes — refusal BEFORE any state
+change, on both axes:
+
+- `compact`: the existing index check extended to `getTerm() < 0 || getIndex() < 0`
+  (after the null check; both IAE, the `isHostileWireTermIndex` shape the wire guards
+  already use).
+- `commit`: a new `termIndex == null` → IAE and `getTerm() < 0 || getIndex() < 0` → IAE,
+  placed before the index bounds — the null no longer NPEs out of the bound reads and a
+  forged term no longer slips past index-only comparisons.
+
+**Pins (both RED-confirmed before the fix, then GREEN), in `RaftLogsTest`:**
+`testCompactGuards`, extended — `compact(forgeTerm(-1, 2L), "hostile")` throws IAE and
+the refusal is ZERO-STATE-CHANGE (the start point is still `EPOCH`,
+`containsStartPoint((1, 1))` is true, tail index still 2): pre-fix the same call was
+accepted with both records dropped.
+`testCommitGuards`, new — `commit(null)` throws IAE (pre-fix: NPE),
+`commit(forgeTerm(-1, 1L))` throws IAE (pre-fix: accepted), the committed pointer is
+untouched at `(1, 1)`, and then a legitimate `commit((1, 2))` returns EXACTLY `[b]`:
+the double-serve/drop discriminator — had the forged pointer stuck, that same commit
+would have re-served the already-committed `a` (double-apply), asserting `[b]` precisely
+is what distinguishes a real refusal from a lucky filter.
+Both forge through the established 6(n)/6(p) idiom — `new TermIndex(0, index)` with the
+private final `term` field set reflectively to `-1` (`forgeTerm` helper, now shared by
+`RaftLogsTest`) — the exact shape a deserialized or otherwise construction-bypassed
+carrier would deliver and the one the constructor forbids.
+
+Isolated: `RaftLogsTest` **10 green / 0 fail / 0 skip** (9 baseline + the new
+`testCommitGuards` method; the `testCompactGuards` pin extended an existing method, no
+delta). Full suite at this point: **383 tests green, 0 failures, 1 pre-existing skip**
+(+1 over the 6(q) baseline of 382). The pointer family — wire (6(g)–6(n)), store
+(6(o)–6(p)), log (6(r)) — now has one answer at every in-process entry point: a pointer
+is legitimate iff it is non-null and both axes non-negative — the `TermIndex`
+constructor's contract, enforced at every API the constructor does not reach.

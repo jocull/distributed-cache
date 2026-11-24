@@ -272,6 +272,19 @@ public class RaftLogsTest {
         assertThrows(IllegalArgumentException.class, () -> raftLogs.compact(null, "payload"));
         assertThrows(IllegalArgumentException.class, () -> raftLogs.compact(new TermIndex(1, -1L), "payload"));
 
+        // (6r) The index half of the boundary axis is pinned above, the term half was not:
+        // the TermIndex constructor forbids a negative term, but a construction-bypassed
+        // carrier (a deserialized or reflected one -- the 6(n)/6(p) mechanism) carries one.
+        // Accepted, it reseeds the deque and, full-install, becomes the recorded tail and
+        // the start point: a term no TermIndex may legally hold, served back through
+        // getStartTermIndex() onto the wire (the 6(g)-guarded install path refuses it
+        // forever) and into the term-first compareTo ordering rollback and commit depend on.
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.compact(forgeTerm(-1, 2L), "hostile"));
+        // Refusal is zero-state-change: the start point did not move and the log is intact
+        assertEquals(TermIndex.EPOCH, raftLogs.getStartTermIndex());
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 1L)));
+        assertEquals(2L, raftLogs.getCurrentTermIndex().getIndex());
+
         raftLogs.commit(new TermIndex(1, 1L));
         raftLogs.compact(new TermIndex(1, 1L), "payload1");
 
@@ -286,5 +299,49 @@ public class RaftLogsTest {
         raftLogs.appendLog(1, "c");
         raftLogs.commit(new TermIndex(1, 2L));
         assertThrows(IllegalStateException.class, () -> raftLogs.compact(new TermIndex(2, 1L), "payload2"));
+    }
+
+    @Test
+    void testCommitGuards() {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        final RaftLog<String> a = raftLogs.appendLog(1, "a"); // (1,1)
+        final RaftLog<String> b = raftLogs.appendLog(1, "b"); // (1,2)
+        raftLogs.commit(new TermIndex(1, 1L)); // "a" committed, "b" pending
+
+        // (6r) A null or negative-term commit pointer is hostile by construction (the
+        // same family as the compact guards above): a null derefs to NPE at the index
+        // bounds, and a negative term passes them both (they are index-only), sticking
+        // into committedTermIndex and inverting the term-first compareTo the committed
+        // filter and rollback rely on.
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.commit(null));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.commit(forgeTerm(-1, 1L)));
+
+        // Refusal is zero-state-change: the committed pointer is untouched...
+        assertEquals(new TermIndex(1, 1L), raftLogs.getCommittedTermIndex());
+        assertTrue(raftLogs.containsStartPoint(b.getTermIndex()));
+        // ...and the legitimate commit still returns exactly the pending entry. Had the
+        // forged pointer stuck, its term-first ordering would have re-served the already-
+        // committed "a" (double-apply) or dropped "b" entirely (an ack that never comes) --
+        // breaking the apply-then-acknowledge ordering this method exists to protect.
+        assertEquals(List.of(b), raftLogs.commit(new TermIndex(1, 2L)));
+        assertEquals(new TermIndex(1, 2L), raftLogs.getCommittedTermIndex());
+    }
+
+    /**
+     * Forge a pointer the {@link TermIndex} constructor would never produce (a negative
+     * term): build a legal one, then set the field directly -- the exact shape a
+     * deserialized or otherwise construction-bypassed carrier would reach the log with
+     * (the 6(n)/6(p) mechanism, on the 6(g) term axis).
+     */
+    private static TermIndex forgeTerm(int term, long index) {
+        final TermIndex base = new TermIndex(0, index);
+        try {
+            final java.lang.reflect.Field field = TermIndex.class.getDeclaredField("term");
+            field.setAccessible(true);
+            field.set(base, term);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the pointer term", e);
+        }
     }
 }

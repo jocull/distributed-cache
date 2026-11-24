@@ -204,7 +204,15 @@ class RaftLogs {
         if (boundary == null) {
             throw new IllegalArgumentException("compact boundary must not be null");
         }
-        if (boundary.getIndex() < 0) {
+        if (boundary.getTerm() < 0 || boundary.getIndex() < 0) {
+            // (6r) The index half was guarded and the term half was not: a negative term is
+            // one the TermIndex constructor forbids, reachable only through a
+            // construction-bypassed carrier (a deserialized or reflected one -- the 6(n)/6(p)
+            // mechanism). Accepted, the boundary would reseed the deque and, full-install,
+            // become the recorded tail and the start point: a term no TermIndex may legally
+            // hold, served back through getStartTermIndex() onto the wire (the 6(g)-guarded
+            // install path refuses it forever) and into the term-first compareTo ordering
+            // commit and rollback depend on.
             throw new IllegalArgumentException("compact boundary must not be negative: " + boundary);
         }
         if (boundary.getIndex() < startSeed.getTermIndex().getIndex()) {
@@ -279,6 +287,20 @@ class RaftLogs {
      * a client cannot observe its own write as acknowledged before it has taken effect.
      */
     public synchronized List<RaftLog<?>> commit(TermIndex termIndex) {
+        // (6r) Same hostile-carrier guard family as compact below: the pointer must be
+        // present and both axes non-negative. The index half was only implicitly closed by
+        // the committed-lower-bound check further down, and the term half (and the null,
+        // which NPE'd out of the first index bound) were wide open: a forged negative term
+        // passes both index comparisons, sticks into committedTermIndex, and inverts the
+        // term-first compareTo the committed filter and rollback rely on -- re-serving
+        // committed entries (double-apply) or dropping pending ones (an ack that never
+        // comes), breaking the apply-then-acknowledge ordering this method protects.
+        if (termIndex == null) {
+            throw new IllegalArgumentException("commit termIndex must not be null");
+        }
+        if (termIndex.getTerm() < 0 || termIndex.getIndex() < 0) {
+            throw new IllegalArgumentException("commit termIndex must not be negative: " + termIndex);
+        }
         // The commit index moves along the index axis and cannot outrun the true tail --
         // which, post-install (stage 4), is the boundary even when the recorded tail lags.
         final TermIndex tail = currentTail();
