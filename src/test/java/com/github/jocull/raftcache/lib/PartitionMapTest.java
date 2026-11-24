@@ -394,4 +394,179 @@ public class PartitionMapTest {
         assertThrows(NullPointerException.class,
                 () -> new KeyDataExpireInput("key", null), "The TTL must not be null");
     }
+
+    // ---- 6(v) intake guards (store intakes) ----
+    //
+    // The five store intakes (getData/setData/deleteData/expireData/restore) used to
+    // dereference a null wherever one slipped past a carrier's constructor, and the
+    // write paths bumped the global version *before* the dereference -- a refusal that
+    // then threw leaked a consumed version into every later entry. These pins refuse at
+    // the intake with a named exception, before any state change or version bump.
+
+    /**
+     * Forge a PUT carrier the {@link KeyDataInput} constructor would never produce (a
+     * null key): the same construction-bypass shape as the 6(r) forges -- the carrier
+     * the store intake must refuse no matter how it arrived.
+     */
+    private static KeyDataInput forgePutNullKey() {
+        final KeyDataInput base = new KeyDataInput("key", Map.of("data", new byte[]{'v'}));
+        try {
+            final java.lang.reflect.Field field = KeyDataInput.class.getDeclaredField("key");
+            field.setAccessible(true);
+            field.set(base, null);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the null PUT key", e);
+        }
+    }
+
+    /**
+     * Forge a PUT carrier the {@link KeyDataInput} constructor would never produce (a
+     * null data map) -- the carrier the store intake must refuse before it stamps a
+     * value.
+     */
+    private static KeyDataInput forgePutNullData() {
+        final KeyDataInput base = new KeyDataInput("key", Map.of("data", new byte[]{'v'}));
+        try {
+            final java.lang.reflect.Field field = KeyDataInput.class.getDeclaredField("data");
+            field.setAccessible(true);
+            field.set(base, null);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the null PUT data", e);
+        }
+    }
+
+    /**
+     * Forge an EXPIRE carrier the constructor would never produce (a null key).
+     */
+    private static KeyDataExpireInput forgeExpireNullKey() {
+        final KeyDataExpireInput base = new KeyDataExpireInput("key", Duration.ofMillis(1000L));
+        try {
+            final java.lang.reflect.Field field = KeyDataExpireInput.class.getDeclaredField("key");
+            field.setAccessible(true);
+            field.set(base, null);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the null EXPIRE key", e);
+        }
+    }
+
+    /**
+     * Forge an EXPIRE carrier the constructor would never produce (a null TTL).
+     */
+    private static KeyDataExpireInput forgeExpireNullTtl() {
+        final KeyDataExpireInput base = new KeyDataExpireInput("key", Duration.ofMillis(1000L));
+        try {
+            final java.lang.reflect.Field field = KeyDataExpireInput.class.getDeclaredField("ttl");
+            field.setAccessible(true);
+            field.set(base, null);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the null EXPIRE TTL", e);
+        }
+    }
+
+    @Test
+    void testStoreIntakeGuards() {
+        // ---- getData / setData / deleteData (raw-string and carrier intakes) ----
+        final PartitionMap pm = new PartitionMap(eventBus, 16);
+
+        final IllegalArgumentException readRefusal = assertThrows(IllegalArgumentException.class,
+                () -> pm.getData(null));
+        assertEquals("key must not be null", readRefusal.getMessage(), "A null read key must name the key");
+
+        final IllegalArgumentException setRefusal = assertThrows(IllegalArgumentException.class,
+                () -> pm.setData(null));
+        assertEquals("input must not be null", setRefusal.getMessage(), "A null PUT carrier must name the carrier");
+
+        final IllegalArgumentException deleteRefusal = assertThrows(IllegalArgumentException.class,
+                () -> pm.deleteData((String) null));
+        assertEquals("key must not be null", deleteRefusal.getMessage(), "A null DELETE key must name the key");
+
+        // The construction-bypassed carriers (null key / null data) are refused too
+        final IllegalArgumentException bypassKeyRefusal = assertThrows(IllegalArgumentException.class,
+                () -> pm.setData(forgePutNullKey()));
+        assertEquals("key must not be null", bypassKeyRefusal.getMessage(), "A nulled PUT key must name the key");
+        final IllegalArgumentException bypassDataRefusal = assertThrows(IllegalArgumentException.class,
+                () -> pm.setData(forgePutNullData()));
+        assertEquals("data must not be null", bypassDataRefusal.getMessage(), "A nulled PUT data must name the data");
+
+        // Refusals must not consume a version: the four refusals above each bumped the
+        // global counter before they threw (pre-guard the legitimate SET landed on
+        // version 5); post-guard it still gets the *first* global version
+        pm.setData(input("key", "v1"));
+        assertEquals(1L, pm.getData("key").orElseThrow().getVersion(),
+                "A refused intake must not leak a consumed version into a later legitimate write");
+
+        // ---- expireData (carrier intake, both axes) ----
+        final PartitionMap ttlMap = new PartitionMap(eventBus, 16, new MutableClock(Instant.EPOCH));
+
+        final IllegalArgumentException expireRefusal = assertThrows(IllegalArgumentException.class,
+                () -> ttlMap.expireData(null));
+        assertEquals("input must not be null", expireRefusal.getMessage(),
+                "A null EXPIRE carrier must name the carrier");
+        final IllegalArgumentException expireKeyRefusal = assertThrows(IllegalArgumentException.class,
+                () -> ttlMap.expireData(forgeExpireNullKey()));
+        assertEquals("key must not be null", expireKeyRefusal.getMessage(), "A nulled EXPIRE key must name the key");
+        final IllegalArgumentException expireTtlRefusal = assertThrows(IllegalArgumentException.class,
+                () -> ttlMap.expireData(forgeExpireNullTtl()));
+        assertEquals("ttl must not be null", expireTtlRefusal.getMessage(), "A nulled EXPIRE TTL must name the TTL");
+
+        // Version-leak pin on the TTL path: SET -> legitimate EXPIRE. Pre-guard the three
+        // EXPIRE refusals above each consumed a version (the live entry landed on version
+        // 5); post-guard the refusal leaks nothing and the live entry stays on version 2
+        ttlMap.setData(input("key", "v1"));
+        ttlMap.expireData(new KeyDataExpireInput("key", Duration.ofMillis(1000L)));
+        assertEquals(2L, ttlMap.getData("key").orElseThrow().getVersion(),
+                "A refused EXPIRE must not leak a consumed version into a later legitimate write");
+
+        // ---- restore (the snapshot-reinstall intake) ----
+        final PartitionMap snapshotMap = new PartitionMap(eventBus, 16);
+        snapshotMap.setData(input("existing", "v1"));
+
+        final IllegalArgumentException restoreNullRefusal = assertThrows(IllegalArgumentException.class,
+                () -> snapshotMap.restore(null));
+        assertEquals("state must not be null", restoreNullRefusal.getMessage(), "A null state must name the state");
+
+        // Construction-bypassed state (a plain HashMap carrying a null key / a null
+        // DataVersion -- shapes neither Map.of nor a captured state would produce) is
+        // refused too
+        final Map<String, DataVersion> nullKeyState = new HashMap<>();
+        nullKeyState.put(null, new DataVersion(Map.of("data", "v".getBytes(StandardCharsets.UTF_8)), 1L));
+        final IllegalArgumentException restoreKeyRefusal = assertThrows(IllegalArgumentException.class,
+                () -> snapshotMap.restore(nullKeyState));
+        assertEquals("key must not be null", restoreKeyRefusal.getMessage(), "A nulled restore key must name the key");
+
+        final Map<String, DataVersion> nullValueState = new HashMap<>();
+        nullValueState.put("key", null);
+        final IllegalArgumentException restoreValueRefusal = assertThrows(IllegalArgumentException.class,
+                () -> snapshotMap.restore(nullValueState));
+        assertEquals("state value must not be null", restoreValueRefusal.getMessage(),
+                "A nulled restore value must name the value");
+
+        // Refusals must not disturb the existing state at all (pre-guard the NPEs were
+        // already before any partition mutation; this pins that)
+        assertTrue(snapshotMap.getData("existing").isPresent(),
+                "A refused restore must not drop the existing state");
+        assertArrayEquals("v1".getBytes(StandardCharsets.UTF_8),
+                snapshotMap.getData("existing").orElseThrow().getData().get("data"));
+        assertTrue(snapshotMap.getData("key").isEmpty(),
+                "A refused restore must not install partial state");
+
+        // And the intake remains fully usable: a legitimate restore replaces the state,
+        // fast-forwarding the version counter for subsequent local writes
+        final Map<String, DataVersion> state = new HashMap<>();
+        state.put("restored", new DataVersion(Map.of("data", "v2".getBytes(StandardCharsets.UTF_8)), 7L));
+        snapshotMap.restore(state);
+        assertTrue(snapshotMap.getData("restored").isPresent(),
+                "A legitimate restore must install its state");
+        assertEquals(7L, snapshotMap.getData("restored").orElseThrow().getVersion(),
+                "The restored entry must carry its restored version");
+        assertTrue(snapshotMap.getData("existing").isEmpty(),
+                "Restore replaces the state: keys absent from it are dropped");
+        snapshotMap.setData(input("after", "v1"));
+        assertEquals(8L, snapshotMap.getData("after").orElseThrow().getVersion(),
+                "After a fast-forwarding restore, the next local write must still be strictly newer");
+    }
 }

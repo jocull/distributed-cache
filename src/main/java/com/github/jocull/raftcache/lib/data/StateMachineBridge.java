@@ -53,15 +53,34 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
     private final AtomicReference<TermIndex> lastApplied = new AtomicReference<>(NO_POSITION_APPLIED);
 
     public StateMachineBridge(EventBus eventBus, PartitionMap partitionMap) {
-        this.eventBus = eventBus;
-        this.partitionMap = partitionMap;
+        this.eventBus = Objects.requireNonNull(eventBus, "eventBus");
+        this.partitionMap = Objects.requireNonNull(partitionMap, "partitionMap");
         eventBus.subscribe(this);
     }
 
     @Override
     public void onEvent(Object event) {
+        if (event == null) {
+            throw new IllegalArgumentException("event must not be null");
+        }
         if (event instanceof LogsCommitted) {
             final LogsCommitted logsCommitted = (LogsCommitted) event;
+            // Validate the whole batch before applying anything (the 6(t)
+            // notifyCommitted precedent): a forged log anywhere in the list -- a shape
+            // the RaftLog constructor would never produce but a deserialized or
+            // reflection-bypassed carrier can carry -- refuses the entire batch with
+            // zero state change, so a mixed [good, forged] list is never half-applied.
+            for (RaftLog<?> raftLog : logsCommitted.getLogs()) {
+                if (raftLog == null) {
+                    throw new IllegalArgumentException("log must not be null");
+                }
+                if (raftLog.getTermIndex() == null) {
+                    throw new IllegalArgumentException("term index must not be null");
+                }
+                if (raftLog.getEntry() == null) {
+                    throw new IllegalArgumentException("entry must not be null");
+                }
+            }
             for (RaftLog<?> raftLog : logsCommitted.getLogs()) {
                 applyLog(raftLog);
             }

@@ -33,6 +33,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(s) | non-happy-path hardening (seventeenth pass, the `RaftLogs` content intake — the one append path not construction-guarded): all four public append overloads funnel into `appendLogInternal(TermIndex, T)`, and the int overloads reach it only through the `TermIndex` constructor (IAE on both negative axes) — so the raw overload is the one intake a 6(n)/6(p)-shaped construction-bypassed carrier or a null can reach, and it had no guards at all, right next to the 6(r) guards that had just sealed its sibling intakes. Four live shapes, all RED-confirmed pre-fix: **null pointer** NPE'd in the conflict walk (the log is never empty — it is seeded with the epoch); a **forged negative term** could replace nothing (a negative term outranks no existing entry) but is also never "before" one under the term-first `compareTo`, so it fell out of the walk as an ISE "log gap" — the wrong family for a contract refusal; a **forged negative index** tripped `isReplacementOf` against the epoch seed (1 > 0 and -1 <= 0) and the conflict sweep destroyed the ENTIRE log before the forged record lodged below the true tail — state-destroying, with a completed future for index -1 in the caller's hand and the recorded tail a phantom the deque no longer holds; and a **null entry** NPE'd out of the record construction at a new index while silently no-oping (returning the existing record, the entry never read) at an existing one. The gate now refuses the null pointer, the negative-axis pointer, and the null entry at the head of the method, before the iterator touches the deque — one guard covering all four overloads through the funnel, carrying the zero-state-change and next-append-lands-past-the-tail discriminators | `stage 6(s)` |
 | 6(t) | non-happy-path hardening (eighteenth pass, the `RaftLogs` read + notification surfaces — the last unguarded public intakes on a class whose mutation intakes 6(r)/6(s) just sealed): `containsStartPoint`, `getLogRange`, and `notifyCommitted` were raw. All RED-confirmed pre-fix: a **null pointer** NPE'd at the `containsStartPoint` `startSeed` equality check or in the `getLogRange` stream filter; a **null transform** NPE'd at the `map` step; **forged negative axes** were silently answered "not contained" or served a range computed off a pointer no `TermIndex` may hold (the range filter indexes the index axis only, so a forged term was ignored and a forged negative index served a wider range than asked); `notifyCommitted(**null)**` NPE'd in the for-each, and a **null element** was skipped with no trace (`instanceof` is simply false) — the caller cannot tell a refusal from a skipped acknowledgement, and the good neighbours completed *first*. Each gate now refuses a null pointer / negative-axis pointer / null transform / null list / null element before touching the list — in `notifyCommitted` validating the WHOLE list before completing ANY future, so a mixed-list refusal is zero-state-change — carrying the zero-state-change, legitimate-range-still-served, and legitimate-ack-still-completes-a-waiting-client discriminators | `stage 6(t)` |
 | 6(u) | non-happy-path hardening (nineteenth pass, the pending-request registry — the last raw in-process intake sitting between the sealed wire (6(g)–6(n)) and the sealed log (6(r)–6(t)): `NodeRequests` is the sole request/response correlation point; `NodeConnectionOutboundImpl` is its only caller and funnels BOTH `sendStateRequest` and `receive(StateResponse)` through it, yet neither intake had a single gate. RED-confirmed pre-fix (the pin's first two failures): a **null request** NPE'd synchronously at the `pendingRequests.put(request.getRequestId(), …)` key dereference while the already-scheduled delayed-cancellation task NPE'd a SECOND time, invisibly, 5 s later inside the common pool; a **null response** into `completeRequest` NPE'd at `response.getRequestId()` (the wrong family, both). The remaining shapes are confirmed from the same source walk and guarded in the same pass: a **null response class** was accepted and NPE'd *later*, inside the caller's own future, at `isAssignableFrom(null)` (wrong time, wrong place); a **null requestId** — reachable only via a construction-bypassed carrier (the 6(n)/6(p) shape; the constructors seed the id in-field and can never produce one) — was silently accepted as a legal `HashMap` null key, so two such requests collide on ONE entry and a completion under that key resolved the *WRONG* pending future (talking past each other), and a null-id response carrier fell into the `pending == null` early return and was dropped with no trace — indistinguishable from the legitimate unknown-id discard, and masked in practice by the 5 s cancellation timeout. Both intakes now refuse at the method head in the 6(r)–6(t) IAE family — `getRequestFuture` refusing request / request id / response class before the executor or the map is touched, `completeRequest` refusing response / response id before the map lookup — carrying the legitimate-roundtrip-still-completes-the-waiting-caller and unknown-id-still-a-silent-no-op discriminators | `stage 6(u)` |
+| 6(v) | non-happy-path hardening (twentieth pass, the apply/data plane — the last raw in-process intake downstream of the sealed log: `LogsCommitted` — the last unguarded public event carrier — feeds `StateMachineBridge.onEvent`, which replays it into the `PartitionMap` write intakes, and neither side had a single gate. RED-confirmed pre-fix (the pins' first failures, both new test methods): the bridge constructor NPE'd at `eventBus.subscribe` on a null bus with the JDK-enriched message (indistinguishable from a failure deeper in the wiring), and *passed construction* on a null state machine to NPE later, silently, inside an applied write (wrong time, wrong place); `onEvent(null)` fell through into the silent unknown-event-ignore line (indistinguishable from a legitimate discard by another publisher on the shared bus); the carrier held the producer's mutable list by reference, so a nulled element — a shape `List.of` itself would refuse — rode past it, and a forged log (null term index, or null entry: shapes the `RaftLog` constructor never produces) was accepted and NPE'd inside the apply loop — in a mixed `[good, forged]` batch the good log was *applied first* (state changed, applied position moved) and only then the batch died: a half-applied commit; the store intakes bumped `globalVersion` *before* the NPE they threw (every refusal leaked one consumed version — a legitimate SET landed on version **5** where the contract says 1, a follow-up EXPIRE on **5** where it says 2), and `restore` NPE'd mid-restore over a construction-legit `HashMap` with a null key or a null `DataVersion` value. The intakes now refuse at the method head in the 6(r)–6(t) IAE family — constructor arguments refused as named NPEs (`eventBus`/`partitionMap`, the `adopt` `"snapshot"` family; the bus axis pins the message, since the JDK message differed pre-fix), the event refused naming the event while the ignore line narrows to *unknown, non-null* events, the WHOLE batch validated axis by axis (`term index`/`entry`) before anything is applied so a mixed batch is refused as a batch with zero state change and the applied index does not move, the `LogsCommitted` constructor taking `List.copyOf` of a required list (immutable and null-free at the handoff; safe — its only consumer iterates read-only), and the store axes `key` / `input`+`key`+`data` / `input`+`key`+`ttl` / `state` + per-entry `key`+value all refused BEFORE `incrementAndGet()` or any partition mutation — carrying the legitimate-commit-still-applies, refused-restore-leaves-existing-state-untouched-and-restore-then-works, and no-version-leak discriminators | `stage 6(v)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -148,7 +149,22 @@ established — was silently accepted as a legal `HashMap` null key (a second su
 request overwrites the first's pending future, a completion under that key can
 resolve the wrong one) or dropped with no trace, indistinguishable from the
 legitimate unknown-id discard; both intakes now refuse at the method head in the
-same IAE family; see §7).
+same IAE family; see §7); and after stage 6(v): **389 tests green, 0 failures, 1
+pre-existing skip** (+2: the apply/data plane — the last raw in-process intake
+downstream of the sealed log: `LogsCommitted`, the one unguarded public carrier in
+the event family, rode the shared node bus into `StateMachineBridge.onEvent` — whose
+constructor (a raw bus, a raw state machine), event intake, and `applyLog` deref had no
+gate of their own either — and into the five `PartitionMap` data intakes: a forged
+`RaftLog` (a null term index / null entry, shapes the `RaftLog` constructor cannot
+produce) NPE'd *inside* `applyLog` only after its legitimate neighbour in a mixed batch
+had already been applied and `lastApplied` had moved, a null event fell through into the
+silent unknown-event-ignore line, indistinguishable from a legitimate discard, the write
+intakes NPE'd at the deref *after* bumping `globalVersion` — one refusal leaked one
+global version into the next legitimate write (a SET landing on version 5 instead of 1,
+an EXPIRE on 5 instead of 2) — and `restore` NPE'd mid-install over a null-keyed or
+null-valued `HashMap`; every intake in the chain now refuses at the method head in the
+6(r)–6(t) family, the whole commit batch is validated axis by axis before anything is
+applied, and no refusal consumes a version or mutates a partition; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1581,3 +1597,105 @@ request/response bus (this pass). The pointer+carrier family the house has been 
 since 6(g) enforces one contract at every in-process entry point: a pointer is legitimate
 iff non-null with both axes non-negative, a list iff it holds no nulls, and a
 request/response pair iff the carrier and its correlation id are non-null.
+
+**Non-happy-path hardening pass, twentieth round (2026-11-24, stage 6(v))** — the
+apply/data plane: 6(g)–6(n) sealed the wire, 6(o)–6(p) the store, 6(r)–6(t) the log, and
+6(u) the request/response registry — but between the sealed log and the state the log
+replays into there was still one chain with no gate on any hop, because every hop is
+in-process and carries no wire shape: `LogsCommitted`, the one public event carrier
+with no element gate, rode the shared node bus straight into
+`StateMachineBridge.onEvent`, whose `applyLog` fed the five `PartitionMap` data intakes —
+and the bridge's own constructor took a raw bus and a raw state machine. A
+construction-bypassed `RaftLog` (a null term index / a null entry — shapes the `RaftLog`
+constructor cannot produce, the 6(n)/6(p) shape) or a plain null could walk that whole
+chain in and reach `setData`, `deleteData`, `expireData`, and `restore`, the very
+surfaces this house has been sealing intakes on since 6(g).
+
+The surface. `StateMachineBridge(EventBus, PartitionMap)` wired `eventBus.subscribe(this)`
+with no check on either dependency. `onEvent(Object)` branched on event type only — a
+null sailed through both `instanceof` guards into the unknown-event-ignore line, the same
+line a *legitimate* discard by another publisher lands on. `LogsCommitted` stored the
+producer's mutable list **by reference** with no element check — the one carrier a
+nulled element (a shape `List.of` would itself refuse) could ride on, and it could still
+be mutated by its producer after publish. `applyLog` dereferenced
+`getTermIndex().getIndex()` first, then `getEntry()`. And the five `PartitionMap`
+intakes — `getData`/`setData`/`deleteData`/`expireData`/`restore` — dereferenced their
+key/input/data/ttl/state axes at the partition walk, the three write intakes bumping
+`globalVersion` **before** the dereference that threw, and `restore` writing partitions
+as it walked.
+
+The pre-fix behaviours (all five RED-confirmed by the pin before the fix):
+- **null bus into the bridge constructor**: NPE at the `eventBus.subscribe` call, with
+  the JDK's enriched message — the wrong family, indistinguishable from a wiring failure;
+  **null state machine**: no failure at construction at all — deferred and silent, an NPE
+  inside an applied write.
+- **null event on the shared bus**: silent — the ignore line is the SAME path a
+  legitimate discard by another publisher takes; no error, no family, no trace.
+- **a nulled `LogsCommitted` element**: rode the chain by reference into the apply loop,
+  NPE'd there — the wrong family, mid-apply, *after* a legitimate neighbour in the same
+  batch might already have been applied.
+- **a forged `RaftLog`** (null term index → NPE at `termIndex.getIndex()`; null entry →
+  NPE at the `instanceof` dispatch): worst in a **mixed `[legitimate, forged]` batch** —
+  the legitimate log **applied first** — state changed, `lastApplied` moved — and only
+  then the batch died on the forged element: a *half-applied commit* at the very surface
+  the sealed log is meant to make atomic.
+- **null axes into the `PartitionMap` intakes** (null key / input / data / ttl / state /
+  state value — raw and 6(n)/6(p)-forged): NPE at the dereference — and, for the write
+  intakes, **after** `globalVersion.incrementAndGet()`: one refusal consumed one global
+  version, so the next legitimate write landed one higher than its caller expected (a
+  SET on version 5 where the sequence was 1; an EXPIRE on 5 where it should have been 2);
+  and `restore` NPE'd **mid-install** over a `HashMap` carrying a null key or a null
+  `DataVersion` — a shape neither `Map.of` nor a captured state would ever produce —
+  with partitions already half-replaced.
+
+The fix is the 6(r)–6(t) gate family at the head of every intake in the chain, in order:
+the constructor names both refused dependencies (`"eventBus"`, `"partitionMap"`) before
+any wiring; `onEvent` refuses a null event before the type branches, so the ignore line
+is reachable only by non-null unknown events — the legitimate case; `LogsCommitted` now
+stores an **immutable copy** (`List.copyOf`) that rejects a null list (`"logs"`) and a
+nulled element at construction, so the carrier itself can no longer hold one or be
+mutated by its producer after publish; the `onEvent` apply path validates the **whole
+batch** — "log must not be null", "term index must not be null", "entry must not be
+null" per element, **before** the apply loop (the 6(t) `notifyCommitted` precedent) — so
+one forged element refuses the entire batch with **zero state change** (`lastApplied`
+untouched); and all five `PartitionMap` intakes refuse their null axes at the method
+head in the 6(r)–6(t) IAE family ("key must not be null", "input must not be null",
+"data must not be null", "ttl must not be null", "state must not be null", "state value
+must not be null") — **before** any `incrementAndGet()` and before any partition
+mutation, with `restore` validating every entry (key and value) before its install loop.
+
+**Pin (RED-confirmed before the fix, then GREEN), `StateMachineBridgeTest` and
+`PartitionMapTest` extended:** new `testApplyIntakeGuards` (BridgeTest, 22) — the
+constructor NPEs on each null dependency, **naming it** (`"eventBus"`,
+`"partitionMap"`); `new LogsCommitted(null)` and a list carrying a nulled element NPE
+(`"logs"`); `onEvent(null)` IAE `"event must not be null"` (was: the silent ignore
+line); a forged null-term-index log and a forged null-entry log are refused at the
+*publisher's* `publish` call site — the bus is synchronous, so the IAE surfaces there,
+not in the background — with `"term index must not be null"` / `"entry must not be
+null"` (was: NPE mid-apply); the **mixed `[legitimate, forged]` batch** is refused as a
+batch — `getData(legitimate-key)` still empty, `getLastAppliedIndex()` still `0` — and
+then the discriminator, a **legitimate commit still applies** (`getLastAppliedIndex()`
+1), so the refused intake remains fully usable; new `testStoreIntakeGuards` (
+PartitionMapTest, 14) — the null axes of `getData`/`setData`/`deleteData` (raw and
+6(n)/6(p)-forged: null key / null PUT data) and of `expireData` (null input, null key,
+null ttl) and of `restore` (null state, null key, null state value) all IAE with the
+axis named, plus the **version-leak discriminators** the pre-fix code failed: after the
+write refusals a legitimate SET still lands on global version **1** (pre-fix: **5**),
+and after the EXPIRE refusals SET → legitimate EXPIRE leaves its entry on version **2**
+(pre-fix: **5**); on the `restore` path the refusals leave the existing partition
+byte-identical — no partial install — and a **legitimate** restore then installs its
+entries at their restored version (v7), drops the keys absent from it (the "existing"
+state is gone), fast-forwards the counter, and the NEXT local write lands on v8 — the
+intake is usable after refusing, and the versions stay strictly increasing.
+
+Isolated: `StateMachineBridgeTest` **22 green** and `PartitionMapTest` **14 green** —
+**36 green / 0 fail / 0 skip**.
+Full suite at this point: **389 tests green, 0 failures, 1 pre-existing skip**
+(+2 over the 6(u) baseline of 387). The pointer+carrier family the house has been
+closing since 6(g) now enforces its one contract at every in-process entry point — wire
+(6(g)–6(n)), store (6(o)–6(p)), log (6(r)–6(t)), request/response registry (6(u)), and
+this pass, the apply/data plane (6(v)) — and the last raw intake in the chain, the one
+that turns the sealed log into state, now refuses the shapes the house's own sealed
+constructors can never produce: at the head of the bridge, at the head of the carrier,
+and at the head of every store intake, before a version is consumed or a partition is
+touched.

@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -485,5 +486,103 @@ public class StateMachineBridgeTest {
         assertTrue(s.map.getData("key2").isPresent(),
                 "Data entries after a foreign payload should still be applied");
         assertEquals(2L, s.bridge.getLastAppliedIndex());
+    }
+
+    // ---- 6(v) intake guards (apply path + last unguarded carrier) ----
+    //
+    // The bridge and its intake axes (ctor, onEvent, the apply axes) used to dereference
+    // a null wherever one slipped past a constructor: a deserialized or otherwise
+    // construction-bypassed RaftLog/LogsCommitted reaches the same code a legitimate one
+    // does. These pins refuse such carriers at the intake, before any state change.
+
+    /**
+     * Forge a log the {@link RaftLog} constructor would never produce (a null term
+     * index): the same construction-bypass shape as the 6(r) TermIndex forges, applied
+     * to the log's own axis -- the carrier the apply intake must refuse no matter how
+     * it arrived.
+     */
+    private static RaftLog<?> forgeNullTermIndex(Object entry) {
+        final RaftLog<?> base = new RaftLog<>(new TermIndex(1, 1L), entry);
+        try {
+            final java.lang.reflect.Field field = RaftLog.class.getDeclaredField("termIndex");
+            field.setAccessible(true);
+            field.set(base, null);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the null term index", e);
+        }
+    }
+
+    /**
+     * Forge a log the {@link RaftLog} constructor would never produce (a null entry):
+     * the carrier the apply intake must refuse before it dereferences the entry.
+     */
+    private static RaftLog<?> forgeNullEntry(TermIndex termIndex) {
+        final RaftLog<?> base = new RaftLog<>(termIndex, "placeholder");
+        try {
+            final java.lang.reflect.Field field = RaftLog.class.getDeclaredField("entry");
+            field.setAccessible(true);
+            field.set(base, null);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the null entry", e);
+        }
+    }
+
+    @Test
+    void testApplyIntakeGuards() {
+        // Ctor intake: a null dependency must be refused before any bus wiring, naming
+        // the refused argument (a bare NPE pre-guarantee is indistinguishable from a
+        // failure deeper in the wiring)
+        final NullPointerException busRefusal = assertThrows(NullPointerException.class,
+                () -> new StateMachineBridge(null, new PartitionMap(new EventBus(), 4)));
+        assertEquals("eventBus", busRefusal.getMessage(), "A null event bus must name the event bus");
+        final NullPointerException mapRefusal = assertThrows(NullPointerException.class,
+                () -> new StateMachineBridge(new EventBus(), null));
+        assertEquals("partitionMap", mapRefusal.getMessage(), "A null partition map must name the partition map");
+
+        // Carrier intake: LogsCommitted is the last unguarded public carrier in the
+        // event family -- a null list and a nulled element (a shape List.of would itself
+        // refuse) must both be refused
+        assertThrows(NullPointerException.class, () -> new LogsCommitted(null));
+        assertThrows(NullPointerException.class,
+                () -> new LogsCommitted(Arrays.asList((RaftLog<?>) null)));
+
+        // Event intake: a null event on the shared bus must be refused, not silently ignored
+        final IllegalArgumentException eventRefusal = assertThrows(IllegalArgumentException.class,
+                () -> bridge.onEvent(null));
+        assertEquals("event must not be null", eventRefusal.getMessage(), "A null event must name the event");
+
+        // Apply axes: a construction-bypassed log (null term index / null entry) must be
+        // refused at the publish call site, not dereferenced (the bus is synchronous)
+        final IllegalArgumentException termRefusal = assertThrows(IllegalArgumentException.class,
+                () -> nodeEventBus.publish(new LogsCommitted(
+                        List.of(forgeNullTermIndex(input("key1", "value1"))))));
+        assertEquals("term index must not be null", termRefusal.getMessage(),
+                "A null term index must name the term index");
+        final IllegalArgumentException entryRefusal = assertThrows(IllegalArgumentException.class,
+                () -> nodeEventBus.publish(new LogsCommitted(
+                        List.of(forgeNullEntry(new TermIndex(1, 1L))))));
+        assertEquals("entry must not be null", entryRefusal.getMessage(),
+                "A null entry must name the entry");
+
+        // Whole-batch semantics (the 6(t) precedent): a forged log anywhere in the
+        // list refuses the entire batch with zero state change -- the legitimate
+        // entries in it must not be half-applied
+        final IllegalArgumentException batchRefusal = assertThrows(IllegalArgumentException.class,
+                () -> nodeEventBus.publish(new LogsCommitted(
+                        List.of(new RaftLog<>(new TermIndex(1, 1L), input("good", "value1")),
+                               forgeNullTermIndex(input("bad", "value2"))))));
+        assertEquals("term index must not be null", batchRefusal.getMessage());
+        assertTrue(partitionMap.getData("good").isEmpty(),
+                "A refused batch must not be partially applied");
+        assertEquals(0L, bridge.getLastAppliedIndex(),
+                "A refused batch must not move the applied position");
+
+        // And the bridge remains fully usable: a legitimate commit still applies
+        commit(new RaftLog<>(new TermIndex(1, 1L), input("good", "value1")));
+        assertTrue(partitionMap.getData("good").isPresent(),
+                "A legitimate commit after a refused batch must still apply");
+        assertEquals(1L, bridge.getLastAppliedIndex());
     }
 }

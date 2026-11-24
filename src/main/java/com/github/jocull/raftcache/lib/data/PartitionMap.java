@@ -63,17 +63,32 @@ public class PartitionMap {
     }
 
     public Optional<KeyDataOutput> getData(String key) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         return partitionMap.get(getPartitionForKey(key))
                 .getEntry(key)
                 .map(dataVersion -> new KeyDataOutput(key, dataVersion.getData(), dataVersion.getVersion()));
     }
 
     public void setData(KeyDataInput input) {
+        if (input == null) {
+            throw new IllegalArgumentException("input must not be null");
+        }
+        if (input.getKey() == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        if (input.getData() == null) {
+            throw new IllegalArgumentException("data must not be null");
+        }
         final long version = globalVersion.incrementAndGet();
         partitionMap.get(getPartitionForKey(input.getKey())).setEntry(input.getKey(), new DataVersion(input.getData(), version));
     }
 
     public boolean deleteData(String key) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         final long version = globalVersion.incrementAndGet();
         return partitionMap.get(getPartitionForKey(key)).deleteEntry(key, version);
     }
@@ -86,6 +101,15 @@ public class PartitionMap {
      *         expired is not resurrected -- the replicated no-op case)
      */
     public boolean expireData(KeyDataExpireInput input) {
+        if (input == null) {
+            throw new IllegalArgumentException("input must not be null");
+        }
+        if (input.getKey() == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        if (input.getTtl() == null) {
+            throw new IllegalArgumentException("ttl must not be null");
+        }
         final long version = globalVersion.incrementAndGet();
         final long now = clock.millis();
         return partitionMap.get(getPartitionForKey(input.getKey()))
@@ -153,6 +177,21 @@ public class PartitionMap {
      * still strictly newer.
      */
     public synchronized void restore(Map<String, DataVersion> state) {
+        if (state == null) {
+            throw new IllegalArgumentException("state must not be null");
+        }
+        // Validate every entry before the state is touched at all: a null key or
+        // value -- a shape a captured state would never carry, but a HashMap would --
+        // refuses the whole restore with zero state change (no partition mutation,
+        // no version fast-forward).
+        for (final Map.Entry<String, DataVersion> entry : state.entrySet()) {
+            if (entry.getKey() == null) {
+                throw new IllegalArgumentException("key must not be null");
+            }
+            if (entry.getValue() == null) {
+                throw new IllegalArgumentException("state value must not be null");
+            }
+        }
         long maxVersion = 0L;
         final Map<Partition, Map<String, DataVersion>> byPartition = new HashMap<>(partitionMap.size());
         for (final Map.Entry<String, DataVersion> entry : state.entrySet()) {
