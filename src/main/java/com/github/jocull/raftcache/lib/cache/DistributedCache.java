@@ -53,9 +53,9 @@ public class DistributedCache implements AutoCloseable {
     private final StateMachineBridge stateMachineBridge;
 
     public DistributedCache(EventBus clusterEventBus, List<RaftNode> nodes, PartitionMap partitionMap) {
-        Objects.requireNonNull(clusterEventBus);
-        Objects.requireNonNull(nodes);
-        Objects.requireNonNull(partitionMap);
+        Objects.requireNonNull(clusterEventBus, "clusterEventBus");
+        Objects.requireNonNull(nodes, "nodes");
+        Objects.requireNonNull(partitionMap, "partitionMap");
         if (nodes.isEmpty()) {
             throw new IllegalArgumentException("nodes must not be empty");
         }
@@ -83,8 +83,12 @@ public class DistributedCache implements AutoCloseable {
      * with {@link IllegalStateException}; retries are the caller's responsibility.
      */
     public CompletableFuture<RaftLog<KeyDataInput>> put(String key, Map<String, byte[]> data) {
-        Objects.requireNonNull(key);
-        Objects.requireNonNull(data);
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        if (data == null) {
+            throw new IllegalArgumentException("data must not be null");
+        }
         return findLeaderNode()
                 .thenCompose(leader -> leader.submit(new KeyDataInput(key, data)));
     }
@@ -99,7 +103,9 @@ public class DistributedCache implements AutoCloseable {
      * still completes normally, so retries are safe.
      */
     public CompletableFuture<RaftLog<KeyDataDeleteInput>> delete(String key) {
-        Objects.requireNonNull(key);
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         return findLeaderNode()
                 .thenCompose(leader -> leader.submit(new KeyDataDeleteInput(key)));
     }
@@ -118,8 +124,12 @@ public class DistributedCache implements AutoCloseable {
      * never resurrected.
      */
     public CompletableFuture<RaftLog<KeyDataExpireInput>> expire(String key, Duration ttl) {
-        Objects.requireNonNull(key);
-        Objects.requireNonNull(ttl);
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        if (ttl == null) {
+            throw new IllegalArgumentException("ttl must not be null");
+        }
         return findLeaderNode()
                 .thenCompose(leader -> leader.submit(new KeyDataExpireInput(key, ttl)));
     }
@@ -128,7 +138,9 @@ public class DistributedCache implements AutoCloseable {
      * Returns the current value for {@code key} from the local state machine view, if present.
      */
     public Optional<KeyDataOutput> get(String key) {
-        Objects.requireNonNull(key);
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
         return partitionMap.getData(key);
     }
 
