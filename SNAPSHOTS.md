@@ -32,6 +32,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(r) | non-happy-path hardening (sixteenth pass, the 6(g) term axis on the `RaftLogs` intake — the last consumer in the chain behind the sealed wire guards): `compact()` guarded `index < 0` but never `term < 0`, and `commit()` had no guard at all but the index bounds (a null NPEd out of `getIndex()`; a forged `(-1,k)` passes both), sticking into `snapshotBoundary`/`startSeed`/`currentTermIndex` (full install) or `committedTermIndex`, inverting the term-first `TermIndex.compareTo` the committed filter and `rollback()` depend on — committed entries re-served (double-apply) or the pending ones dropped with their acks, and `rollback()` tearing out the committed prefix alongside the uncommitted tail. The axis had looked sealed because the existing negative-<i>index</i> pin was actually pinning the `TermIndex` constructor (it throws inside the pin's own expression) — the same construction-guard illusion that blinded the 6(p) store audit. Both intakes now refuse a null or negative-axis pointer (IAE, the `isHostileWireTermIndex` shape) before ANY state change, with pins carrying the zero-state-change contract and the double-serve/drop discriminator | `stage 6(r)` |
 | 6(s) | non-happy-path hardening (seventeenth pass, the `RaftLogs` content intake — the one append path not construction-guarded): all four public append overloads funnel into `appendLogInternal(TermIndex, T)`, and the int overloads reach it only through the `TermIndex` constructor (IAE on both negative axes) — so the raw overload is the one intake a 6(n)/6(p)-shaped construction-bypassed carrier or a null can reach, and it had no guards at all, right next to the 6(r) guards that had just sealed its sibling intakes. Four live shapes, all RED-confirmed pre-fix: **null pointer** NPE'd in the conflict walk (the log is never empty — it is seeded with the epoch); a **forged negative term** could replace nothing (a negative term outranks no existing entry) but is also never "before" one under the term-first `compareTo`, so it fell out of the walk as an ISE "log gap" — the wrong family for a contract refusal; a **forged negative index** tripped `isReplacementOf` against the epoch seed (1 > 0 and -1 <= 0) and the conflict sweep destroyed the ENTIRE log before the forged record lodged below the true tail — state-destroying, with a completed future for index -1 in the caller's hand and the recorded tail a phantom the deque no longer holds; and a **null entry** NPE'd out of the record construction at a new index while silently no-oping (returning the existing record, the entry never read) at an existing one. The gate now refuses the null pointer, the negative-axis pointer, and the null entry at the head of the method, before the iterator touches the deque — one guard covering all four overloads through the funnel, carrying the zero-state-change and next-append-lands-past-the-tail discriminators | `stage 6(s)` |
 | 6(t) | non-happy-path hardening (eighteenth pass, the `RaftLogs` read + notification surfaces — the last unguarded public intakes on a class whose mutation intakes 6(r)/6(s) just sealed): `containsStartPoint`, `getLogRange`, and `notifyCommitted` were raw. All RED-confirmed pre-fix: a **null pointer** NPE'd at the `containsStartPoint` `startSeed` equality check or in the `getLogRange` stream filter; a **null transform** NPE'd at the `map` step; **forged negative axes** were silently answered "not contained" or served a range computed off a pointer no `TermIndex` may hold (the range filter indexes the index axis only, so a forged term was ignored and a forged negative index served a wider range than asked); `notifyCommitted(**null)**` NPE'd in the for-each, and a **null element** was skipped with no trace (`instanceof` is simply false) — the caller cannot tell a refusal from a skipped acknowledgement, and the good neighbours completed *first*. Each gate now refuses a null pointer / negative-axis pointer / null transform / null list / null element before touching the list — in `notifyCommitted` validating the WHOLE list before completing ANY future, so a mixed-list refusal is zero-state-change — carrying the zero-state-change, legitimate-range-still-served, and legitimate-ack-still-completes-a-waiting-client discriminators | `stage 6(t)` |
+| 6(u) | non-happy-path hardening (nineteenth pass, the pending-request registry — the last raw in-process intake sitting between the sealed wire (6(g)–6(n)) and the sealed log (6(r)–6(t)): `NodeRequests` is the sole request/response correlation point; `NodeConnectionOutboundImpl` is its only caller and funnels BOTH `sendStateRequest` and `receive(StateResponse)` through it, yet neither intake had a single gate. RED-confirmed pre-fix (the pin's first two failures): a **null request** NPE'd synchronously at the `pendingRequests.put(request.getRequestId(), …)` key dereference while the already-scheduled delayed-cancellation task NPE'd a SECOND time, invisibly, 5 s later inside the common pool; a **null response** into `completeRequest` NPE'd at `response.getRequestId()` (the wrong family, both). The remaining shapes are confirmed from the same source walk and guarded in the same pass: a **null response class** was accepted and NPE'd *later*, inside the caller's own future, at `isAssignableFrom(null)` (wrong time, wrong place); a **null requestId** — reachable only via a construction-bypassed carrier (the 6(n)/6(p) shape; the constructors seed the id in-field and can never produce one) — was silently accepted as a legal `HashMap` null key, so two such requests collide on ONE entry and a completion under that key resolved the *WRONG* pending future (talking past each other), and a null-id response carrier fell into the `pending == null` early return and was dropped with no trace — indistinguishable from the legitimate unknown-id discard, and masked in practice by the 5 s cancellation timeout. Both intakes now refuse at the method head in the 6(r)–6(t) IAE family — `getRequestFuture` refusing request / request id / response class before the executor or the map is touched, `completeRequest` refusing response / response id before the map lookup — carrying the legitimate-roundtrip-still-completes-the-waiting-caller and unknown-id-still-a-silent-no-op discriminators | `stage 6(u)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -133,7 +134,21 @@ off a pointer no `TermIndex` may hold, a null list NPE'd in the for-each, and a
 null element was skipped so silently a caller could not tell a refusal from a
 skipped acknowledgement (its good neighbours completing first); the gates now
 refuse all five hostile shapes before the list is touched, and in
-`notifyCommitted` before any future is completed; see §7).
+`notifyCommitted` before any future is completed; see §7); and after stage 6(u):
+**387 tests green, 0 failures, 1 pre-existing skip** (+1: the pending-request
+registry — the last raw in-process intake between the sealed wire and the
+sealed log: `NodeConnectionOutboundImpl` is its only caller and funnels
+both `sendStateRequest` and `receive(StateResponse)` through `NodeRequests`,
+yet neither intake had a gate: a null request NPE'd at
+the `put` key dereference (and the already-scheduled cancellation task would NPE
+again, invisibly, 5 s later), a null response NPE'd at `getRequestId()`, a null
+response class was accepted then NPE'd later inside the caller's own future, and
+a null requestId — the construction-bypassed carrier the 6(n)/6(p) passes
+established — was silently accepted as a legal `HashMap` null key (a second such
+request overwrites the first's pending future, a completion under that key can
+resolve the wrong one) or dropped with no trace, indistinguishable from the
+legitimate unknown-id discard; both intakes now refuse at the method head in the
+same IAE family; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1490,3 +1505,79 @@ the stream, or any future is touched. The pointer+carrier family the house has b
 closing since 6(g) — wire (6(g)–6(n)), store (6(o)–6(p)), log (6(r)–6(s) + this pass) —
 now enforces one contract at every in-process entry point: a pointer is legitimate iff
 it is non-null and both axes non-negative, and a list is legitimate iff it holds no nulls.
+
+**Non-happy-path hardening pass, nineteenth round (2026-11-24, stage 6(u))** — the
+PENDING-REQUEST REGISTRY: `NodeRequests`. 6(g)–6(n) sealed the wire, 6(o)–6(p) the store,
+6(r)–6(t) the log — but between wire and behaviour there was one raw intake none of those
+passes touched, because it carries no wire shape at all: the in-process correlation registry
+that `NodeConnectionOutboundImpl` — its only caller — funnels `sendStateRequest` into
+(`getRequestFuture`) and `receive(StateResponse)` through (`completeRequest`). Everything
+around it is guarded; the registry itself was the hop where a hostile carrier could still
+walk in and corrupt the correlation state of the very requests the sealed intakes had just
+validated.
+
+The surface. `getRequestFuture(request, responseClass)` schedules a delayed executor
+(5 s) that will cancel the pending future, builds the `thenApply` chain that validates the
+arriving response against `responseClass`, and registers the pending future keyed by
+`request.getRequestId()` before returning it to the caller. `completeRequest(response)`
+looks up the pending future by `response.getRequestId()` and either silently returns
+(`pending == null`) or completes it with the arrived response. The registry's only state is
+the `pendingRequests` map and the futures it holds.
+
+Neither intake had a single gate. The pre-fix behaviors (the first two RED-confirmed by the
+pin before the fix; the remainder confirmed from the source walk, guarded in the same pass):
+- **null request** (RED-confirmed): NPE, synchronously, at the `pendingRequests.put(request.getRequestId(), …)`
+  key dereference — and, in parallel, the delayed-cancellation task was already scheduled
+  and would NPE a **second** time, invisibly, 5 s later inside the common pool: the wrong
+  family, plus a deferred failure the caller can never see.
+- **null response** (RED-confirmed): NPE at `response.getRequestId()` — wrong family.
+- **null response class**: the call silently succeeds; the NPE arrives **deferred**, inside
+  the *caller's own future*, when the response arrives (`isAssignableFrom(null)`): an error
+  that surfaces at the wrong time, in the wrong place, as a failure of a future the caller
+  is holding.
+- **null requestId, request side** (the 6(n)/6(p) construction-bypassed carrier — the
+  constructors seed the id in a field initializer and can never produce one; only a
+  deserialized stream or a subclass override can): `HashMap` accepts `null` **as a key**, so
+  the call silently succeeds, the entry is registered, and *two* such requests collide on
+  the ONE null-keyed entry — the second registration overwrites the first's pending future,
+  and a completion under that key resolves whichever entry happens to be there: the WRONG
+  pending future (talking past each other), or a 5 s cancellation task cancelling a future
+  whose caller is still waiting.
+- **null-id response carrier**: `pendingRequests.get(null)` silently early-returns —
+  dropped with no trace, indistinguishable from the *legitimate* unknown-id discard (that
+  axis's existing contract is "unknown completions are ignored", and this is the hostile
+  version of it), masked in practice by the 5 s cancellation timeout the caller observes.
+
+The fix is the 6(r)–6(t) guard shape, at the head of BOTH intakes (the
+`isHostileWireTermIndex` / IAE family): `getRequestFuture` refuses `request == null`,
+`request.getRequestId() == null`, and `responseClass == null` BEFORE the executor is
+scheduled or the map is touched, so the null-request shape no longer even leaves a pending
+task; `completeRequest` refuses `response == null` and `response.getRequestId() == null`
+before the map lookup. The house contract extends by exactly one axis, continuing the
+6(t) closing sentence: a carrier is legitimate iff it is non-null, and a request/response
+pair is legitimate iff the request, the response, the expected class, and the correlation
+id that binds them are all non-null.
+
+**Pin (RED-confirmed before the fix, then GREEN), `NodeRequestsTest` new:**
+`testPendingRegistryGuards` — `getRequestFuture(null, StateResponse.class)` IAE (pre-fix:
+NPE at the `put` key dereference), `completeRequest(null)` IAE (pre-fix: NPE at
+`getRequestId()`), `getRequestFuture(validRequest, null)` IAE (pre-fix: silent success,
+NPE deferred into the caller's future), and `getRequestFuture(NullIdRequest,
+StateResponse.class)` / `completeRequest(NullIdResponse)` IAE (pre-fix: silent
+acceptance — null is a legal `HashMap` key). The null-id shapes are built with private
+static subclasses overriding `getRequestId()` to return null — the only in-repo way to
+produce a construction-bypassed carrier (the 6(n)/6(p) shape). Discriminators: a
+**legitimate round trip** — `getRequestFuture(liveRequest, StateResponse.class)` →
+`completeRequest(liveResponse)` → the caller's future resolves to exactly the awaited
+response within 1 s — still works; and a response with a **legitimate-but-unknown** id
+still lands on the silent `pending == null` no-op (the existing unknown-id contract is
+preserved; only hostile carriers are now refused).
+
+Isolated: `NodeRequestsTest` **1 green / 0 fail / 0 skip** (new test class).
+Full suite at this point: **387 tests green, 0 failures, 1 pre-existing skip**
+(+1 over the 6(t) baseline of 386). The wire→behaviour funnel is now closed at every
+in-process intake: wire (6(g)–6(n)), store (6(o)–6(p)), log (6(r)–6(t)), and the
+request/response bus (this pass). The pointer+carrier family the house has been closing
+since 6(g) enforces one contract at every in-process entry point: a pointer is legitimate
+iff non-null with both axes non-negative, a list iff it holds no nulls, and a
+request/response pair iff the carrier and its correlation id are non-null.

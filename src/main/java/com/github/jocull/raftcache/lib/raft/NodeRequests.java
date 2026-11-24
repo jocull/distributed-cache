@@ -16,6 +16,15 @@ class NodeRequests {
     private final Map<UUID, CompletableFuture<Response>> pendingRequests = new HashMap<>();
 
     public  <TRequest extends Request, TResponse extends Response> CompletableFuture<TResponse> getRequestFuture(TRequest request, Class<TResponse> tResponseClass) {
+        if (request == null) {
+            throw new IllegalArgumentException("request must not be null");
+        }
+        if (request.getRequestId() == null) {
+            throw new IllegalArgumentException("request id must not be null");
+        }
+        if (tResponseClass == null) {
+            throw new IllegalArgumentException("response class must not be null");
+        }
         // Prepare the request's timeout
         final Executor delayedExecutor = CompletableFuture.delayedExecutor(5, TimeUnit.SECONDS); // TODO: Is this timeout appropriate?
         final CompletableFuture<Void> requestCancellation = CompletableFuture.runAsync(() -> {
@@ -50,6 +59,12 @@ class NodeRequests {
     }
 
     public void completeRequest(Response response) {
+        if (response == null) {
+            throw new IllegalArgumentException("response must not be null");
+        }
+        if (response.getRequestId() == null) {
+            throw new IllegalArgumentException("response id must not be null");
+        }
         final CompletableFuture<Response> pending;
         synchronized (pendingRequests) {
             pending = pendingRequests.get(response.getRequestId());
