@@ -1986,6 +1986,12 @@ since 6(g) now closes its root: the bus every production subscriber sits on and 
 publisher delivers through — refusing a null subscriber before it parks, a null event
 before any fan-out, speaking the same axis names its own sealed consumers speak.
 
+**Addendum (2026-11-24).** `Replica`, named twice above as one of the bus's production-
+shaped subscribers, was never instantiated in `src/` (no `new Replica(`, no
+`lib.replication` import anywhere outside itself) — it has been deleted as dead code
+(infra-debt item 2, SCOPE.md Decision #4). The 6(y) pins above are unaffected: they
+drive `EventBus` itself, with subscribers in the same `instanceof`-filtering shape.
+
 **Non-happy-path hardening pass, twenty-fourth round (2026-11-24, stage 6(z))** — the
 public client API boundary: 6(v) sealed the apply/data plane at the boundary
 (`PartitionMap` intakes), 6(w) its carriers, 6(x) the key store they write through,

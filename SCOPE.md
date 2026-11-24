@@ -332,9 +332,16 @@ subsequently decided, fixed, and regression-tested):
    node removal is not part of phase 2. (Consequence: the downed-follower quorum path — a leader
    with a live follower disconnected — is untestable until this exists; the quorum fix above was
    verified with 1- and 2-node *up* clusters instead.)
-4. **`Replica` stub** — `lib/replication/Replica.java:15-19` is an empty `SetDataEvent` subscriber
-   ("Do something here!"). It represents the *map → replication* direction; the current design
-   feeds the map *from* Raft, so this stays a stub.
+4. **`Replica` stub** — *(resolved: infra-debt item 2, removed as dead code, 2026-11-24)*.
+   The original cut: `lib/replication/Replica.java:15-19` was an empty `SetDataEvent`
+   subscriber ("Do something here!"). It represented the *map → replication* direction; the
+   actual design feeds the map *from* Raft. **Resolution.** Verified it was never alive
+   anywhere — no
+   `new Replica(` and no `lib.replication` import in `src/` outside the class itself — so the
+   "keep the stub" framing had no subject left: the class and its package were deleted, and
+   the map→replication direction it sketched is still expressed by the real apply path (the
+   sealed `StateMachineBridge` intake). No test touches it; the EventBus 6(y) pins cover the
+   identical `instanceof`-filtering subscriber shape (SNAPSHOTS.md §6(y) addendum).
 5. **Deletion over Raft** — *(resolved: Signed-off work plan item 1, commit `40700d0`)*.
    The original cut: there is no log entry type distinguishing "set" from "delete"
    (`KeyDataInput` has no delete flag). The bridge applies `setData` only; a proper delete
@@ -448,10 +455,10 @@ which stay the detailed record.
    the pre-failure leader; after restore, assert it is no longer LEADER at an overtaken term —
    stepping down to follower is fine, and winning a fresh election at a *higher* term (becoming
    the current leader again) is fine; staying LEADER while another node holds leadership is not.
-9. **Carried from Decisions** — `disconnectFrom` (Decision #3), `Replica` stub (Decision #4),
-   and the `Main.java` cluster demo (Decision #7), plus the phase 3 network transport.
-   (`RaftLogs` performance, Decision #6, resolved 2026-11-24 with the O(1) tail-append
-   fast path.)
+9. **Carried from Decisions** — `disconnectFrom` (Decision #3) and the `Main.java` cluster
+   demo (Decision #7), plus the phase 3 network transport. (`RaftLogs` performance,
+   Decision #6, resolved 2026-11-24 with the O(1) tail-append fast path; `Replica` stub,
+   Decision #4, resolved the same day by removing it as dead code.)
 10. **Pre-Vote (optional Raft election extension)** — ~~explicitly deferred by the user on
     2026-11-20 ("Reframe now + Pre-Vote later")~~ **implemented 2026-11-21, commit
     `f35e60d` (242 tests green):** a follower's election timeout now runs a hypothetical
