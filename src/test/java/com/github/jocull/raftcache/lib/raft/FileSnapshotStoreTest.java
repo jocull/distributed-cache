@@ -137,6 +137,37 @@ class FileSnapshotStoreTest {
     }
 
     @Test
+    void aBoundaryWhoseTermIsNegative_isRejectedWithoutTearingOutTheValidSnapshot(@TempDir Path dir) {
+        // (6p) The save() argument guard checked boundary.getIndex() < 0 but never
+        // boundary.getTerm() < 0 — the TermIndex constructor rejects BOTH negative axes
+        // (the 6(g) root mechanism), which made the term axis look unreachable to this
+        // guard, exactly as the null-payload construction guard looked unreachable in 6(n).
+        // A forged/deserialized boundary (fields set without the constructor) reaches save()
+        // with a negative term, and there: the write target would be raft-snapshot--3-10.snap —
+        // a name parseBoundary can NEVER read back (the first dash is at position 0; parsing
+        // the empty pre-dash substring throws) — while deleteSuperseded runs BEFORE the
+        // unloadability is discoverable, tearing out the previous valid snapshot. A save that
+        // "succeeds" and leaves the store EMPTY: data loss with no throw, and a directory
+        // holding a file not even a foreign writer would leave. Refuse at the argument guard,
+        // in the shape of the sibling index guard: before any temp file, any write, any delete.
+        final FileSnapshotStore store = new FileSnapshotStore(dir);
+        store.save(new TermIndex(5, 10L), PAYLOAD_A);
+        final TermIndex forged = forgeTerm(-3, 10L);
+
+        assertThrows(IllegalArgumentException.class, () -> store.save(forged, PAYLOAD_B),
+                "a negative term is undefined: the constructor rejects it, and a forged one must not be persisted");
+
+        // THE DISTINGUISHING PART: the valid snapshot that was there BEFORE must still load —
+        // the "drop every earlier snapshot" pass is part of the mutation a refusal must avoid.
+        final SnapshotStore.Stored stored = store.loadLatest().orElseThrow(
+                () -> new AssertionError("a refused save must not have torn out the valid snapshot"));
+        assertEquals(new TermIndex(5, 10L), stored.boundary(),
+                "a rejected save must not delete the previously valid snapshot");
+        assertArrayEquals(PAYLOAD_A, stored.payload(), "the surviving snapshot's bytes are intact");
+        assertEquals(1, files(dir).size(), "a rejected save leaves no file behind — no unreadable --3-10 name, no .tmp");
+    }
+
+    @Test
     void aSnapshotNameThatNamesNoBoundary_isSkippedAndTheValidOneStillLoads(@TempDir Path dir) {
         // (6d) The directory may hold a file that has a snapshot's NAME SHAPE but not a boundary —
         // e.g. raft-snapshot-foo.snap left by a crashed writer or a foreign tool working in a shared
@@ -288,5 +319,23 @@ class FileSnapshotStoreTest {
         // 9-character POSIX form, writable "rwxrwxrwx", read-only "r-xr-xr-x". A null view
         // never reaches here (the platform gate already skipped the test).
         attributeView.setPermissions(PosixFilePermissions.fromString(writable ? "rwxrwxrwx" : "r-xr-xr-x"));
+    }
+
+    /**
+     * Forge a boundary the {@link TermIndex} constructor would never produce (a negative term):
+     * build a legal one, then set the field directly — the exact shape a deserialized or
+     * otherwise construction-bypassed carrier would reach a store with (the 6(n) mechanism,
+     * applied to the 6(g) term axis).
+     */
+    private static TermIndex forgeTerm(int term, long index) {
+        final TermIndex base = new TermIndex(0, index);
+        try {
+            final java.lang.reflect.Field field = TermIndex.class.getDeclaredField("term");
+            field.setAccessible(true);
+            field.set(base, term);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the boundary term", e);
+        }
     }
 }

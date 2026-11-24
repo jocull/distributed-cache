@@ -85,6 +85,9 @@ public interface SnapshotStore {
             if (boundary.getIndex() < 0) {
                 throw new IllegalArgumentException("Stored boundary index must not be negative: " + boundary);
             }
+            if (boundary.getTerm() < 0) {
+                throw new IllegalArgumentException("Stored boundary term must not be negative: " + boundary);
+            }
         }
     }
 }

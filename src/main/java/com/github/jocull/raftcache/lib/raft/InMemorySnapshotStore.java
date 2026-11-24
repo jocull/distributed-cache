@@ -24,6 +24,13 @@ public class InMemorySnapshotStore implements SnapshotStore {
     public void save(TermIndex boundary, byte[] payload) {
         Objects.requireNonNull(boundary, "boundary must not be null");
         Objects.requireNonNull(payload, "payload must not be null");
+        // The TermIndex constructor rejects both negative axes, which makes a negative term look
+        // unreachable — but a deserialized or otherwise construction-bypassed boundary reaches this
+        // guard with one (stage 6p). Refuse it in the shape of the sibling index guard, BEFORE the
+        // slot write, so a store save can never hold a boundary no state machine can have.
+        if (boundary.getTerm() < 0) {
+            throw new IllegalArgumentException("boundary term must not be negative: " + boundary);
+        }
         if (boundary.getIndex() < 0) {
             throw new IllegalArgumentException("boundary index must not be negative: " + boundary);
         }

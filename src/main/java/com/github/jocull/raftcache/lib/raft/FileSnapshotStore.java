@@ -73,6 +73,16 @@ public class FileSnapshotStore implements SnapshotStore {
         if (payload == null) {
             throw new IllegalArgumentException("payload must not be null");
         }
+        // The TermIndex constructor rejects both negative axes, which makes a negative term
+        // look unreachable — but a deserialized or otherwise construction-bypassed boundary
+        // reaches this guard with one (stage 6p). A negative term is not merely invalid, it is
+        // UNRECOVERABLE: snapshotFile() would name it raft-snapshot--N-K.snap, a name parseBoundary()
+        // can never read back, so this write would be the one loadLatest silently skips — while
+        // deleteSuperseded() below has already torn out every valid snapshot. Refuse BEFORE any
+        // temp file, any write, any delete, in the shape of the sibling index guard.
+        if (boundary.getTerm() < 0) {
+            throw new IllegalArgumentException("boundary term must not be negative: " + boundary);
+        }
         if (boundary.getIndex() < 0) {
             throw new IllegalArgumentException("boundary index must not be negative: " + boundary);
         }

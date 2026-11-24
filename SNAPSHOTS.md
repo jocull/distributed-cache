@@ -27,6 +27,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(m) | non-happy-path hardening (eleventh pass): the 6(k) identity family on the **append / pre-vote-response / install-snapshot surface** — the last audited handler surface the null-sender guard had not reached: the follower's `onAppendEntries` / `onPreVoteResponse` / `onInstallSnapshot` plus the candidate's and the leader's `onAppendEntries` now each **refuse a null sender before any term comparison, conversion, tally, grant, or install** (the 6(k) shape: warn, zero state change, no reply — a success-shaped ack would be strictly worse than silence). Malformed-by-construction and unreachable on the live wire (defense-in-depth for the direct-handler surface, as 6(l)); audit of the remaining surfaces (pre-vote request, candidate/leader pre-vote response, both ack paths, the leader's snapshot-response path) records why each needs no identity guard — see §7. Five closed vectors: a follower conversion with a high-term append under a null leader plus rollback of the uncommitted tail and a true `AcknowledgeEntries` to a connection nobody could name; a follower pre-vote tally where `preVoteGrants.add(null)` (legal for a `HashSet`) reaches the 3-node majority on ONE unattributed grant; a follower install-snapshot (payload adopt, log re-anchor, `SnapshotInstalled` publish, reply) for an unattributable leader; a candidate conversion to a null-leader follower before the re-dispatch even reaches the follower handler; and a live-leader step-down for an unauthenticated carrier | `stage 6(m)` |
 | 6(n) | non-happy-path hardening (twelfth pass): the last open axis of the message-`field` null family the 6(k)–6(m) identity passes left — not the sender (6(k)–6(m)), not a hostile term/index (6(g)–6(i)), not a null <i>slot</i> (6(j)), but a null <i>payload</i> inside an otherwise well-formed append entry. The wire `AppendEntries.RaftLog` constructor null-guards `entry` (`requireNonNull`), which made the shape look unreachable — but Java deserialization reconstructs fields without calling constructors, so a hostile or corrupted stream carries the payload past the construction guard, and on the direct-handler surface that is the one vector that reaches the accept path with an entry the construction layer never accepted. Without the extension the refusal was never even reached: `RaftLogs.appendLogInternal` deletes conflicting entries FIRST (real log state torn out) and only then NPEs out of `CompletableRaftLog` construction — the throw-after-mutation family 6(e)/6(g)/6(h) closed on the other axes, here through a different field. `hasHostileWireTermIndex` now classifies `entry.getEntry() == null` in the same per-entry pass (alongside the 6(h) hostile term/index and the 6(j) null slot), so the follower's `onAppendEntries` refuses in the established 6(g)/6(h)/6(j) shape before ANY mutation — before `containsStartPoint`, before the leader install, before the append — one false ack answering in OUR term with OUR unchanged tail, zero state change (no leader, no append, no commit move, nothing applied). A null payload is structurally invalid exactly like a null slot or a missing term/index, so it is refused, not negotiated (no clamping); the full message-`field` null audit — the sealed matrix of every remaining carrier and why each needs no guard (consumer-inert reads, primitive-only fields, and the construction-guarded rest) — is recorded in §7 | `stage 6(n)` |
 | 6(o) | non-happy-path hardening (thirteenth pass, audit sweep of the `SnapshotStore` file surface): the empty-<i>body</i> axis of the 6(d) family — a file whose NAME parses to a valid boundary but whose body is ZERO BYTES (`raft-snapshot-99-99.snap` in a shared directory, left by a crashed or foreign writer: both `save()`s reject an empty payload, so the shape cannot come from this store) — was being handed back as a `Stored` (the record null-checks the payload but not its length) and, named for a higher boundary than the real snapshot, MAX-BY-BOUNDARY masked the real one. `loadLatest` now warns and skips empty-payload files in the collect pass — parallel to the 6(d) unparseable-name skip (a hollow body is a no-snapshot, left in place, never allowed to blow up an otherwise clean load), and the `Stored` record completes the invariant symmetric with `save()` by rejecting an empty payload (defense-in-depth; the skip in `loadLatest` is the behavioral fix). Two pins: a hollow file named for a higher boundary is invisible to `loadLatest` (the real snapshot still wins, bytes intact, hollow file left in place) and a hollow-only directory loads as `Optional.empty()` instead of a `Stored` with an empty payload | `stage 6(o)` |
+| 6(p) | non-happy-path hardening (fourteenth pass, the store `save()` argument surface on a 6(g)-family axis): the negative-<i>term</i> axis — the `TermIndex` constructor rejects BOTH negative axes (the 6(g) root mechanism), which made the axis look unreachable to the store guards, but a deserialized/construction-bypassed boundary reaches `save()` with one; both `save()`s guarded `boundary.getIndex() < 0` and never `boundary.getTerm() < 0`, so a `(-3,10)` boundary wrote `raft-snapshot--3-10.snap` — a name `parseBoundary` can never read back (the first dash is at position 0) — AFTER `deleteSuperseded` had torn out the valid snapshot: a "successful" save leaving the store EMPTY, data loss with no exception (worse than the 6(o) masking, where the real snapshot still existed); `InMemorySnapshotStore` stored the forged boundary and handed it back. Both `save()`s now refuse a negative term before any temp file, write, or delete (the shape of the sibling index guard), and the shared `Stored` record completes the axis (defense-in-depth, symmetrical with the 6(o) empty-payload completion) | `stage 6(p)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -75,7 +76,19 @@ green, 0 failures, 1 pre-existing skip** (+2: the empty-<i>body</i> axis of the
 6(d) family — a valid-named zero-byte snapshot file in a shared directory is now
 a no-snapshot that `loadLatest` warns and skips instead of a `Stored` that
 max-by-boundary could use to MASK the real one; the `Stored` record also completes
-the invariant symmetric with `save()`; see §7).
+the invariant symmetric with `save()`; see §7); and after
+stage 6(p): **379 tests green, 0 failures, 1 pre-existing
+skip** (+3: the negative-<i>term</i> axis of the 6(g) root mechanism
+reaching the store `save()` argument surface — while the `TermIndex`
+constructor rejects both negative axes (which is exactly what made this
+axis look unreachable), both `save()`s guarded only the index, so a
+deserialized/construction-bypassed `(-3,10)` boundary would write
+`raft-snapshot--3-10.snap` — a name `parseBoundary` can never read back —
+in a `FileSnapshotStore` that has already deleted the valid snapshot
+(data loss with no exception), or been handed back by
+`InMemorySnapshotStore.loadLatest`; both stores now refuse it before any
+write or delete, and the `Stored` record completes the axis as
+defense-in-depth; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1051,3 +1064,81 @@ baseline of 374). The file-surface family is now closed across all three axes
 6(c)/6(d)/6(o) map it — a name that does not parse (6(d)), a body that is empty
 (6(o)), and the max-by-boundary selection invariant both rely on — with `save()`,
 `loadLatest`, and the `Stored` record agreeing on what a legitimate `Stored` is.
+
+**Non-happy-path hardening pass, fourteenth round (2026-11-24, stage 6(p))** — the
+negative-<i>term</i> axis of the 6(g) root mechanism on the store `save()`/`Stored`
+surface. 6(g) established the root mechanism (`TermIndex`'s constructor throws IAE on
+a negative term or index, and a consumer feeding an unguarded wire value into it
+breaks mid-mutation) and 6(g)–6(i) sealed every message-handler feed-in the sweep
+could find. The 6(o) sweep then ruled the `save()` input surface sealed: `save` valid­ates
+boundary (null, negative index) and payload (null, empty) BEFORE any temp file, any
+write, any delete — and `TermIndex`'s constructor rejecting BOTH negative axes was taken
+as the reason no guard for the term axis was needed. That reasoning holds only for
+constructor-built boundaries: the 6(n) pass established that deserialization (the same
+mechanism the 6(n) pin forges) reconstructs fields WITHOUT calling constructors, so a
+construction-bypassed `TermIndex` can carry a negative `term` past the very guard that
+made the axis look sealed. The store guards checked `boundary.getIndex() < 0` and
+NEVER `boundary.getTerm() < 0`; the shared `Stored` record had the same one-sided
+check. This is the 6(n) shape (a guard that looks like a non-seal, reachable only via
+the construction-bypass path) applied to the 6(g) axis — and like 6(g) the consequence
+is silent data loss, not merely a wrong value:
+
+- `FileSnapshotStore.save` would write the boundary `(-3,10)` as
+  `raft-snapshot--3-10.snap`. `parseBoundary` splits on the FIRST dash and finds it at
+  position 0, so `Integer.parseInt("")` throws before the boundary is even compared to
+  a valid one — a name that no reader, ever, can recover (the 6(d) skip would WARN on
+  it, but that is diagnosis, not recovery). And because `deleteSuperseded` runs BEFORE
+  the write (the retain-latest contract, stage 6b), the previously valid snapshot is
+  torn out before the unreadable write would become discoverable. The "successful"
+  `save` left an EMPTY store and a directory holding a file no one can load: a forged
+  boundary deleting real state with no exception — strictly worse than the 6(o)
+  masking, where at least the real snapshot still existed, merely not selected.
+- `InMemorySnapshotStore.save` accepted the forged boundary into the single slot and
+  `loadLatest` handed it back — a `Stored` naming a boundary no state machine can have
+  (terms are non-negative; the epoch is `(0,0)`). The record's 6(o) completion closed
+  the payload-length door one step before; the term door was the one left open.
+
+The fix is the 6(o) layered shape on the new axis — behavioral guard at the entry,
+record completion as defense-in-depth:
+
+- Both `save()`s (`FileSnapshotStore`, `InMemorySnapshotStore`) now refuse
+  `boundary.getTerm() < 0` with IAE BEFORE any temp file, any directory listing, any
+  delete, any slot write — in the shape of the sibling index guard already present, so
+  the guard set no longer depends on `TermIndex`'s constructor being the only
+  structural check the store can rely on (it was not, on the 6(n) axis).
+- The shared `SnapshotStore.Stored` record (null boundary, null payload, empty payload
+  after 6(o), negative index) now also rejects a negative term. The record is the
+  store-INDEPENDENT line of defense: a future `SnapshotStore` implementation whose
+  `save` forgets the axis still cannot hand the shape back through a record.
+
+Ordering is the load-bearing detail and it shaped the pin: the refusal must land at
+the guard (step 1 of `save`), not the delete step. The pre-fix data-loss path was
+validate → delete superseded → write, failing at step 3 on an input that was invalid
+at step 1. The 6(o) pins asserted the hollow file survives; this pin asserts the
+OPPOSITE survivor — the pre-existing VALID snapshot must still load — because the
+pre-fix path deletes it. A "leaves no file" assertion would have passed against the
+pre-fix delete-then-write order; asserting the valid snapshot's survival is what
+distinguishes a refusal from the data loss. The InMemory pair pins the slot-stays-empty
+and record-refusal halves symmetric with the file pin's no-leftover-file and no-lost-
+snapshot halves.
+
+**Pins, three total:** `FileSnapshotStoreTest#aBoundaryWhoseTermIsNegative_isRejectedWithoutTearingOutTheValidSnapshot`
+— a valid `(5,10)` save, then a forged `(-3,10)` save into the same directory: the
+refusal throws, the pre-existing valid snapshot STILL LOADS (boundary and bytes
+intact), and no unreadable `--3`-named file is left behind.
+`InMemorySnapshotStoreTest#aBoundaryWhoseTermIsNegative_isRejectedAndStoresNothing`
+— the save throws and the slot remains empty.
+`InMemorySnapshotStoreTest#aStoredWhoseBoundaryTermIsNegative_isRejectedByTheRecordItself`
+— the `Stored` record itself refuses the forged boundary, pinning the store-independent
+layer so the invariant holds even for a store that forgets the axis. All three forge
+via the established 6(n) idiom — build a legal `TermIndex(0, index)`, then set the
+private final `term` field reflectively to `-3` — the exact shape a deserialized or
+construction-bypassed carrier would deliver and the one the constructor forbids.
+
+Isolated: `FileSnapshotStoreTest` **14 green / 0 fail / 0 skip** (13 baseline + 1);
+`InMemorySnapshotStoreTest` **9 green / 0 fail / 0 skip** (7 baseline + 2). Full suite
+at this point: **379 tests green, 0 failures, 1 pre-existing skip** (+3 over the 6(o)
+baseline of 376). The store-input surface and the record now share one answer to
+"what is a legitimate `Stored`": non-null, non-empty payload, non-negative term,
+non-negative index — the `TermIndex` constructor's contract, enforced at every entry
+point the constructor does not reach.

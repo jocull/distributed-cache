@@ -92,4 +92,56 @@ class InMemorySnapshotStoreTest {
         assertNotNull(store.loadLatest().orElseThrow(), "an (0,0) boundary round-trips like any other");
         assertEquals(new TermIndex(0, 0L), store.loadLatest().orElseThrow().boundary());
     }
+
+    @Test
+    void aBoundaryWhoseTermIsNegative_isRejectedAndStoresNothing() {
+        // (6p) The save() guard checked boundary.getIndex() < 0 but never boundary.getTerm() < 0.
+        // A negative term is unreachable in normal construction (the TermIndex constructor rejects
+        // BOTH axes — the 6(g) root mechanism), which made the axis look unguarded-but-harmless,
+        // exactly as the null-payload construction guard looked unreachable in 6(n). A forged or
+        // deserialized boundary (fields set without the constructor) reaches save() with term < 0,
+        // and before the fix it was stored and handed back by loadLatest — a Stored naming a
+        // boundary no state machine can have. Refuse at the argument guard, the shape of the
+        // sibling index guard: before the slot write.
+        final InMemorySnapshotStore store = new InMemorySnapshotStore();
+        final TermIndex forged = forgeTerm(-3, 10L);
+
+        assertThrows(IllegalArgumentException.class, () -> store.save(forged, PAYLOAD_A),
+                "a negative term is undefined and must not be stored");
+        assertTrue(store.loadLatest().isEmpty(), "a rejected save stores nothing");
+    }
+
+    @Test
+    void aStoredWhoseBoundaryTermIsNegative_isRejectedByTheRecordItself() {
+        // (6p) The shared SnapshotStore.Stored record is the store-independent line of defense.
+        // It already refused a negative INDEX (and null, and — after 6(o) — an empty payload),
+        // but not a negative TERM: a forged boundary slipped through a store save and was only
+        // caught if that store remembered to check. The record must name only a boundary the
+        // TermIndex constructor could produce, so the invariant holds even for a store that
+        // forgets the term axis. Refusing at the record is defense-in-depth one layer up from
+        // the save() guard; the save() guard is the behavioral fix (refuse before any write).
+        final TermIndex forged = forgeTerm(-3, 10L);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new SnapshotStore.Stored(forged, PAYLOAD_A),
+                "the record must not name a boundary that is structurally invalid (a negative term)");
+    }
+
+    /**
+     * Forge a boundary the {@link TermIndex} constructor would never produce (a negative term):
+     * build a legal one, then set the field directly — the exact shape a deserialized or
+     * otherwise construction-bypassed carrier would reach a store with (the 6(n) mechanism,
+     * applied to the 6(g) term axis).
+     */
+    private static TermIndex forgeTerm(int term, long index) {
+        final TermIndex base = new TermIndex(0, index);
+        try {
+            final java.lang.reflect.Field field = TermIndex.class.getDeclaredField("term");
+            field.setAccessible(true);
+            field.set(base, term);
+            return base;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to forge the boundary term", e);
+        }
+    }
 }
