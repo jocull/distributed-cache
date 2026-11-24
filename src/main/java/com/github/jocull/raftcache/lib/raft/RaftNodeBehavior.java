@@ -1,10 +1,12 @@
 package com.github.jocull.raftcache.lib.raft;
 
 import com.github.jocull.raftcache.lib.raft.messages.*;
+import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.stream.Collectors;
 
 abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
@@ -34,6 +36,20 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
 
     @Override
     public void onIntroduction(NodeConnectionOutbound sender, Introduction introduction) {
+        // Stage 6(k) (SNAPSHOTS.md stage 6(k)): a well-formed introduction is the only
+        // shape this handler acts on. The message carrier is bare, so a hostile intro can
+        // carry a missing id or a missing address; both are refused here, BEFORE the
+        // connection is bound, the node is registered, or a reply is sent: an unbound
+        // connection and an unchanged topology, with a log -- exactly the no-reply
+        // refusal shape the family uses where the handler has no ack to carry one.
+        if (introduction == null
+                || isInvalidNodeIdentifier(introduction.getId(), introduction.getNodeAddress())) {
+            LOGGER.warn("{} Introduction from {} carries a missing node identifier ({}) - refusing; "
+                            + "the connection stays unbound, nothing is registered, no topology is announced",
+                    self.getId(), sender.getRemoteNodeAddress(), introduction);
+            return;
+        }
+
         // Mark the connection with the identifying node
         sender.setRemoteNodeId(introduction.getId());
 
@@ -56,8 +72,39 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
 
     @Override
     public void onAnnounceClusterTopology(NodeConnectionOutbound sender, AnnounceClusterTopology announceClusterTopology) {
+        // Stage 6(k) (SNAPSHOTS.md stage 6(k)): the announced topology is admitted as ONE
+        // transaction. Both node-identifier carriers are bare, so the list can hold an
+        // entry with a missing id (a null map key: legal for HashMap, but it inflates
+        // getMajorityCount() and votes can never target it -- quorum DoS) or a missing
+        // address (NPEs the first locate()). Refuse the WHOLE announce before registering
+        // any of it, rather than registering the valid entries and throwing on the bad one.
+        final List<com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier> announced =
+                announceClusterTopology == null
+                        ? List.of()
+                        : announceClusterTopology.getNodeIdentifierStates();
+        if (announceClusterTopology == null
+                || announced.stream().anyMatch(i -> i == null
+                        || isInvalidNodeIdentifier(i.getId(), i.getNodeAddress()))) {
+            LOGGER.warn("{} AnnounceClusterTopology from {} carries a missing node identifier ({}) - refusing; "
+                            + "nothing is registered and the sender stays unbound",
+                    self.getId(), sender.getRemoteNodeAddress(), announceClusterTopology);
+            return;
+        }
+
+        // Still unbound? The address must already be resolvable -- against what we hold or
+        // what the announce lists (a node announces itself, so its own view contains its
+        // own address). Checked BEFORE registering so a miss refuses the transaction
+        // instead of throwing out of locate() after the topology has already moved.
+        if (sender.getRemoteNodeId() == null
+                && !canResolveAddress(sender.getRemoteNodeAddress(), announced)) {
+            LOGGER.warn("{} AnnounceClusterTopology from unresolvable address {} - the announce does not "
+                            + "name the sender and we do not hold it - refusing",
+                    self.getId(), sender.getRemoteNodeAddress());
+            return;
+        }
+
         // When the topology has been received we can update our local view of the world
-        self.clusterTopology.register(announceClusterTopology.getNodeIdentifierStates().stream()
+        self.clusterTopology.register(announced.stream()
                 .map(i -> new NodeIdentifier(
                         i.getId(),
                         i.getNodeAddress()
@@ -65,6 +112,9 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
                 .collect(Collectors.toList()));
 
         if (sender.getRemoteNodeId() == null) {
+            // canResolveAddress proved the address is present before we mutated anything,
+            // so this locate is guaranteed to hit -- the throw is an invariant tripwire,
+            // not a reachable refusal path.
             final String remoteNodeId = self.clusterTopology.locate(sender.getRemoteNodeAddress())
                     .map(com.github.jocull.raftcache.lib.topology.NodeIdentifier::getId)
                     .orElseThrow(() -> new IllegalStateException("Remote address " + sender.getRemoteNodeAddress() + " not found in cluster topology: {}" + self.clusterTopology.getTopology()));
@@ -73,7 +123,7 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     }
 
     /**
-     * Stage 6(i) (SNAPSHOTS.md stage 6(i)): is this wire term/index structurally hostile —
+     * Stage 6(j) (SNAPSHOTS.md stage 6(j)): is this wire term/index structurally hostile —
      * {@code null}, or carrying a negative term or index? The wire {@code messages.TermIndex}
      * is a bare carrier: none of those can be constructed into it, and feeding one into a
      * domain comparison would NPE out of the wire getters or IAE out of the domain
@@ -83,6 +133,46 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
      */
     static boolean isHostileWireTermIndex(com.github.jocull.raftcache.lib.raft.messages.TermIndex wire) {
         return wire == null || wire.getTerm() < 0 || wire.getIndex() < 0;
+    }
+
+    /**
+     * Stage 6(k) (SNAPSHOTS.md stage 6(k)): is this wire node-identifier structurally
+     * invalid — a missing (null) id, or a missing (null) address? The bootstrap carriers
+     * ({@code messages.Introduction}, {@code messages.NodeIdentifier}) are bare, so —
+     * unlike the term/index family, whose invalid shapes are rejected by the domain
+     * constructors — a bootstrap message can reach the handler carrying either. A null id
+     * becomes a NULL KEY in the topology map: legal for {@code HashMap}, but it inflates
+     * {@link com.github.jocull.raftcache.lib.topology.ClusterTopology#getMajorityCount()}
+     * and votes can never target the unnameable member (quorum DoS); a null address NPEs
+     * the first {@code locate()} and propagates to peers in the announce replies both
+     * handlers build. Every bootstrap path checks its identifiers with this BEFORE
+     * binding the connection, registering, or replying.
+     */
+    static boolean isInvalidNodeIdentifier(String id, NodeAddress nodeAddress) {
+        return id == null || nodeAddress == null;
+    }
+
+    /**
+     * Stage 6(k) (SNAPSHOTS.md stage 6(k)): can {@code address} be resolved — against the
+     * topology we already hold, or the announced list we are about to admit? Null-safe:
+     * a null sender address and a null address inside an entry resolve to nothing. A
+     * {@code true} result is what makes the post-registration {@code locate} in
+     * {@link #onAnnounceClusterTopology} a reachable hit: nothing else between the check
+     * and the locate can change the topology on this executor.
+     */
+    private boolean canResolveAddress(NodeAddress address, List<com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier> announced) {
+        if (address == null) {
+            return false;
+        }
+        boolean hit = self.clusterTopology.getTopology().stream()
+                .anyMatch(i -> i.getNodeAddress() != null
+                        && address.getAddress().equals(i.getNodeAddress().getAddress()));
+        if (!hit) {
+            hit = announced.stream()
+                    .anyMatch(i -> i != null && i.getNodeAddress() != null
+                            && address.getAddress().equals(i.getNodeAddress().getAddress()));
+        }
+        return hit;
     }
 
     /**

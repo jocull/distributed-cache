@@ -35,6 +35,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -492,6 +493,217 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
             assertEquals(0L, follower.logs.getCurrentTermIndex().getIndex(), "the log is untouched by the refusal");
             assertEquals(0L, follower.logs.getCommittedTermIndex().getIndex(), "the commit point is untouched by the refusal");
             assertEquals(0L, bridge.getLastAppliedIndex(), "nothing is applied to the state machine");
+        }
+    }
+
+    // ---- Stage 6k: structurally invalid bootstrap traffic is refused before any mutation ----
+    //
+    // The bootstrap handlers (onIntroduction / onAnnounceClusterTopology, stage 6(k))
+    // live in the RaftNodeBehavior base and, like the leader-ack paths the family
+    // hardened after them, have no ack to carry a refusal -- so the refusal shape is the
+    // no-reply one: warn, change ZERO state (no binding, no registration, no reply).
+    // The carriers are bare, unlike the null-guards on the term/index wire types: a
+    // missing id becomes a null map key (legal, but it inflates getMajorityCount() and
+    // votes can never target it), and a missing address NPEs or throws out of the
+    // FIRST locate() that follows -- the stage 6(j) "throw after mutation" mechanism,
+    // this time on the bootstrap surface.
+
+    @Test
+    void anIntroductionCarryingANullNodeId_isRefusedBeforeBindingRegisteringOrReplying() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender peer = new RecordingSender("peer");
+            // Without the guard this would bind the connection to a null id, register a
+            // null key (quorum inflation) and THEN reply -- the mutation the guard must
+            // precede.
+            follower.currentReceiver().onIntroduction(peer,
+                    new Introduction(null, new NodeAddress("peerAddress"), wire(0, 0)));
+
+            assertTrue(peer.remoteNodeIdBindings().isEmpty(),
+                    "a refused introduction must not bind the connection");
+            assertEquals(1, follower.clusterTopology.getClusterCount(),
+                    "a refused introduction registers nothing");
+            assertEquals(1, follower.clusterTopology.getMajorityCount(),
+                    "the quorum is not inflated by a null key");
+            assertTrue(peer.announcedTopologies().isEmpty(),
+                    "a refused introduction announces no topology");
+        }
+    }
+
+    @Test
+    void anIntroductionCarryingANullNodeAddress_isRefusedBeforeBindingRegisteringOrReplying() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender peer = new RecordingSender("peer");
+            // Null address: register would accept it into the map, and the reply built
+            // from getTopology() would carry the null-address entry out to peers -- the
+            // 6(j) null-slot shape, on the bootstrap surface. The guard precedes both.
+            follower.currentReceiver().onIntroduction(peer,
+                    new Introduction("peer", null, wire(0, 0)));
+
+            assertTrue(peer.remoteNodeIdBindings().isEmpty(),
+                    "a refused introduction must not bind the connection");
+            assertEquals(1, follower.clusterTopology.getClusterCount(),
+                    "a refused introduction registers nothing");
+            assertTrue(peer.announcedTopologies().isEmpty(),
+                    "a refused introduction announces no topology");
+        }
+    }
+
+    @Test
+    void anAnnounceCarryingANullNodeIdEntry_isRefusedWithoutRegisteringAnything() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender leader = new RecordingSender("leader");
+            // The 6(i) whole-list convention: one bad entry refuses the WHOLE announce.
+            // The null id is the quorum-inflation vector (null key); the "legit" entry
+            // would have been fine on its own -- exactly why it must go down with the
+            // bad one.
+            follower.currentReceiver().onAnnounceClusterTopology(leader, new AnnounceClusterTopology(
+                    List.of(
+                            new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier("legit", new NodeAddress("legitAddress")),
+                            new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier(null, new NodeAddress("hostileAddress")))));
+
+            assertEquals(1, follower.clusterTopology.getClusterCount(),
+                    "a refused announce registers nothing -- not even its valid entries");
+            assertEquals(1, follower.clusterTopology.getMajorityCount(),
+                    "the quorum is unchanged");
+            assertTrue(leader.remoteNodeIdBindings().isEmpty(),
+                    "a refused announce touches the sender's binding not at all");
+            assertTrue(leader.announcedTopologies().isEmpty());
+        }
+    }
+
+    @Test
+    void anAnnounceCarryingANullNodeAddressEntry_fromAnUnboundSender_isRefusedWithoutThrowing() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender unbound = new RecordingSender(null); // still unbound on the stub (address "stub-unbound")
+            // Without the guard this NPEs out of locate() AFTER the topology has ALREADY
+            // been registered: the filter dereferences every entry's address, and the
+            // null-address entry below is what it hits -- the throw-after-mutation shape.
+            follower.currentReceiver().onAnnounceClusterTopology(unbound, new AnnounceClusterTopology(
+                    List.of(
+                            new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier("peer", new NodeAddress("stub-unbound")),
+                            new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier("hostile", null))));
+
+            assertEquals(1, follower.clusterTopology.getClusterCount(),
+                    "the NPE-able entry is registered by nothing");
+            assertTrue(unbound.remoteNodeIdBindings().isEmpty(),
+                    "and the sender is never bound");
+        }
+    }
+
+    @Test
+    void anAnnounceFromAnUnboundSenderWhoIsNotInTheTopology_isRefusedWithoutRegistering() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender unbound = new RecordingSender(null); // address "stub-unbound"
+            final AnnounceClusterTopology unresolvable = new AnnounceClusterTopology(
+                    List.of(new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier("peer", new NodeAddress("someOtherAddress"))));
+            // The announce is well-formed but simply does not name the (unbound) sender
+            // and we do not hold it: without the guard we would register the topology and
+            // THEN throw the ISE out of locate() -- the throw-after-mutation shape, now
+            // refused before any mutation instead.
+            assertDoesNotThrow(
+                    () -> follower.currentReceiver().onAnnounceClusterTopology(unbound, unresolvable),
+                    "an unresolvable sender is refused, not thrown on after the topology moved");
+
+            assertEquals(1, follower.clusterTopology.getClusterCount(),
+                    "a refused announce registers nothing");
+            assertEquals(1, follower.clusterTopology.getMajorityCount(),
+                    "the quorum is unchanged");
+            assertTrue(unbound.remoteNodeIdBindings().isEmpty(),
+                    "and the sender is never bound");
+        }
+    }
+
+    @Test
+    void anIntroductionFromAMatchedPeer_bindsRegistersAndAnnounces() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender peer = new RecordingSender("peer");
+            // The legitimate bootstrap the guard must keep working: a well-formed
+            // introduction binds the connection, registers the peer, and replies with
+            // the (now grown) topology.
+            follower.currentReceiver().onIntroduction(peer,
+                    new Introduction("peer", new NodeAddress("peerAddress"), wire(0, 0)));
+
+            assertEquals(List.of("peer"), peer.remoteNodeIdBindings(),
+                    "the connection is bound to the introducer");
+            assertEquals(2, follower.clusterTopology.getClusterCount(),
+                    "the introducer is registered");
+            assertEquals(1, peer.announcedTopologies().size(),
+                    "and the reply is one announce");
+            final List<com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier> reply =
+                    peer.announcedTopologies().get(0).getNodeIdentifierStates();
+            assertEquals(2, reply.size(),
+                    "the reply carries our own entry and the introducer's");
+            assertTrue(reply.stream().anyMatch(i -> "follower".equals(i.getId())),
+                    "self is still in the announced topology");
+            assertTrue(reply.stream().anyMatch(i -> "peer".equals(i.getId())),
+                    "the introducer is in the announced topology");
+        }
+    }
+
+    @Test
+    void anAnnounceFromAnUnboundSenderThatListsItself_resolvesBindsAndRegisters() {
+        try (final PassThruMiddleware middleware = new PassThruMiddleware();
+             final RaftManager raftManager = new RaftManager(new InMemoryTopologyDiscovery(), middleware)) {
+
+            final RaftNodeImpl follower = (RaftNodeImpl) raftManager.newNode("follower", new NodeAddress("followerAddress"));
+            middleware.addNode(follower);
+            wireBridge(follower);
+            follower.start().join();
+
+            final RecordingSender unbound = new RecordingSender(null); // address "stub-unbound"
+            // A real node always announces itself, so the sender's address is resolvable
+            // INSIDE its own list -- the legitimate bootstrap this pin must keep
+            // working: the guard may not over-refuse.
+            final AnnounceClusterTopology announce = new AnnounceClusterTopology(
+                    List.of(new com.github.jocull.raftcache.lib.raft.messages.NodeIdentifier("peer", new NodeAddress("stub-unbound"))));
+            follower.currentReceiver().onAnnounceClusterTopology(unbound, announce);
+
+            assertEquals(List.of("peer"), unbound.remoteNodeIdBindings(),
+                    "the sender is resolved from its own announce and bound");
+            assertEquals(2, follower.clusterTopology.getClusterCount(),
+                    "the announce is registered exactly once");
         }
     }
 
@@ -968,13 +1180,19 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
 
     /**
      * A minimal {@link NodeConnectionOutbound} that identifies itself as the sender and
-     * records the {@link InstallSnapshotResponse}/{@link AcknowledgeEntries} it is asked to
-     * send. Everything else is inert (mirrors the voter test's RecordingSender).
+     * RECORDS what it is told to do: the {@link InstallSnapshotResponse}/{@link
+     * AcknowledgeEntries} it is asked to send, every {@code setRemoteNodeId} binding
+     * (stage 6(k)) and every {@link AnnounceClusterTopology} it is asked to announce
+     * (the introduction reply). Construction with a {@code null} id models a connection
+     * that is still unbound (nothing has resolved who is on the other side) -- the shape
+     * the 6(k) announce pins drive.
      */
     private static final class RecordingSender implements NodeConnectionOutbound {
         private final String remoteNodeId;
         private final List<InstallSnapshotResponse> snapshotResponses = new ArrayList<>();
         private final List<AcknowledgeEntries> acknowledges = new ArrayList<>();
+        private final List<String> remoteNodeIdBindings = new ArrayList<>();
+        private final List<AnnounceClusterTopology> announcedTopologies = new ArrayList<>();
 
         RecordingSender(String remoteNodeId) {
             this.remoteNodeId = remoteNodeId;
@@ -987,12 +1205,12 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
 
         @Override
         public void setRemoteNodeId(String remoteNodeId) {
-            throw new UnsupportedOperationException("test stub");
+            remoteNodeIdBindings.add(remoteNodeId);
         }
 
         @Override
         public NodeAddress getRemoteNodeAddress() {
-            return new NodeAddress("stub-" + remoteNodeId);
+            return new NodeAddress("stub-" + (remoteNodeId == null ? "unbound" : remoteNodeId));
         }
 
         @Override
@@ -1031,6 +1249,7 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
 
         @Override
         public void sendAnnounceClusterTopology(AnnounceClusterTopology announceClusterTopology) {
+            announcedTopologies.add(announceClusterTopology);
         }
 
         @Override
@@ -1082,6 +1301,14 @@ class RaftNodeBehaviorFollowerInstallSnapshotTest {
 
         List<AcknowledgeEntries> acknowledges() {
             return List.copyOf(acknowledges);
+        }
+
+        List<String> remoteNodeIdBindings() {
+            return List.copyOf(remoteNodeIdBindings);
+        }
+
+        List<AnnounceClusterTopology> announcedTopologies() {
+            return List.copyOf(announcedTopologies);
         }
     }
 }

@@ -22,6 +22,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(h) | non-happy-path hardening (sixth pass): the remaining hostile-wire-tail escapes on the replication path, the 6(g) root mechanism (`TermIndex` constructor IAE/NPE) on the append/ack surface — the follower's `onAppendEntries` feeds three of the wire axes (prev-log pointer, each entry's term/index, the leader commit index) into `new TermIndex(...)` unguarded (a negative or missing field threw mid-handler after the sender was already recorded as leader, and, for the entry/commit axes, after entries were already appended), now **refused** before any state change in the shape of the sibling refusals (false ack carrying our own unchanged tail) — no clamping here, because clamping a mid-log position or match point would manufacture a bogus append or a phantom match; the leader's `onAcknowledgeEntries` feeds the follower's reported tail into `new TermIndex(...)` in **both** branches (the failure-branch rewind, the success-branch adoption), and a negative or missing tail threw before adoption, commit alignment or the catch-up send could run, now **refused as warn + ignore** (no reply exists on the ack path; connection book-keeping, log, and leadership are byte-for-byte untouched) | `stage 6(h)` |
 | 6(i) | non-happy-path hardening (seventh pass): the last two hostile-wire-tail escapes of the 6(g)/6(h) family, now on the vote path — the follower's `onVoteRequest` now **refuses before any mutation** (the term-ladder conversion still runs first, then: warn + re-armed election timer + one explicit false `VoteResponse` carrying our own committed tail, mirroring the handler's own denial shape; `leaderId` never cleared, and a denial deliberately does **not** burn `votedForNodeId`, so a legitimate same-term candidate is still granted afterward) when the request's last-log term/index is a negative or missing wire field; the base-class `isUpToDate` — the single feed-in point all three pre-vote handlers share (follower/candidate/leader) — now refuses with a plain `false` (warn, no state change) on a hostile/missing tail, sealing all three roles with no handler-side change; `isHostileWireTermIndex` lifted to `RaftNodeBehavior` as a shared static (the follower's copy deleted; the three 6(h) append-path call sites resolve via the inherited static, unchanged) | `stage 6(i)` |
 | 6(j) | non-happy-path hardening (eighth pass): the last hostile shape on the append surface, found by the post-6(i) audit sweep — a null slot **inside** the `AppendEntries.entries` list (the 6(h) pins covered a null term/index <i>inside</i> a well-formed entry; the wire ctor's element-blind `unmodifiableList` copy admits null slots, unlike `AnnounceClusterTopology`'s `List.copyOf`, which rejects such lists at construction) — `hasHostileWireTermIndex` now classifies a null slot as hostile, so the follower refuses it in the established shape (false ack carrying our unchanged tail; no leader installed, no append, no commit move, nothing applied) instead of NPE-ing on the very dereference the classification performs (the guard throwing where it exists to catch) — including the tail slot, which the accept path would read FIRST as the new tail, the post-mutation surface 6(h) closed on the other axes; the audit sweep clearing every remaining carrier (`AnnounceClusterTopology`, `VoteResponse`, `Introduction`, `StateResponse`) is recorded in §7 | `stage 6(j)` |
+| 6(k) | non-happy-path hardening (ninth pass): the two base-class **bootstrap handlers** — `onIntroduction` / `onAnnounceClusterTopology`, the only surface the hostile-wire audit left, flagged in the §7 sweep as a *separate carrier family* (null id / null nodeAddress in the bootstrap carriers; `Introduction` and `messages.NodeIdentifier` are bare null-permitting, unlike the term/index family that the domain constructors reject) — both now **refuse before any mutation** (the no-reply refusal shape: warn, zero state change): an intro carrying a null id or null address is refused before `setRemoteNodeId`, before `register`, and before the announce reply (previously: a null-bound connection feeding the follower vote/leader-handoff paths, a null map key in the topology — a `HashMap` null key, which inflates `getMajorityCount()` and votes can never name the unnameable member, a quorum DoS — and the null-address entry propagating to peers inside the reply built from `getTopology()`); an announce with a null slot / null id / null address anywhere in its list is refused wholesale (the 6(i) whole-list convention) and an unbound sender must be resolvable against the held topology <i>or its announced list</i> (real nodes announce themselves, so legitimate bootstrap still resolves) — all checks now run **before** `register`, making the post-registration `locate` `orElseThrow` ISE an unreachable invariant tripwire that used to fire after the topology had moved (the throw-after-mutation surface, closed for the follower-append path in 6(j), now on the bootstrap surface); the "exhausted" claim of the 6(i)/6(j) closure is re-scoped to the term/index family (see §7) | `stage 6(k)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -39,7 +40,13 @@ and three pre-vote role refusal pins, closing the vote surface of the hostile-wi
 mechanism); and after stage 6(j): **354 tests green, 0 failures, 1 pre-existing
 skip** (+2: two follower append-path refusal pins for the mechanism's last hostile
 shape — a null <i>entry slot</i> in the entries list — closing it after an audit sweep
-that cleared every remaining wire carrier; see §7).
+that cleared every remaining wire carrier on the term/index axes; see §7); and after
+stage 6(k): **361 tests green, 0 failures, 1 pre-existing skip** (+7: five bootstrap
+refusal pins and two legitimate-bootstrap acceptance pins on `onIntroduction` /
+`onAnnounceClusterTopology`, the first test coverage of these handlers at all — a
+separate carrier family, null id / null nodeAddress, from the term/index family the
+audit closed; the "exhausted on the current surface" claim is re-scoped to that
+family; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -616,8 +623,92 @@ pre-existing skip** (+2 over the 6(i) baseline).
 
 **Closure.** Every wire carrier is now accounted for and the hostile-wire family —
 structurally invalid term/index/entry values that would throw or corrupt mid-handler —
-is exhausted on the current surface, including the one shape that was neither
-guardable by clamping (nothing to clamp to) nor caught by the term/index guards (it
-is the *absence* of an object). The handoff stands as recorded in 6(i): the next
-items on the plan are the structural backlog — (A) spill-to-disk durable store,
-(B) partition ownership, (C) fixed-cluster topology, (D) infra debt.
+is exhausted on the current surface <i>for the term/index family</i>, including the one
+shape that was neither guardable by clamping (nothing to clamp to) nor caught by the
+term/index guards (it is the *absence* of an object). The re-scoping is made explicit
+in the 6(k) round below: the bootstrap identity carriers closed there are a different
+mechanism. The handoff stands as recorded in 6(i): the next items on the plan are the
+structural backlog — (A) spill-to-disk durable store, (B) partition ownership,
+(C) fixed-cluster topology, (D) infra debt.
+
+**Non-happy-path hardening pass, ninth round (2026-11-23, stage 6(k))** — the
+term/index family closed in 6(g)–6(j) was one carrier family, not the whole hostile
+surface. The post-6(j) audit flagged the base-class **bootstrap handlers** —
+`onIntroduction` and `onAnnounceClusterTopology`, the two handlers through which
+every legitimate cluster is formed — as accepting a *separate* family: bare
+null-permitting identity fields. The 8th-round sweep's "carriers cleared" was true of
+the term/index <i>axes</i> of those carriers (`Introduction`'s log tail there is
+write-only), but neither `Introduction` nor `messages.NodeIdentifier` null-guards its
+id or its address object — `topology.NodeAddress` null-guards the address *string* in
+its ctor, which is not the hostile shape; a null `NodeAddress` <i>inside the
+identifier</i> passes through untouched and reaches the handler. And unlike the
+term/index carriers, these shapes do not IAE out of a domain constructor, because they
+never feed one in: they poison the **map** (null keys) and the **stream filter**
+(null dereferences out of `locate`).
+
+**The two escape mechanisms (both closed now, both pre-mutation).** (1) *null id →
+quorum DoS.* `ClusterTopology.register` puts the entry into a `HashMap` keyed by id:
+a null key is *legal*, `getMajorityCount()` is `(size/2)+1`, so a single null entry
+on a 1-node cluster flips the majority 1→2 — and no vote, pre-vote grant, or commit
+ack can ever name the unnameable member (`RaftNodeBehaviorFollower`'s
+`votedForNodeId = sender.getRemoteNodeId()`, `preVoteGrants` majority math,
+`RaftNodeBehaviorCandidate`'s `votes >= getMajorityCount()` all consume it). The
+binding side is equally broken: `sender.setRemoteNodeId(null)` hands a null-id
+connection to the follower's leader-handoff paths (`convertToFollowerForNewLeader`).
+(2) *null address → NPE out of `locate`.* `onAnnounceClusterTopology` registered the
+whole announced list **before** its first `locate()`, which resolves an unbound
+sender: the stream filter dereferences every entry's address, so one null-address
+entry NPEd the handler **after the topology had already moved** — the
+throw-after-mutation shape 6(j) closed on the follower-append surface, on the
+bootstrap surface. The tail `locate(...).orElseThrow(ISE)` was the same family: an
+unbound sender whose address appears neither in the topology nor in the announced
+list threw **after** registration.
+
+**The fix (two handlers, two helpers).** Neither handler has a reply to carry a
+refusal, so both take the no-reply shape (the 6(h) leader-ack precedent): warn, zero
+state change, no exceptions. `onIntroduction` now refuses a null id or null address
+**before** `setRemoteNodeId`, **before** `register`, and **before** the announce
+reply. `onAnnounceClusterTopology` now refuses the entire announce if any slot is a
+null entry/id/address (the 6(i) whole-list convention — refuse the list, not
+"register the valid entries and throw on the bad one"), and additionally requires an
+unbound sender to be resolvable against the held topology **or the announced
+list** — a real node announces itself, so the legitimate bootstrap (the sender's
+address present inside its own list) still resolves — and all of these checks run
+**before** `register`, making the post-registration `locate` a guaranteed hit: the
+`orElseThrow(ISE)` survives as an unreachable invariant tripwire rather than as a
+reachable refusal path. Helpers sit next to `isHostileWireTermIndex` as pattern
+siblings: `isInvalidNodeIdentifier(id, address)` and `canResolveAddress(address,
+announced)` (null-safe; checks the held topology, then the announced list).
+
+**Pins, seven total**, in `RaftNodeBehaviorFollowerInstallSnapshotTest` — the first
+test coverage of these two handlers (grep-verified zero before this stage; the only
+end-to-end exercise was the full-cluster `RaftNodeTest` bootstrap, which stays green
+at 155). Refusals: (i) intro with null id — no `setRemoteNodeId` binding, no
+registration (size 1→1, majority 1→1), no reply; (ii) intro with null address — same
+shape, and no null-address entry leaks into the topology to ride out in the reply to
+peers; (iii) announce with a well-formed peer entry <i>plus</i> a null-id entry — the
+whole announce is refused, even the valid entry is not registered, quorum untouched,
+sender untouched; (iv) announce with a null-address entry from an unbound sender —
+no NPE out of `locate`, nothing registered, sender unbound (previously: registered,
+*then* NPE); (v) well-formed announce from an unbound sender whose address matches
+neither the topology nor its own list — no ISE, nothing registered (previously:
+registered, *then* ISE). Acceptance regressions: (vi) a valid intro binds the
+connection to the introducer, registers it, and replies with exactly one announce
+carrying both the self entry and the introducer's; (vii) an unbound sender that
+announces itself resolves, binds, and registers exactly once. The pin host's
+`RecordingSender` had to change two stubs from throw/no-op to <i>record</i> (the old
+`setRemoteNodeId` threw UOE; `sendAnnounceClusterTopology` was a silent no-op) —
+safe because no test had ever reached either (the handlers were uncovered), and the
+refusal pins now assert call/no-call rather than "did it throw".
+
+Isolated: the host **32 green** (25 → 32); neighbors `RaftNodeBehaviorFollowerVoteTest`
+**3 green** and the full-cluster `RaftNodeTest` **155 green** — legitimate bootstrap
+through the real `sendIntroduction` path unchanged. Final suite: **361 tests green,
+0 failures, 1 pre-existing skip** (+7 over the 6(j) baseline).
+
+**Reconciliation of the "exhausted" claim.** The 6(i)/6(j) closure was scoped to the
+**term/index family** — wire values that feed a domain `TermIndex` comparison or an
+`entries` slot whose absence is the hostility. The bootstrap identity family (null
+id / null address) is a different mechanism, closed by this stage; the wire surface
+is now exhausted *per family*, and both families are accounted for on the current
+surface. The structural-backlog handoff stands as recorded in the 8th-round closure.
