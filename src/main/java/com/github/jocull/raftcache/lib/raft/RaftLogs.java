@@ -70,6 +70,17 @@ class RaftLogs {
     }
 
     public synchronized boolean containsStartPoint(TermIndex index) {
+        // (6t) Same hostile-carrier guard family as the 6r compact/commit and the 6s
+        // append guards, now on the read surface: a null pointer derefs to NPE at the
+        // first startSeed equality check (the wrong family for a contract refusal), and
+        // a construction-bypassed carrier (the 6(n)/6(p) shape) with a forged negative
+        // term or index is silently answered "not contained" instead of being refused.
+        if (index == null) {
+            throw new IllegalArgumentException("containsStartPoint termIndex must not be null");
+        }
+        if (index.getTerm() < 0 || index.getIndex() < 0) {
+            throw new IllegalArgumentException("containsStartPoint termIndex must not be negative: " + index);
+        }
         // O(1) common cases (closes the old TODOs): the start point is an exact field
         // hit (epoch for a fresh log, the snapshot boundary after compact), and anything
         // before the start point is compacted away and can never match.
@@ -174,6 +185,21 @@ class RaftLogs {
     }
 
     public synchronized <TOut> List<TOut> getLogRange(TermIndex startTermIndex, int limit, Function<RaftLog<?>, TOut> fnTransform) {
+        // (6t) Same hostile-carrier guard family, at the range-serving intake. The
+        // two-arg overload funnels in with Function.identity(), so this single gate
+        // holds both: a null pointer derefs to NPE inside the stream filter
+        // (startTermIndex.getIndex()); a forged negative index serves a silent, wider
+        // range than requested (everything at index above it); a null transform NPEs
+        // at the map step.
+        if (startTermIndex == null) {
+            throw new IllegalArgumentException("getLogRange startTermIndex must not be null");
+        }
+        if (startTermIndex.getTerm() < 0 || startTermIndex.getIndex() < 0) {
+            throw new IllegalArgumentException("getLogRange startTermIndex must not be negative: " + startTermIndex);
+        }
+        if (fnTransform == null) {
+            throw new IllegalArgumentException("getLogRange transform must not be null (start " + startTermIndex + ")");
+        }
         // Batched by the index axis, and never serves the start record (epoch, or the
         // snapshot boundary after compact): its state is already in the state machine
         // and re-applying it would be a double-apply.
@@ -355,6 +381,20 @@ class RaftLogs {
      * entries, rollback-cancelled ones) are passed through with no effect.
      */
     public synchronized void notifyCommitted(List<RaftLog<?>> committedLogs) {
+        // (6t) Same hostile-carrier guard family, at the acknowledgement notifier: a
+        // null list NPEs in the for-each; a null element is silently skipped (the
+        // instanceof test is simply false), so the caller cannot distinguish a refusal
+        // from a skipped acknowledgement, and the good neighbours are completed before
+        // the bad one is reached. The gate runs before any completion, so the refusal
+        // is zero-state-change even for a mixed list.
+        if (committedLogs == null) {
+            throw new IllegalArgumentException("notifyCommitted list must not be null");
+        }
+        for (RaftLog<?> committedLog : committedLogs) {
+            if (committedLog == null) {
+                throw new IllegalArgumentException("notifyCommitted list must not contain null elements");
+            }
+        }
         for (RaftLog<?> committedLog : committedLogs) {
             if (committedLog instanceof CompletableRaftLog) {
                 ((CompletableRaftLog<?>) committedLog).commit();

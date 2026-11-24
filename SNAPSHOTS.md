@@ -31,6 +31,7 @@ plan was subsequently executed in full, each stage committed with a green `mvn -
 | 6(q) | non-happy-path hardening (fifteenth pass, the <i>type</i> axis of the 6(d)/6(o) "looks like a snapshot but is not one" family on the file surface): 6(d) sealed the NAME axis (unparseable → warn+skip), 6(o) the BODY axis (zero bytes) — but neither gate could express TYPE, because 6(o)'s `hasPayload` is a stat and a directory's stat legitimately reports a positive size (the only question a directory answers with "no" is "am I a regular file?", which the code never asked). A save() writes regular files and nothing else, yet a NON-REGULAR foreign entry named like a snapshot (a directory `raft-snapshot-99-99.snap` in a shared directory) passed every gate that existed: name shape, `parseBoundary`, "has payload". Load path: max-by-boundary "recovered" it (a foreign writer can always name it ABOVE the real snapshot — the 6(o) masking mechanism), `readAllBytes` threw (`Is a directory`), and the one VALID snapshot sitting next to it became unrecoverable — a seed-at-startup node starting unseeded over a log already compaction-truncated to the real boundary. Save path: `deleteSuperseded` visited it as superseded — throwing on a non-EMPTY foreign directory (the failure escapes `save()` as a `RuntimeException`, not the `IllegalStateException` family it wraps, and reaches the caller AFTER the new snapshot is already in place: a partial save reported as one), or silently tearing down an empty foreign object as collateral. Fix: ONE root-cause predicate on both paths — only a regular file is a snapshot — `loadLatest` warns and skips non-regular entries (the 6(o) skip shape; a vanished entry lands on the same guard, still skipped) and `deleteSuperseded` spares them (inert under our naming scheme: never read, never torn out); three pins in `FileSnapshotStoreTest` including the distinguishing valid-snapshot-must-still-load assertion | `stage 6(q)` |
 | 6(r) | non-happy-path hardening (sixteenth pass, the 6(g) term axis on the `RaftLogs` intake — the last consumer in the chain behind the sealed wire guards): `compact()` guarded `index < 0` but never `term < 0`, and `commit()` had no guard at all but the index bounds (a null NPEd out of `getIndex()`; a forged `(-1,k)` passes both), sticking into `snapshotBoundary`/`startSeed`/`currentTermIndex` (full install) or `committedTermIndex`, inverting the term-first `TermIndex.compareTo` the committed filter and `rollback()` depend on — committed entries re-served (double-apply) or the pending ones dropped with their acks, and `rollback()` tearing out the committed prefix alongside the uncommitted tail. The axis had looked sealed because the existing negative-<i>index</i> pin was actually pinning the `TermIndex` constructor (it throws inside the pin's own expression) — the same construction-guard illusion that blinded the 6(p) store audit. Both intakes now refuse a null or negative-axis pointer (IAE, the `isHostileWireTermIndex` shape) before ANY state change, with pins carrying the zero-state-change contract and the double-serve/drop discriminator | `stage 6(r)` |
 | 6(s) | non-happy-path hardening (seventeenth pass, the `RaftLogs` content intake — the one append path not construction-guarded): all four public append overloads funnel into `appendLogInternal(TermIndex, T)`, and the int overloads reach it only through the `TermIndex` constructor (IAE on both negative axes) — so the raw overload is the one intake a 6(n)/6(p)-shaped construction-bypassed carrier or a null can reach, and it had no guards at all, right next to the 6(r) guards that had just sealed its sibling intakes. Four live shapes, all RED-confirmed pre-fix: **null pointer** NPE'd in the conflict walk (the log is never empty — it is seeded with the epoch); a **forged negative term** could replace nothing (a negative term outranks no existing entry) but is also never "before" one under the term-first `compareTo`, so it fell out of the walk as an ISE "log gap" — the wrong family for a contract refusal; a **forged negative index** tripped `isReplacementOf` against the epoch seed (1 > 0 and -1 <= 0) and the conflict sweep destroyed the ENTIRE log before the forged record lodged below the true tail — state-destroying, with a completed future for index -1 in the caller's hand and the recorded tail a phantom the deque no longer holds; and a **null entry** NPE'd out of the record construction at a new index while silently no-oping (returning the existing record, the entry never read) at an existing one. The gate now refuses the null pointer, the negative-axis pointer, and the null entry at the head of the method, before the iterator touches the deque — one guard covering all four overloads through the funnel, carrying the zero-state-change and next-append-lands-past-the-tail discriminators | `stage 6(s)` |
+| 6(t) | non-happy-path hardening (eighteenth pass, the `RaftLogs` read + notification surfaces — the last unguarded public intakes on a class whose mutation intakes 6(r)/6(s) just sealed): `containsStartPoint`, `getLogRange`, and `notifyCommitted` were raw. All RED-confirmed pre-fix: a **null pointer** NPE'd at the `containsStartPoint` `startSeed` equality check or in the `getLogRange` stream filter; a **null transform** NPE'd at the `map` step; **forged negative axes** were silently answered "not contained" or served a range computed off a pointer no `TermIndex` may hold (the range filter indexes the index axis only, so a forged term was ignored and a forged negative index served a wider range than asked); `notifyCommitted(**null)**` NPE'd in the for-each, and a **null element** was skipped with no trace (`instanceof` is simply false) — the caller cannot tell a refusal from a skipped acknowledgement, and the good neighbours completed *first*. Each gate now refuses a null pointer / negative-axis pointer / null transform / null list / null element before touching the list — in `notifyCommitted` validating the WHOLE list before completing ANY future, so a mixed-list refusal is zero-state-change — carrying the zero-state-change, legitimate-range-still-served, and legitimate-ack-still-completes-a-waiting-client discriminators | `stage 6(t)` |
 
 Final suite at stage 6(b): **320 tests green, 0 failures, 1 pre-existing skip**
 (`/tmp/opencode/mvn-phase4-final.log`); after stage 6(c): **325 tests green, 0 failures,
@@ -121,7 +122,18 @@ negative term fell out as an ISE "log gap", a forged negative index tripped
 `isReplacementOf` against the epoch seed and the sweep destroyed the entire
 log before the forged record lodged, and a null entry NPE'd at a new index
 while silently no-oping at an existing one; the gate now refuses all four
-before the deque is touched; see §7).
+before the deque is touched; see §7); and after stage 6(t): **386 tests green, 0
+failures, 1 pre-existing skip** (+1: the read + notification surfaces of the
+same log — `containsStartPoint`, `getLogRange`, `notifyCommitted` were the last
+unguarded public intakes on the class 6(r)/6(s) sealed on the mutation side,
+yet they were raw: a null pointer NPE'd at the start-record equality check or
+inside the range stream filter, a null transform NPE'd at the map, forged
+negative axes were silently answered "not contained" or served a range computed
+off a pointer no `TermIndex` may hold, a null list NPE'd in the for-each, and a
+null element was skipped so silently a caller could not tell a refusal from a
+skipped acknowledgement (its good neighbours completing first); the gates now
+refuse all five hostile shapes before the list is touched, and in
+`notifyCommitted` before any future is completed; see §7).
 `InstallSnapshotExample.java` and the `proto/raft/*`
 package were consulted as working notes only and remain untouched (do-not-modify).
 
@@ -1400,3 +1412,81 @@ methods). Full suite at this point: **385 tests green, 0 failures, 1 pre-existin
 compact (6(r) term+index), commit (6(r) term+index), append (6(s) pointer + entry) — now
 refuses every hostile shape at every public surface that takes one, before any mutation of
 the deque.
+
+**Non-happy-path hardening pass, eighteenth round (2026-11-24, stage 6(t))** — the READ
+and NOTIFICATION surfaces of the same log 6(r)/6(s) sealed on the mutation side:
+`containsStartPoint`, `getLogRange`, and `notifyCommitted`. The pointer family has one
+answer at every in-process entry point that took a pointer; these three are the last
+public intakes on the class that did not — and, unlike the 6(s) intake, they had not even
+the construction-guard illusion to blind an audit: nothing here constructs a `TermIndex`,
+so there was no guard-shaped artifact at all to find.
+
+The surfaces. `containsStartPoint(TermIndex index)` reads its pointer at the FIRST
+start-record equality check — the start record always exists — so a null pointer is a
+deterministic NPE, not a conditional one. `getLogRange(TermIndex, int, Function)`
+dereferences `startTermIndex.getIndex()` inside the stream filter and applies
+`fnTransform` at the `map`; the two-arg overload funnels in with `Function.identity()`,
+so one gate at the three-arg version holds both overloads. `notifyCommitted(List)`
+iterates the raw list and completes each `CompletableRaftLog`'s future as it goes — a
+null list NPEs in the for-each, and a null element simply fails the `instanceof` test.
+
+The pre-fix behaviors (all RED-confirmed by the pin before the fix):
+- **null pointer** to either reader: NPE — at `index.equals(startSeed.getTermIndex())`
+  in `containsStartPoint`, at `startTermIndex.getIndex()` inside the `getLogRange`
+  filter. Zero state change, wrong family (NPE, not IAE).
+- **forged negative axis**: silently *answered* — "not contained" in
+  `containsStartPoint` (the axes never match and the negative index compares "before"
+  the seed), and in `getLogRange` a range computed off a pointer no `TermIndex` may
+  hold: the filter indexes the index axis only, so a forged term is ignored and a forged
+  *negative index* serves a wider range than was asked. Zero state change, silently
+  accepted — the most dangerous of the three behaviors here, because it masquerades as
+  a plausible result.
+- **null transform** to `getLogRange`: NPE at the `map` step. Zero state change, wrong
+  family.
+- **null list** to `notifyCommitted`: NPE in the for-each, wrong family. **Null
+  element**: skipped with no trace — `null instanceof CompletableRaftLog` is simply
+  false — and critically the good neighbours in the same list complete *before* the bad
+  one is reached: a caller passing `[a, null]` cannot tell a refusal from a skipped
+  acknowledgement, and had already mutated observable state (acknowledgements are the one
+  side effect on the read surface).
+
+The fix is the 6(r)/6(s) guard shape on all three, at the head of each public method (the
+`isHostileWireTermIndex` / IAE family): `containsStartPoint` now refuses `index == null`
+and `getTerm() < 0 || getIndex() < 0` before the first equality check; `getLogRange`
+refuses a null start pointer, a negative-axis start pointer, and `fnTransform == null` —
+one gate covering both overloads through the funnel, so the two-arg path inherits the
+same contract; `notifyCommitted` refuses `committedLogs == null` and a null element,
+validating the WHOLE list before completing ANY future — the mixed list `[a, null]` is
+now refused with `a`'s future still pending, which is what "zero state change" means on a
+surface whose only state change is completing futures.
+
+**Pin (RED-confirmed before the fix, then GREEN), in `RaftLogsTest`:**
+`testReadNotificationGuards`, new (modeled on the 6(r)/6(s) guard methods) —
+`containsStartPoint(null)` IAE (pre-fix: NPE),
+`containsStartPoint(forgeTerm(-1, 1L))` and `containsStartPoint(forgeIndex(-1L))` IAE
+(pre-fix: silently "not contained"), while legitimate `(1, 1)`/`(1, 2)` still resolve and
+an unknown `(9, 9)` still answers false; `getLogRange(null, 2)`,
+`getLogRange(null, 2, …)` (both overloads), `getLogRange(forgeTerm(-1, 1L), 10, …)`,
+`getLogRange(forgeIndex(-1L), 10, …)` (the wider-range shape), and
+`getLogRange(new TermIndex(0, 0L), 2, null)` (the transform axis) all IAE (pre-fix: NPE
+/ NPE / silently served `[b]` / silently served `["a","b"]` / NPE), while the legitimate
+`getLogRange(new TermIndex(0, 0L), 2, RaftLog::getEntry)` still serves exactly
+`["a","b"]`; `notifyCommitted(null)` IAE (pre-fix: NPE),
+`notifyCommitted([null])` IAE (pre-fix: silently skipped), and `notifyCommitted([a, null])`
+— the mixed-list shape — IAE (pre-fix: `a`'s future completed, `null` skipped, nothing
+thrown: the refusal indistinguishable from a skip), while a legitimate acknowledgement
+still completes a waiting client (`appendFutureLog(1, "c")` → `commit((1, 3))` →
+`notifyCommitted(newlyCommitted)` → the future resolves to "c"). The
+zero-state-change discriminator closes it: both real records intact, the tail at 3, and
+the full range `["a","b","c"]` still served after every refusal.
+
+Isolated: `RaftLogsTest` **13 green / 0 fail / 0 skip** (12 baseline + the new method).
+Full suite at this point: **386 tests green, 0 failures, 1 pre-existing skip**
+(+1 over the 6(s) baseline of 385). The `RaftLogs` surface is now closed end to end:
+compact (6r), commit (6r), append (6s), contains (6t), range (6t), notify (6t) — every
+public intake refuses a hostile carrier (null pointer, negative-axis pointer, null entry,
+null transform, null list, null element) at the head of its method, before the deque,
+the stream, or any future is touched. The pointer+carrier family the house has been
+closing since 6(g) — wire (6(g)–6(n)), store (6(o)–6(p)), log (6(r)–6(s) + this pass) —
+now enforces one contract at every in-process entry point: a pointer is legitimate iff
+it is non-null and both axes non-negative, and a list is legitimate iff it holds no nulls.

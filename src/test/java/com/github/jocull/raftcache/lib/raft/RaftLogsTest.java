@@ -3,6 +3,7 @@ package com.github.jocull.raftcache.lib.raft;
 import com.github.jocull.raftcache.lib.event.EventBus;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.*;
@@ -389,6 +390,66 @@ public class RaftLogsTest {
         assertEquals(List.of("a", "b"), raftLogs.getLogRange(new TermIndex(0, 0L), 2, RaftLog::getEntry));
         raftLogs.appendLog(1, "c"); // (1,3) still lands exactly one past the tail
         assertEquals(3L, raftLogs.getCurrentTermIndex().getIndex());
+    }
+
+    @Test
+    void testReadNotificationGuards() throws Exception {
+        final RaftLogs raftLogs = new RaftLogs(mock(EventBus.class));
+        final RaftLog<String> log1 = raftLogs.appendLog(1, "a"); // (1,1)
+        raftLogs.appendLog(1, "b"); // (1,2)
+
+        // (6t) The 6r/6s guard family, extended to the log's remaining public read and
+        // notification surfaces: containsStartPoint, getLogRange and notifyCommitted.
+        // The pointer is legitimate iff non-null with both axes non-negative; the list
+        // is legitimate iff it holds no nulls.
+        // Pre-fix shapes: a null pointer NPEs (at the startSeed equality check, or
+        // inside the getLogRange stream filter), a null transform NPEs at the map,
+        // forged negative axes are silently answered "not contained" or serve a wider
+        // range than asked, and notifyCommitted(null) NPEs in the for-each while a null
+        // element is skipped without any trace (the instanceof test is simply false) --
+        // the caller cannot tell a contract refusal apart from a skipped acknowledgement.
+
+        // containsStartPoint: the null pointer and both forged negative axes are contract
+        // refusals, not an NPE or a quiet "no"...
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.containsStartPoint(null));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.containsStartPoint(forgeTerm(-1, 1L)));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.containsStartPoint(forgeIndex(-1L)));
+        // ...while legitimate pointers still resolve, and unknown ones still answer false.
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 1L)));
+        assertTrue(raftLogs.containsStartPoint(new TermIndex(1, 2L)));
+        assertFalse(raftLogs.containsStartPoint(new TermIndex(9, 9L)));
+
+        // getLogRange: the two-arg overload funnels into the three-arg form, so the gate
+        // at the three-arg version holds both; null pointer, forged axes and a null
+        // transform are all refusals...
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.getLogRange(null, 2));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.getLogRange(null, 2, RaftLog::getEntry));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.getLogRange(forgeTerm(-1, 1L), 10, RaftLog::getEntry));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.getLogRange(forgeIndex(-1L), 10, RaftLog::getEntry));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.getLogRange(new TermIndex(0, 0L), 2, null));
+        // ...while a legitimate range is served exactly.
+        assertEquals(List.of("a", "b"), raftLogs.getLogRange(new TermIndex(0, 0L), 2, RaftLog::getEntry));
+
+        // notifyCommitted: a null list and null elements are refusals, whether the list
+        // is empty, null-only, or mixed -- the mixed one must not complete the good
+        // record before refusing the bad neighbour (pre-fix it did, silently).
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.notifyCommitted(null));
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.notifyCommitted(Collections.singletonList(null)));
+        final List<RaftLog<?>> mixed = new ArrayList<>();
+        mixed.add(log1);
+        mixed.add(null);
+        assertThrows(IllegalArgumentException.class, () -> raftLogs.notifyCommitted(mixed));
+        // A legitimate acknowledgement still completes a waiting client.
+        final CompletableFuture<RaftLog<String>> pending = raftLogs.appendFutureLog(1, "c"); // (1,3)
+        final List<RaftLog<?>> newlyCommitted = raftLogs.commit(new TermIndex(1, 3L));
+        assertFalse(newlyCommitted.isEmpty());
+        raftLogs.notifyCommitted(newlyCommitted);
+        assertEquals("c", pending.get(1, TimeUnit.SECONDS).getEntry());
+
+        // Zero-state-change: none of the refusals touched a record -- the tail is the
+        // legitimately appended one and the range is intact.
+        assertEquals(3L, raftLogs.getCurrentTermIndex().getIndex());
+        assertEquals(List.of("a", "b", "c"), raftLogs.getLogRange(new TermIndex(0, 0L), 3, RaftLog::getEntry));
     }
 
     /**
