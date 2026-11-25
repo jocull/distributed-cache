@@ -1,18 +1,16 @@
 package com.github.jocull.raftcache.lib.raft.middleware;
 
 import com.github.jocull.raftcache.lib.raft.RaftNode;
+import com.github.jocull.raftcache.lib.raft.messages.WireCodec;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
+import com.google.protobuf.InvalidProtocolBufferException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -532,24 +530,20 @@ public class SocketChannelMiddleware implements ChannelMiddleware, AutoCloseable
     }
 
     // ---------------------------------------------------------------------------
-    // Frame codec — 4-byte BE length + one JDK-serialized payload per frame (NETWORKING.md 2.1)
+    // Frame codec — 4-byte BE length + one WireMessage envelope per frame (NETWORKING.md 2.1).
+    // The byte mapping (POJO <-> Protocol Buffers) lives in lib.raft.messages.WireCodec;
+    // this layer only frames the envelope bytes (length prefix, caps, order). Task 1, Step B.
     // ---------------------------------------------------------------------------
 
     private static byte[] serialize(Object payload) throws IOException {
-        final ByteArrayOutputStream bos = new ByteArrayOutputStream(256);
-        try (ObjectOutputStream oos = new ObjectOutputStream(bos)) {
-            oos.writeObject(payload);
-        }
-        return bos.toByteArray();
+        return WireCodec.serialize(payload);
     }
 
     private static Object deserialize(byte[] payload) throws IOException {
         try {
-            try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(payload))) {
-                return ois.readObject();
-            }
-        } catch (ClassNotFoundException e) {
-            throw new IOException("Wire payload of unknown class: " + e.getMessage(), e);
+            return WireCodec.deserialize(payload);
+        } catch (InvalidProtocolBufferException e) {
+            throw new IOException("Wire frame is not a well-formed WireMessage: " + e.getMessage(), e);
         }
     }
 

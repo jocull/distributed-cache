@@ -1,8 +1,11 @@
 package com.github.jocull.raftcache.lib.raft.middleware;
 
+import com.github.jocull.raftcache.lib.raft.messages.TermIndex;
+import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.function.Supplier;
 
@@ -59,11 +62,14 @@ class SocketChannelMiddlewareTest {
             assertEquals(a, sideBA.getAddress(), "ChannelSide must report the remote node's address");
             sideBA.setReceiver(nodeB::record);
 
-            sideAB.send("ping");
-            awaitDelivery(() -> nodeB.received(), List.of("ping"), "a->b ping");
+            // The transport now carries a real wire frame (the codec closes the frame set at
+            // the 14 wire types), so the synthetic payload is a VoteResponse whose `term`
+            // doubles as its delivery tag, asserted by count + term below.
+            sideAB.send(frame(1));
+            awaitFrames(() -> nodeB.received(), new int[]{1}, "a->b echo");
 
-            sideBA.send("pong");
-            awaitDelivery(() -> nodeA.received(), List.of("pong"), "b->a pong");
+            sideBA.send(frame(2));
+            awaitFrames(() -> nodeA.received(), new int[]{2}, "b->a echo");
         }
     }
 
@@ -84,13 +90,12 @@ class SocketChannelMiddlewareTest {
             sideAB.setReceiver(nodeA::record);
 
             final int count = 1000;
-            final List<Object> expected = new java.util.ArrayList<>(count);
+            final int[] terms = new int[count];
             for (int i = 0; i < count; i++) {
-                final String message = "m-" + i;
-                expected.add(message);
-                sideAB.send(message);
+                terms[i] = i;
+                sideAB.send(frame(i));
             }
-            awaitDelivery(() -> nodeB.received(), expected, "a->b ordered burst of " + count);
+            awaitFrames(() -> nodeB.received(), terms, "a->b ordered burst of " + count);
         }
     }
 
@@ -118,38 +123,39 @@ class SocketChannelMiddlewareTest {
             sideBA.setReceiver(nodeB::record);
 
             // Baseline: both directions deliver.
-            sideAB.send("a-0");
-            awaitDelivery(() -> nodeB.received(), List.of("a-0"), "baseline a->b");
-            sideBA.send("b-0");
-            awaitDelivery(() -> nodeA.received(), List.of("b-0"), "baseline b->a");
+            sideAB.send(frame(0));
+            awaitFrames(() -> nodeB.received(), new int[]{0}, "baseline a->b");
+            sideBA.send(frame(10));
+            awaitFrames(() -> nodeA.received(), new int[]{10}, "baseline b->a");
 
             mwA.interrupt(a);
             assertTrue(mwA.isInterrupted(a), "isInterrupted should report the seal");
 
             // Sealed A: its own outbound drops at the door...
-            sideAB.send("a-loss");
+            sideAB.send(frame(100));
             // ...while B's outbound still crosses the wire and is consumed-but-discarded by A.
-            sideBA.send("b-loss");
+            sideBA.send(frame(100));
             // Let the single "b-loss" frame be read and discarded before we resume (loopback
             // delivery is immediate and A's reader is a dedicated thread blocked in readFrame).
             awaitMillis(500);
 
-            // Nothing new arrived at either node.
-            assertEquals(List.of("a-0"), nodeB.received(), "a->b send while A is sealed must drop at the door");
-            assertEquals(List.of("b-0"), nodeA.received(), "b->a send must be consumed but discarded while A is sealed");
+            // Nothing new arrived at either node: A's outbound dropped at the door, B's
+            // consumed-but-discarded. Asserted as counts (the sealed payload is discarded).
+            assertEquals(1, nodeB.received().size(), "a->b send while A is sealed must drop at the door");
+            assertEquals(1, nodeA.received().size(), "b->a send must be consumed but discarded while A is sealed");
 
             // Resume: the post-seal burst still lands, strictly in order, with no trace of the
             // discarded frames -- the reader stayed in sync on the byte stream.
             mwA.restore(a);
             assertFalse(mwA.isInterrupted(a), "restore should clear the seal");
 
-            sideAB.send("a-1");
-            sideAB.send("a-2");
-            awaitDelivery(() -> nodeB.received(), List.of("a-0", "a-1", "a-2"), "a->b after restore");
+            sideAB.send(frame(1));
+            sideAB.send(frame(2));
+            awaitFrames(() -> nodeB.received(), new int[]{0, 1, 2}, "a->b after restore");
 
-            sideBA.send("b-1");
-            sideBA.send("b-2");
-            awaitDelivery(() -> nodeA.received(), List.of("b-0", "b-1", "b-2"),
+            sideBA.send(frame(11));
+            sideBA.send(frame(12));
+            awaitFrames(() -> nodeA.received(), new int[]{10, 11, 12},
                     "b->a after restore (b-loss consumed, not desyncing the stream)");
         }
     }
@@ -170,15 +176,16 @@ class SocketChannelMiddlewareTest {
 
         final ChannelMiddleware.ChannelSide sideAB = mwA.openChannel(nodeA, mwB.getAddress());
         sideAB.setReceiver(nodeA::record);
-        sideAB.send("live");
-        awaitDelivery(() -> nodeB.received(), List.of("live"), "pre-close a->b");
+        sideAB.send(frame(1));
+        awaitFrames(() -> nodeB.received(), new int[]{1}, "pre-close a->b");
 
         mwA.close();
         mwA.close(); // idempotent
 
-        // Dead side: send is dropped, never throws.
-        sideAB.send("after-close");
-        assertEquals(List.of("live"), nodeB.received(), "send on a closed channel must be a no-op");
+        // Dead side: send is dropped, never throws (asserted as a count -- the payload of a
+        // dropped send never reaches the peer).
+        sideAB.send(frame(2));
+        assertEquals(1, nodeB.received().size(), "send on a closed channel must be a no-op");
 
         // New channels are refused outright.
         assertThrows(IllegalStateException.class,
@@ -247,12 +254,33 @@ class SocketChannelMiddlewareTest {
 
     // -----------------------------------------------------------------------
 
-    /* Waits until the receiver's list equals the expected sequence (strict order). */
-    private static void awaitDelivery(Supplier<List<Object>> received, List<Object> expected, String what) {
+    /* A synthetic wire frame. The codec closes the frame set at the 14 wire types, so
+     * transport tests must send a real wire message; VoteResponse's `term` field gives each
+     * frame a content-level delivery tag that survives the round-trip (the POJOs carry no
+     * value equality to assert against). */
+    private static VoteResponse frame(int term) {
+        return new VoteResponse(term, new TermIndex(term, 0), true);
+    }
+
+    /* Waits until the receiver holds exactly expectedTerms.length frames, then asserts each
+     * round-tripped to a VoteResponse carrying its expected term at its position -- strict
+     * per-channel FIFO with content check. */
+    private static void awaitFrames(Supplier<List<Object>> received, int[] expectedTerms, String what) {
         final long deadline = System.currentTimeMillis() + 10_000;
-        while (!received.get().equals(expected)) {
+        while (true) {
+            final List<Object> got = received.get();
+            if (got.size() == expectedTerms.length) {
+                for (int i = 0; i < expectedTerms.length; i++) {
+                    assertTrue(got.get(i) instanceof VoteResponse,
+                            what + " — frame " + i + " must round-trip to a VoteResponse");
+                    assertEquals(expectedTerms[i], ((VoteResponse) got.get(i)).getTerm(),
+                            what + " — frame " + i + " must arrive in send order");
+                }
+                return;
+            }
             if (System.currentTimeMillis() > deadline) {
-                fail(what + " — expected " + expected + " but got " + received.get() + " after 10s");
+                fail(what + " — expected terms [" + Arrays.toString(expectedTerms) + "] but had "
+                        + got.size() + " frame(s) after 10s");
             }
             awaitMillis(5);
         }

@@ -231,3 +231,42 @@ message Handshake {
 // No fields: the frame's arrival IS the acknowledgement.
 message Acknowledgement {
 }
+
+// ---------------------------------------------------------------------------
+// the per-frame envelope (Step B)
+// ---------------------------------------------------------------------------
+
+// One frame carries exactly one WireMessage: the 4-byte big-endian length prefix
+// (NETWORKING.md 2.1) sizes a single WireMessage's serialized bytes. The `oneof`
+// is the wire-level type tag that replaces the JDK-serialization className the
+// old wire carried inside every payload — it is how the receiver picks the
+// message decoder WITHOUT loading any JVM class, which is the cross-language
+// property B (a non-JVM client) needs.
+//
+// The 14 variants are exactly the live wire set (the 12 raft messages of
+// lib/raft/messages the node dispatches on, plus the two channel frames
+// Handshake/Acknowledgement). Value types (TermIndex, NodeAddress,
+// NodeIdentifier, the KeyData* payloads, AppendEntries.RaftLog) are NOT variants
+// here: they never ride the wire standalone — they travel as nested fields of
+// the messages that carry them.
+//
+// Field numbers are FROZEN once this ships (compatibility rule 1). To add a new
+// wire message later: append a new variant with the next unused number.
+message WireMessage {
+  oneof message {
+    AcknowledgeEntries        acknowledge_entries         = 1;
+    AnnounceClusterTopology   announce_cluster_topology   = 2;
+    AppendEntries             append_entries              = 3;
+    InstallSnapshot           install_snapshot            = 4;
+    InstallSnapshotResponse   install_snapshot_response   = 5;
+    Introduction              introduction                = 6;
+    PreVoteRequest            pre_vote_request            = 7;
+    PreVoteResponse           pre_vote_response           = 8;
+    StateRequest              state_request               = 9;
+    StateResponse             state_response              = 10;
+    VoteRequest               vote_request                = 11;
+    VoteResponse              vote_response               = 12;
+    Handshake                 handshake                   = 13;
+    Acknowledgement           acknowledgement             = 14;
+  }
+}
