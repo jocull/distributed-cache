@@ -533,8 +533,8 @@ which stay the detailed record.
     that basis does not transfer at all: Java serialization binds to Java classes and
     `serialVersionUID` values and leaks JDK-internal structure (a `KeyDataInput` entry's
     `Map.copyOf(...)` map round-trips only as an opaque blob — Decision #9's own wording).
-    **Recommended direction (2026-11-24, user discussion): Protocol Buffers as the wire codec,
-    over the existing TCP transport.** Rationale: (a) one `.proto` IDL becomes the shared
+    **Chosen direction (2026-11-24, user discussion; new-dependency gate cleared the same day):
+    Protocol Buffers as the wire codec, over the existing TCP transport.** Rationale: (a) one `.proto` IDL becomes the shared
     contract between Java and any client language — Node's `protobufjs` loads the same file at
     runtime, so the client side has no build step; (b) protobuf's field-number schema evolution
     (unknown fields are skipped on read) is exactly the cross-version / rolling-upgrade safety
@@ -552,20 +552,23 @@ which stay the detailed record.
     — the only cross-platform option feasible today under the offline constraint** (it is already
     in the local repo, managed by the `spring-boot-starter-parent` BOM): Node-native, human-
     readable on the wire, zero new downloads, but no IDL and no typed evolution.
-    **Feasibility gate (verified 2026-11-24):** the offline local Maven repo contains
-    `jackson-databind` but **not** `protobuf-java`/`protoc`; adopting protobuf therefore requires
-    a one-off relaxation of the offline / no-new-dependency policy (fetch or vendor) — that
-    relaxation is itself the user's decision, not an implementation detail. If it is declined, the
-    staged interim is the jackson JSON codec over the same payload-neutral frame (cross-platform,
-    debuggable, no downloads), with the `.proto` IDL authored in the meantime as the contract
-    document (authoring an IDL costs no dependency) so the eventual swap is field-for-field.
+    **Feasibility gate (verified 2026-11-24 — CLEARED):** the offline local Maven repo contains
+    `jackson-databind` but **not** `protobuf-java`/`protoc`, so adopting protobuf means adding a
+    new dependency — and the user approved the one-off exception on 2026-11-24 ("You can add a new
+    dependency? I don't care"). Mechanics verified the same day: this environment reaches Maven
+    Central (artifact fetch OK), so `protobuf-java` downloads normally at implementation time —
+    no vendoring step. The jackson JSON path survives only as a fallback if a future build is
+    made hermetic without network access. The `.proto` IDL is authored first as the contract
+    document either way (authoring an IDL costs no dependency), which is what keeps the eventual
+    swap field-for-field.
     **Sequencing vs B is orthogonal:** B's new message set (`design/REMOTE-CLIENT-B-CLIENT-RPC.md`
     §3.1 — four requests + two responses) is small and cheap to port in either order; B's required
     constraint either way is that its payloads are flat, language-portable values
     (string / byte[] / long) and that its contracts be expressible in the IDL — both hold under
     any codec. **Open sub-questions, deliberately undecided:** build mechanics
     (`protobuf-maven-plugin` + protoc artifact vs. a reflection / dynamic-message runtime — both
-    keep the `.proto` as source of truth); whether `Handshake` negotiates the codec (the natural
+    keep the `.proto` as source of truth); the `protobuf-java` version (pick latest stable at
+    implementation time); whether `Handshake` negotiates the codec (the natural
     rolling-upgrade seam — a node speaking both during the migration); and whether B lands on JDK
     serialization and the six messages are ported later, or B lands after the codec swap.
 

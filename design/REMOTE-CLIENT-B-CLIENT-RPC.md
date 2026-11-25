@@ -55,15 +55,16 @@ non-`Serializable` read payload. Each of those is called out below with honest o
 
 ## 2. What already exists that B reuses (no changes)
 
-- **Frame + codec** (`NETWORKING.md` §2.1, D8/#9) — B is zero-dep by construction; it only adds
-  `Serializable` message types. One caveat on codec: the JDK serialization choice is a
+- **Frame + codec** (`NETWORKING.md` §2.1, D8/#9) — B is zero-dep *today* by construction; it
+  only adds `Serializable` message types. One caveat on codec: the JDK serialization choice is a
   PoC-grade one — offline-constraint-driven (Decision #9 in `SCOPE.md`), not cross-version-safe,
   and unusable by non-JVM clients (a Node.js client cannot deserialize Java serialization).
-  The cross-language codec migration (recommended target: Protocol Buffers over this same
-  frame) is tracked as Follow-up #11 in `SCOPE.md`. Consequence for B: its new messages should
-  keep **flat, language-portable payloads** (string / byte[] / long, wrapping the `KeyData*`
-  inputs) rather than nested Java object graphs, so the codec swap stays cheap whichever codec
-  wins.
+  The cross-language codec migration is tracked as Follow-up #11 in `SCOPE.md`, and its
+  one-off new-dependency exception was approved by the user 2026-11-24 (chosen target: Protocol
+  Buffers over this same frame). Consequence for B: its new messages should keep
+  **flat, language-portable payloads** (string / byte[] / long, wrapping the `KeyData*`
+  inputs) rather than nested Java object graphs, so the swap into the target codec stays
+  mechanical.
 - **`Request`/`Response` correlation** — `Request.requestId` (UUID), `Response(Request)` echo,
   `NodeRequests#getRequestFuture/completeRequest` (a generic pending-future map; currently a
   **5 s** timeout — in-code TODO). B's client requests reuse this **verbatim** (same pattern as
