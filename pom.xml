@@ -38,6 +38,15 @@
             <artifactId>commons-lang3</artifactId>
             <version>3.12.0</version>
         </dependency>
+        <!-- Wire codec (SCOPE.md Decision #9 successor / Follow-up #11, 2026-11-24,
+             new-dependency gate cleared by the user): the protobuf-java runtime for
+             the generated wire messages in src/main/proto/wire.proto. The .proto file
+             is the compatibility contract; field numbers there are frozen. -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>4.35.0</version>
+        </dependency>
         <dependency>
             <groupId>commons-codec</groupId>
             <artifactId>commons-codec</artifactId>
@@ -61,5 +70,42 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Codegen for src/main/proto/*.proto (Follow-up #11). Generates Java
+                 into the com.github.jocull.raftcache.lib.raft.messages.proto package
+                 (set in wire.proto's java_package option) — a separate package from
+                 the hand-written lib/raft/messages POJOs on purpose, so the generated
+                 classes never collide with them; the codec adapter (Step B) maps
+                 POJO <-> generated message at the SocketChannelMiddleware frame seam.
+             -->
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <version>0.6.1</version>
+                <configuration>
+                    <protocArtifact>com.google.protobuf:protoc:4.35.0:exe:${os.detected.classifier}</protocArtifact>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>compile-protos</id>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+        <extensions>
+            <!-- Resolves ${os.detected.classifier} (linux-x86_64 / osx-x86_64 / ...)
+                 for the protoc artifact above, so the build is portable. -->
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>1.7.1</version>
+            </extension>
+        </extensions>
+    </build>
 
 </project>

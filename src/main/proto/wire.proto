@@ -1,0 +1,233 @@
+// wire.proto — the Protocol Buffers wire contract for the raftcache cluster protocol.
+//
+// STATUS: the single source of truth for how messages cross the TCP socket of
+// SocketChannelMiddleware (SCOPE.md Decision #9 successor / Follow-up #11, 2026-11-24,
+// user-approved dependency gate). The previous JDK-serialization payload is PoC-grade
+// and not cross-version safe; from here on, field numbers ARE the compatibility
+// contract.
+//
+// COMPATIBILITY RULES (read before editing):
+//   1. Once a field number is used, it is FROZEN: never renumber, never delete the
+//      number, never reuse it for a different or narrower type.
+//   2. To evolve a message: ADD a new field (new, currently-unused number) and/or
+//      mark an old field `deprecated` — never repurpose it.
+//   3. proto3 semantics apply: missing/absent = zero value (0 / false / empty).
+//      Receivers that do not know a field skip it and keep the known fields —
+//      that is the forward-compatibility property this IDL buys (the
+//      unknown-field-tolerance pin in WireSerializationTest exercises it).
+//   4. The 4-byte big-endian length-prefixed **frame** (NETWORKING.md 2.1) wraps the
+//      serialized message bytes of exactly one message per frame; this file defines
+//      the payload only. Handshake/Acknowledgement ride the same frames (Network 2.2).
+//
+// FLAT PAYLOAD RULE (remote-client requirement, B §3.1): every scalar/bytes value
+// here is language-portable (string / bytes / 32-bit / 64-bit ints / bools / enums)
+// so a non-JVM client, or another JVM at a newer/older version, can interoperate.
+// No Java object graph, no arbitrary `Object` — the former JDK-ser `Object entry`
+// becomes an explicit oneof of the named entry types below.
+
+syntax = "proto3";
+
+package raftcache.wire;
+
+option java_package   = "com.github.jocull.raftcache.lib.raft.messages.proto";
+option java_multiple_files = true;
+
+// ---------------------------------------------------------------------------
+// value types
+// ---------------------------------------------------------------------------
+
+// A node's wire address: host:port as a string (host may be an IP or a literal
+// '127.0.0.1-style' dial string; keep whatever the dialer accepted).
+message NodeAddress {
+  string address = 1;
+}
+
+// A (term, log-index) pair: Raft's two-dimensional position (Raft §5, Raft-logs).
+message TermIndex {
+  int32 term  = 1;
+  int64 index = 2;
+}
+
+// A node's identity on the wire: logical id + dialable address
+// (NodeIdentifier today).
+message NodeIdentifier {
+  string        id          = 1;
+  NodeAddress   node_address = 2;
+}
+
+// The node's role (Java's lib.raft.NodeStates: FOLLOWER/CANDIDATE/LEADER).
+// NODE_STATE_UNSPECIFIED is the proto3 zero-value; a well-formed StateResponse
+// always carries one of the three real states.
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_FOLLOWER    = 1;
+  NODE_STATE_CANDIDATE   = 2;
+  NODE_STATE_LEADER      = 3;
+}
+
+// ---------------------------------------------------------------------------
+// payloads (the flat KeyData* family; B §3.1 / B §3.2 read-payload lives here)
+// ---------------------------------------------------------------------------
+
+// Put: key + named byte-blob fields (the old Map<String, byte[]> 'data').
+message KeyDataInput {
+  string key = 1;
+  // name -> raw value bytes, flat per the flat-payload rule (a proto3 map of
+  // scalar bytes; no nested object graph).
+  map<string, bytes> data = 2;
+}
+
+// Delete: key only.
+message KeyDataDeleteInput {
+  string key = 1;
+}
+
+// Expire: key + TTL. Duration is flat-serialized to nanoseconds (single int64),
+// preserving java.time.Duration's unit without nesting a duration message.
+message KeyDataExpireInput {
+  string key        = 1;
+  int64 ttl_nanos   = 2;
+}
+
+// Read result (B §3.2's payload, born wireable directly — the 'KeyDataOutput
+// NOT Serializable' pre-emption of Task 1 lands here).
+message KeyDataOutput {
+  string key = 1;
+  map<string, bytes> data = 2;
+  int64 version = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Raft log entries (AppendEntries payloads)
+// ---------------------------------------------------------------------------
+
+// One replicated log entry. `entry` is the oneof of the named entry
+// types the state machine applies today (StateMachineBridge.applyLog:
+// KeyDataInput / KeyDataDeleteInput / KeyDataExpireInput) plus the
+// current, tolerated `String` case (entries of other types today
+// advance the applied index with no state-machine action — modeled
+// honestly as an explicit string variant rather than a typed hole).
+message RaftLog {
+  TermIndex term_index = 1;
+  oneof entry {
+    KeyDataInput      key_data_put    = 2;
+    KeyDataDeleteInput key_data_delete = 3;
+    KeyDataExpireInput key_data_expire = 4;
+    string            string_entry    = 5;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Raft protocol messages (the live surface, lib/raft/messages/*)
+// ---------------------------------------------------------------------------
+
+// Follower ack for an AppendEntries batch.
+message AcknowledgeEntries {
+  int32     term = 1;
+  bool      success = 2;
+  TermIndex current_term_index = 3;
+}
+
+// Leader announces the cluster membership it has seen.
+message AnnounceClusterTopology {
+  repeated NodeIdentifier identifiers = 1;
+}
+
+// Leader -> follower log-replication/heartbeat batch (Raft §5.2, §5.3, §5.4.1).
+message AppendEntries {
+  int32     term = 1;
+  TermIndex previous_log_term_index = 2;   // consistency check (Raft §5.3)
+  TermIndex leader_commit_term_index = 3;  // leader commit index hint (Raft §5.3)
+  repeated RaftLog entries = 4;            // empty for a heartbeat
+}
+
+// Leader -> follower snapshot install; payload is the chunk bytes (Object
+// today, byte[] in practice).
+message InstallSnapshot {
+  int32     term               = 1;
+  string    leader_id          = 2;
+  int64     last_included_index = 3;       // Raft §7.2 boundary
+  int32     last_included_term  = 4;
+  int64     offset             = 5;
+  bytes     payload            = 6;
+  bool      done               = 7;
+}
+
+// Follower -> leader snapshot ack.
+message InstallSnapshotResponse {
+  int32     term   = 1;
+  int64     index  = 2;
+  int64     offset = 3;
+}
+
+// First application-level frame on a new channel: who the node is + its
+// address + its last received term/index (NodeConnectionOutboundImpl dispatch).
+message Introduction {
+  string    id = 1;
+  NodeAddress node_address = 2;
+  TermIndex last_received_term_index = 3;
+}
+
+// Pre-vote request (leader-election §5.2): candidate -> node.
+message PreVoteRequest {
+  int32     term = 1;
+  string    candidate_id = 2;
+  TermIndex last_log_term_index = 3;
+}
+
+// Pre-vote response.
+message PreVoteResponse {
+  int32 term = 1;
+  bool  pre_vote_granted = 2;
+}
+
+// StateRequest: Request base only (correlation id); the rest is carried in
+// the response.
+message StateRequest {
+  string request_id = 1;   // Request base: UUID as canonical string
+}
+
+// StateResponse: the node's own identity, role, term, current + committed
+// positions (StateResponse today).
+message StateResponse {
+  string         request_id = 1;           // Response base: echoes the request's id
+  NodeIdentifier identifier = 2;
+  NodeState      state      = 3;
+  int32          term       = 4;
+  TermIndex      current_term_index  = 5;
+  TermIndex      committed_term_index = 6;
+}
+
+// Vote request (leader-election §5.2): candidate -> node.
+message VoteRequest {
+  int32     term = 1;
+  string    candidate_id = 2;
+  TermIndex last_log_term_index = 3;
+}
+
+// Vote response.
+message VoteResponse {
+  int32     term = 1;
+  TermIndex committed_term_index = 2;
+  bool      vote_granted = 3;
+}
+
+// ---------------------------------------------------------------------------
+// channel-level frames (the same 4-byte-BE length-prefixed frames carry these;
+// they cross the codec seam like the raft messages because
+// SocketChannelMiddleware serializes/deserializes them with the same
+// ObjectOutputStream/ObjectInputStream pair).
+// ---------------------------------------------------------------------------
+
+// The handshake frame: client announcing itself + target node it dials (N1,
+// Network 2.2).
+message Handshake {
+  NodeAddress client = 1;
+  NodeAddress target = 2;
+}
+
+// The acknowledgement frame: empty marker — the server writes it once the
+// receiver is installed and the client blocks until it reads this (N1).
+// No fields: the frame's arrival IS the acknowledgement.
+message Acknowledgement {
+}
