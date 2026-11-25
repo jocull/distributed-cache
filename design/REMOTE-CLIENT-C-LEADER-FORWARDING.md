@@ -1,89 +1,96 @@
-# Option C — Leader forwarding (any surviving node accepts a write, non-leaders forward)
+# Option C — Non-leader writes: forward, or redirect? (DEFERRED; undecided)
 
-> **Status:** design/spike only — not implemented. Under-specified where implementation will
-> discover detail; concrete where the code already fixes the answer. Parent:
-> `design/REMOTE-CLIENT.md`.
+> **Status: DEFERRED — a decision, not yet a project.** Not in scope for B's first cut.
+> This documents the *choice to make at or after B lands*: what happens when a write lands on a
+> node that is **not** the leader.
 >
-> **One-line:** turn "a write must be sent *to the leader's JVM*" into "a write can be sent
-> *to any node* — a non-leader forwards it to the current leader and returns the leader's commit
-> result." This is the small, self-contained enabler that both A and B benefit from.
+> **Two candidate mechanisms are specified in this file:**
+>
+> 1. **Forward** — the node forwards the write to the current leader in-cluster and relays the
+>    leader's commit result back to the client. (The cluster does the routing.)
+> 2. **Redirect** — the node replies with a typed "not leader — leader is X" error, and the
+>    client re-targets its connection to X and retries the write. (The client does the routing;
+>    Redis-style, cf. cluster `MOVED`/`ASK` redirection.)
+>
+> **Neither is chosen.** B ships without C: its first-cut non-leader write path is a *typed,
+> retryable not-leader error* (it may or may not carry the discoverable leader's address — the
+> shape is open in B §3.4, and if it does carry one, that *is* the redirect mechanism in variant
+> 2 below), and the client re-discovers the leader and retries. Option C is the follow-up
+> quality decision on top of that. Do **not** implement either variant before the choice is
+> recorded.
+>
+> Under-specified where implementation will discover detail; concrete where the code already
+> fixes the answer. Parent: `design/REMOTE-CLIENT.md`.
 
 ---
 
-## 1. High-level view (for a human reviewer)
+## 1. Where this sits (for a human reviewer)
+
+B (the chosen design) makes **any surviving node a client entry point**. What B's first cut
+deliberately does *not* include is a *handy* path for the "write arrived at a non-leader" case:
+today it would be refused, and the client has to re-discover the leader and retry. That works,
+but every such write pays for it, and it gets worse during leader churn.
+
+Option C is the decision of *who* fixes that:
 
 ```
-                 client (in-process facade today; a remote client later via B)
-                          │  put / delete / expire   — may land on ANY node
-                          ▼
-        ┌────────────────── any node ───────────────────┐
-        │                                                │
-        │  I'm the LEADER?  ─yes─>  submit(entry)        │   ← the existing path;
-        │                            (commit → apply →   │     apply-then-ack preserved.
-        │                             acknowledge)        │     Returns committed RaftLog<op>.
-        │                            ──> reply(result)    │
-        │                                                │
-        │  I'm NOT the leader?  ─→  getLeader()         │   ← discover current leader
-        │                       → forward the SAME entry│     (new node↔node message)
-        │                         to the leader         │
-        │                       ← relay the leader's    │
-        │                         commit result back    │
-        └────────────────────────────────────────────────┘
+              client ── write ──>  non-leader node
+                                      │
+                       ┌──────────────┴──────────────┐
+                       ▼                             ▼
+             [Redirect]                       [Forward]
+   "not leader, leader = X"           node → leader : submit(entry)
+   client re-targets to X, retries    leader → node : commit result
+   client → X : same write            node → client : commit result
 ```
 
-- **The single new capability:** if a write arrives at a node that is *not* the leader, that
-  node forwards the exact same write entry to the leader and hands the leader's commit result
-  back to the caller — instead of refusing.
-- **Every other node in a quorum is now a valid write entry point.** This removes the
-  "co-located with the leader" constraint without touching Raft semantics: the follower does
-  *not* commit, apply, or hold a divergent copy — it hands the entry up to the leader, which
-  commits it exactly once under the leader, and the follower picks it up through normal
-  `AppendEntries`/`InstallSnapshot` replication like any other entry.
-- **It stays entirely in the node↔node world.** The forward is a regular node-to-node message
-  between already-introduced peers. It does **not** need B's foundational "how do we tell a
-  *client* connection from a *Raft-peer* connection?" decision (Option B §4.1). That is the main
-  reason C is small and low-risk: it reuses the well-understood pre-introduction/post-introduction
-  dispatch that already works for `AppendEntries`, `InstallSnapshot`, and `StateRequest`.
+The **client-visible outcome is identical** under the two variants (a successful write plus the
+leader's committed term/index). What differs is *who makes the second hop*, and therefore what
+code that entails:
 
-**Why it's attractive:** it is the smallest, most self-contained increment of the three. It
-changes only the write path's *accept* rule (leader-only → any-node), it reuses `submit`,
-`getLeader`, and the existing request/response correlation verbatim, and it composes with both
-the in-process facade (A's territory) and the remote client (B's). Its principal limit: it is a
-**write** forwarding story; reads can stay local (eventually consistent on a follower) — that is
-deliberately out of C's scope.
+- **Redirect** adds an *error type* to B's wire plus re-target/retry policy *in the client*.
+  The cluster is otherwise untouched.
+- **Forward** adds a *request/response pair plus handlers* to the cluster's peer↔peer wire.
+  The client is untouched.
+
+Neither changes Raft: in **both** variants **the leader is the only node that commits**,
+apply-then-ack is unchanged, and a non-leader never commits, applies, or holds a divergent copy
+of the write it is handling.
 
 ---
 
-## 2. What already exists that C reuses (no changes)
+## 2. What already exists that both variants build on (no changes)
 
 - **The exact write entries** — `KeyDataInput` (put), `KeyDataDeleteInput` (delete),
   `KeyDataExpireInput` (expire); all `java.io.Serializable` and the *same objects* the leader
-  appends today. A forwarded write is literally the object the in-JVM facade already
-  `submit`s via `DistributedCache` (`leader.submit(new KeyDataInput(key, data))`, etc.).
+  appends today (`leader.submit(new KeyDataInput(key, data))`, etc., via `DistributedCache`).
 - **Leader commit + apply-then-ack** — `RaftNode#submit` →
   `RaftNodeBehaviorLeader#updateCommittedIndex` (majority) → `RaftLogs#commit` (returns logs,
-  does **not** ack) → `LogsCommitted` published → `StateMachineBridge` applies to the `PartitionMap`
-  (synchronous) → **only then** `RaftLogs#notifyCommitted` completes the `CompletableFuture<RaftLog<…>>`.
-  The leader-side handler in C calls the *same* `submit`; it does **not** re-implement any of
-  this. The client-visible result of a forwarded write is the leader's `RaftLog<op>` — the
-  committed term/index.
+  does **not** ack) → `LogsCommitted` published → `StateMachineBridge` applies to the
+  `PartitionMap` (synchronous) → **only then** `RaftLogs#notifyCommitted` completes the
+  `CompletableFuture<RaftLog<…>>`. Forward's leader-side handler calls the *same* `submit`; it
+  re-implements none of this. The commit result a client ultimately sees under either variant
+  is the leader's `RaftLog<op>` (the committed term/index).
 - **Leader discovery (in-JVM, already present)** — `RaftNode#getLeader()` →
-  `getClusterNodeStates()` → `StateRequest` to active peers → pick `LEADER` at max term. The
-  forwarder uses this to learn *where* to send.
+  `getClusterNodeStates()` → `StateRequest` to active peers → pick `LEADER` at max term.
+  Redirect uses this to *name* the leader in the error; Forward uses it to *route* the forward.
 - **Request/response correlation (generic — reuse verbatim)** — `Request.requestId` (UUID),
   `Response(Request)` echo, `NodeRequests#getRequestFuture(req, respClass)` +
-  `completeRequest(resp)` (a pending-future map keyed by `requestId`; currently a **5 s** timeout
-  — in-code TODO "Is this timeout appropriate?"). C's forward request reuses this exactly the
-  way `sendStateRequest`/`StateResponse` does.
+  `completeRequest(resp)` (a pending-future map keyed by `requestId`; currently a **5 s**
+  timeout — in-code TODO "Is this timeout appropriate?"). Forward's node↔node request reuses
+  this exactly the way `sendStateRequest`/`StateResponse` does; Redirect does not need it.
 - **Transport + dispatch** — `ChannelMiddleware`/`ChannelSide`; `SocketChannelMiddleware` for
   real sockets; `NodeConnectionOutboundImpl#receive(Object)` is the `instanceof` dispatch chain
-  (two-phase: pre-introduction vs post-introduction). The forward message is a **post-introduction**
-  message (it travels between already-introduced peers), so it slots into the same phase as
+  (two-phase: pre-introduction vs post-introduction). Forward's message is a **post-introduction**
+  one (it travels between already-introduced peers) — the same phase as
   `AppendEntries`/`InstallSnapshot`.
 
 ---
 
-## 3. New pieces (proposed; names tentative)
+## 3. Variant 1 — Forward (the cluster does the routing)
+
+**One-line:** a write that lands on a non-leader is forwarded by that node to the leader, and
+the leader's commit result is relayed back to the caller untouched.
 
 ### 3.1 A node↔node **forward request + response** pair (in `lib/raft/messages/`)
 
@@ -95,7 +102,7 @@ Two possible shapes (pick one during implementation; both are small):
 
 | Shape | Request carries | Response carries | Note |
 |---|---|---|---|
-| **Enveloped (tend toward this)** | which op + the matching entry object (`KeyDataInput` / `KeyDataDeleteInput` / `KeyDataExpireInput`) | the committed `RaftLog<…>` (term+index) or an error/enum | One message type per *direction*; op + entry nested inside. Neatest reuse of the three existing payload types. |
+| **Enveloped (lean toward this)** | which op + the matching entry object (`KeyDataInput` / `KeyDataDeleteInput` / `KeyDataExpireInput`) | the committed `RaftLog<…>` (term+index) or an error/enum | One message type per *direction*; op + entry nested inside. Neatest reuse of the three existing payload types. |
 | **One-per-op** | a dedicated `KeyDataInput` / `KeyDataDeleteInput` / `KeyDataExpireInput` each | `RaftLog<…>` | Mirrors the codebase's "one type per operation" convention but means three request types + one shared response. |
 
 > The **response** is the same in either shape — a `RaftLog<…>` (committed term/index) **or** a
@@ -109,13 +116,14 @@ On the node that is *not* the leader, when a write is handed to it:
 1. Resolve the leader: `getLeader()` (existing; returns a `RaftNode` at max term, or errors if
    none/ambiguous — same refusal behavior as the facade's `findLeaderNode`).
 2. Open / reuse the channel to that leader (existing `ChannelMiddleware#openChannel` / the
-   connection machinery in `RaftNodeImpl`), or the already-present outbound connection if one exists.
+   connection machinery in `RaftNodeImpl`), or the already-present outbound connection if one
+   exists.
 3. Send the forward request (carrying the entry) and await the correlated response via `NodeRequests`.
 4. Relay the leader's result (committed `RaftLog<…>` or the typed failure) back to the caller.
 
 The non-leader **must not** locally `submit`, commit, or apply the entry. It is a pure relay on
 the write path; it receives the entry afterward through normal replication. (This is the
-correctness core — see §6 invariants.)
+correctness core — see §3.6 invariants.)
 
 ### 3.3 The **leader-side** forward handler (the new behavior)
 
@@ -137,60 +145,61 @@ On the leader, when the forward request arrives:
 - `NodeCommunicationSender` — add a `sendForward(...)` that returns
   `CompletableFuture<ForwardResponse>` (correlated), mirroring `sendStateRequest`.
 - `NodeCommunicationReceiver` — add `onForward(sender, req)`; the Leader behavior implements it
-  (submit + reply), the Follower/Candidate behavior implements it (forward to leader + relay).
+  (submit + reply); the Follower/Candidate behavior implements it (forward to leader + relay).
 - `RaftNodeBehavior` (Leader / Follower / Candidate) — provide the two handler variants above.
 
-> **Optional (open, not required):** the same `instanceof`-chain registry cleanup noted in Option
-> B §3.3. Do not bundle it here; it is separable.
+> **Optional (open, not required):** the same `instanceof`-chain registry cleanup noted in
+> Option B §3.3. Do not bundle it here; it is separable.
 
-### 3.5 The **caller** interface (where C plugs in)
+**The caller of Forward is B's non-leader write path:** B's write handler on a non-leader node
+would invoke this forwarder instead of refusing. A (the in-process shim) is rejected — there is
+no separate in-jVM caller path to wire in.
 
-C is agnostic to *who* calls it. Two concrete integrations, both small and both downstream of C:
-- **In-process facade (A's world):** `DistributedCache.put/delete/expire` currently refuse if the
-  node is not the leader. With C, "hand the write to *any* in-JVM node; that node forwards
-  itself." The facade's `findLeaderNode` refusal becomes either a retryable error or a call to
-  the forwarder. This is what makes Option A fault-tolerant to losing the leader's JVM (smaller
-  benefit, per A's own §9 — the cache-server JVM is still the entry point).
-- **Remote client (B's world):** a non-leader's client-side write handler forwards to the leader
-  instead of refusing. This is what makes Option B's "any surviving node is a valid entry point"
-  true across leader churn.
+### 3.5 Pivotal open questions specific to Forward
 
----
-
-## 4. The pivotal open questions (C's decisions)
-
-1. **One envelope vs one-per-op.** §3.1 shape decision. Leaning toward the enveloped single
+1. **One envelope vs one-per-op.** §3.1 shape decision. Lean toward the enveloped single
    message type; both are small. Do not over-spend on this.
 2. **Connection-reuse strategy.** Does the forwarder open a *new* channel per forward, or reuse
-   the already-present outbound `NodeConnectionOutbound` to the leader (the same one `AppendEntries`
-   uses)? Reuse is the natural answer (a leader already needs a connection to the follower for
-   replication, and a follower to the leader for `VoteRequest`/`PreVote`). Confirm the reuse path
-   exists before assuming it (it almost certainly does; the follower already talks to the leader
-   during election). Open to record.
+   the already-present outbound `NodeConnectionOutbound` to the leader (the same one
+   `AppendEntries` uses)? Reuse is the natural answer (a leader already needs a connection to
+   the follower for replication, and a follower to the leader for `VoteRequest`/`PreVote`).
+   Confirm the reuse path exists before assuming it (it almost certainly does; the follower
+   already talks to the leader during election). Open to record.
 3. **No-leader / ambiguity failure shape.** `getLeader()` already refuses on zero or more-than-one
    leaders. The forwarder must turn that into a **retryable** typed error (re-discover and try
    again), not a crash. How long / how often to retry — a policy, not a code detail; leave open.
 4. **Timeout on the forward.** `NodeRequests` is currently a hard **5 s** (in-code TODO). A
    forwarded write is a Raft commit under network + load; under pressure it may not fit 5 s.
-   Flag: derive the timeout from the same policy as B (§4.6 there), do **not** hardcode 5 s as
-   permanent.
-5. **Read forwarding — out of scope.** C is write-forwarding. Reads stay local (eventually
-   consistent on a follower); if a client wants consistent reads, that is the cross-cutting
-   read-index/leases add-on from `REMOTE-CLIENT.md` §4.1, **not** part of C. State this in the
-   C docs so a hand-off session doesn't accidentally fold it in.
-6. **Forwarding loops.** If the "leader" the forwarder learned about is wrong (a stale
+   Flag: derive the timeout from the same policy as B's client-side timeout (B's §4.6 there), do
+   **not** hardcode 5 s as permanent.
+5. **Forwarding loops.** If the "leader" the forwarder learned about is wrong (a stale
    `getLeader()`), the target might itself forward back. Guard against that: when a leader
    receives a forward but is *not* actually leader by the time it acts, it returns a typed
    failure (not a re-forward). Keep forwarding acyclic.
-7. **Audit of `submit` caller context.** `RaftNode#submit` today asserts caller-is-leader. With
-   C, the *leader's* call site in the forward handler is leader by construction (the forward
-   arrived at the leader). Confirm the assertion still holds at the new call site and that
-   nothing else relies on `submit` only being reachable in-process (a quick `grep` should confirm
-   that; if the assertion is purely an internal invariant, C is safe).
+6. **Audit of `submit` caller context.** `RaftNode#submit` today asserts caller-is-leader. With
+   Forward, the *leader's* call site in the forward handler is leader by construction (the
+   forward arrived at the leader). Confirm the assertion still holds at the new call site and
+   that nothing else relies on `submit` only being reachable in-process (a quick `grep` should
+   confirm that; if the assertion is purely an internal invariant, Forward is safe).
 
----
+### 3.6 Invariants (Forward)
 
-## 5. Acceptance bar (test criteria for a later session; not implementation)
+- **Apply-then-ack is end-to-end on the leader path.** The *leader* handler must not reply before
+  `submit`'s future resolves, and that resolution already happens post-commit + post-apply. The
+  *non-leader* must not shortcut by replying from its own `PartitionMap` (which does not contain
+  a just-arrived forwarded write until replication lands) and must not locally commit the entry.
+- **No split-brain.** One writer per write: the leader does the commit; non-leaders only forward.
+  The `submit` leader-assertion (if it exists) must still hold at the forward handler's call
+  site.
+- **Idempotency of a re-forward.** The cache is last-writer-wins by key; a duplicate forwarded
+  put is safe (converges to the same value), but it is still an extra log entry. The design does
+  **not** promise exactly-once delivery; it promises *convergence*. Document that explicitly.
+- **Forwarding is acyclic.** No node forwards to itself, and no leader re-forwards a forward.
+- **Caller does not leak internals.** The caller's contract is `put/delete/expire` → commit
+  result / typed failure; it never sees a `RaftNode` or `RaftLog` unless it *wants* to (B's
+  client may surface the term/index as a detail).
+
+### 3.7 Acceptance bar (test criteria for a later session; not implementation)
 
 - **Write on a non-leader commits via the leader.** Client/harness does `put` at a node that is
   *not* the current leader; the write commits under the current leader, appears in the leader's
@@ -205,78 +214,188 @@ C is agnostic to *who* calls it. Two concrete integrations, both small and both 
   under the new leader. The exactly-one-leader invariant holds (no split-brain).
 - **No-leader window.** All nodes in election → the forwarder returns a clean, retryable error
   (not a crash) and recovers once a leader is elected.
-- **Reads remain eventually-consistent** — assert that, and assert C did **not** silently upgrade
-  reads (C is write-forwarding only).
+- **Reads remain eventually-consistent** — assert that, and assert Forward did **not** silently
+  upgrade reads (Forward is write-forwarding only).
 - **Gate:** `mvn -o -B test` green (461/0/0/1 baseline) before committing.
 
----
-
-## 6. Correctness invariants (must be preserved by any implementation)
-
-- **Apply-then-ack is end-to-end on the leader path.** The *leader* handler must not reply before
-  `submit`'s future resolves, and that resolution already happens post-commit + post-apply. The
-  *non-leader* must not shortcut by replying from its own `PartitionMap` (which does not contain
-  a just-arrived forwarded write until replication lands) and must not locally commit the entry.
-- **No split-brain.** One writer per write: the leader does the commit; non-leaders only forward.
-  The `submit` leader-assertion (if it exists) must still hold at the forward handler's call
-  site.
-- **Idempotency of a re-forward.** The cache is last-writer-wins by key; a duplicate forwarded
-  put is safe (converges to the same value), but it is still an extra log entry. The design does
-  **not** promise exactly-once delivery; it promises *convergence*. Document that explicitly.
-- **Forwarding is acyclic.** No node forwards to itself, and no leader re-forwards a forward.
-- **Caller does not leak internals.** The caller's contract is `put/delete/expire` → commit
-  result / typed failure; it never sees a `RaftNode`, a `RaftLog`, or a cluster address unless
-  it *wants* to (that is B's / A's concern, not C's).
-
----
-
-## 7. Risks & honest trade-offs
+### 3.8 Risks (Forward)
 
 - **It assumes a node can reach the leader.** If the network partition is such that the
   forwarder cannot reach the current leader, the write is *stalled* (it cannot commit anyway).
   This is not a regression from today's behavior — today the same node would refuse — but it
-  means C does not magically make writes succeed under *arbitrary* network partitions. The
+  means Forward does not magically make writes succeed under *arbitrary* network partitions. The
   leader is still required to commit. State this honestly.
 - **It adds one more message type to the dispatch chain.** The `instanceof` chain is the
-  in-`// TODO` "not very maintainable" spot. An additive branch is small; a registry refactor
-  is optional and separable (Option B §3.3).
+  in-code `// TODO` "not very maintainable" spot. An additive branch is small; a registry
+  refactor is optional and separable (Option B §3.3).
 - **Stale `getLeader()`.** A forwarder that learned the leader from a just-stale state can
-  forward to a node that is no longer leader — handled by §4.6 (typed failure, no re-forward
-  loop). Confirm this path in the acceptance bar (§5, leader-failover-mid-forward).
-- **Positive:** smallest of the three, fully self-contained, composes with both A and B, and
-  reuses nearly every existing primitive. It is the natural *first* increment to land if a
-  hand-off session wants a quick, shippable win that also unblocks B.
+  forward to a node that is no longer leader — handled by §3.5.5 (typed failure, no re-forward
+  loop). Confirm this path in the acceptance bar (§3.7, leader-failover-mid-forward).
+- **Positive:** the cluster-side variant of C — it reuses nearly every existing primitive
+  (`submit`, `getLeader`, `NodeRequests`, the dispatch seam), and the client stays simple (fire
+  and wait).
 
 ---
 
-## 8. Dependencies & hand-offs
+## 4. Variant 2 — Redirect (the client does the routing; Redis-style)
 
-- **Depends on:** nothing new. Builds only on existing, green code.
-- **Composes with:**
-  - **Option A** (`design/REMOTE-CLIENT-A-EMBEDDED-SHIM.md`) — if A's cache-server JVM still
-    hosts a node that can forward, its writes survive losing *leadership*; benefit is smaller
-    than for B (the JVM is still the entry point).
-  - **Option B** (`design/REMOTE-CLIENT-B-CLIENT-RPC.md`) — if B's client-side write handler
-    on a non-leader just calls C's forwarder, B's "any surviving node is a valid entry point"
-    guarantee becomes true across leader churn. **C lands before B's B3/B4 (client object and
-    failover)**, and B's B5 (consistent-read knob) still sits independently.
-- **Cross-cutting (do not fold in by default):** read consistency (read-index/leases) —
-  `REMOTE-CLIENT.md` §4.1, **not** part of C; auth model — `REMOTE-CLIENT.md` §4.2, C does
-  not address auth (the forward is node↔node over the existing peer channel).
+**One-line:** a write that lands on a non-leader is refused with a *typed* error that **names the
+current leader**, and the client re-targets its connection to that leader and retries the same
+write. The cluster stays dumb; the client does the routing. (Cf. Redis-cluster `MOVED`/`ASK`
+redirection; a Redis master's `READONLY` refusal on replica writes is a close relative.)
+
+### 4.1 Shape
+
+- On a non-leader, B's write handler (*the same handler B already builds* — B §3.4) does **not**
+  `submit`; instead it resolves `getLeader()`:
+  - **one leader found** → the response is the typed *"not leader"* error **carrying the
+    leader's `NodeAddress`/node id**;
+  - **none or more than one** → the response is the typed *"no leader right now"* error
+    **without** a leader address (purely retryable — B's first-cut behavior).
+- The client (B's `RemoteCacheClient`) treats the error as "re-target": refreshes its leader
+  view with the named address, (re)opens a connection to the named leader, and retries the
+  *same* write, bounded-retry + backoff (policy, open).
+- Side benefit: the error is a continuous *leader hint* — the client's leader view stays warm
+  even if it never explicitly asked for leadership.
+
+### 4.2 Integration seams (small)
+
+- **Wire:** one new response type, **or** one new error field/enum on B's existing
+  `CacheWriteResponse` (name open; the shape — "typed error + an optional leader address" — is
+  the decision). This rides **B's client-facing wire**; it adds **no new cluster↔cluster
+  message**.
+- **Node-side:** B's non-leader write handler (B §3.4) returns the error instead of today's
+  no-leader refusal. No new `RaftNodeBehavior` handler, no `NodeRequests` correlation, and no
+  change to the dispatch chain (unless the error is modeled as a new message type — the open
+  shape choice from §4.3.1).
+- **Client-side:** B's `RemoteCacheClient` gains the re-target/retry loop on "not leader"
+  (bounded retries, re-discovery, anti-loop — §4.3.2/§4.3.3).
+- **Auth:** none beyond B's client-facing auth decision (same surface).
+
+### 4.3 Pivotal open questions specific to Redirect
+
+1. **Error shape.** New response type vs. a field on `CacheWriteResponse` (§4.2 shape choice).
+   Small; decide it and record it.
+2. **Retry policy.** Bounded attempts, backoff, and the treatment of "leader changed again"
+   between the error and the retry (the answer is that the same error is retryable and the
+   client re-discovers; a third consecutive not-leader response naming the node it was told to
+   go to is a hard error / re-discovery — anti-loop; policy detail open).
+3. **Stale leader hints.** The named leader may be demoted again before the client's retry lands.
+   The error must **always** stay retryable, and the client must re-discover on a second
+   not-leader response (covered by §4.3.2 anti-loop).
+4. **Client-side latency.** Under heavy leader churn, every write pays an extra
+   error→retry round trip at the *client*. Acceptable trade if we take this variant (it is
+   exactly how Redis-cluster clients run); record it.
+
+### 4.4 Invariants (Redirect)
+
+- **Writes commit only on the leader** — unchanged; the redirect is a re-target, not a re-route.
+  The non-leader never commits or applies the entry locally.
+- **The error is *always* retryable** — zero or multiple leaders → the error carries no leader
+  hint and the client re-discovers. No crash path over the wire.
+- **Bounded client retries / anti-loop** — the client has bounded attempts + re-discovery
+  (policy, open); no infinite redirect loops.
+- **Idempotency of retried puts** — same as Forward: last-writer-wins by key, convergence; a
+  retried put may duplicate a log entry (a safe, documented property).
+- **Caller contract unchanged** — the client still sees `put/delete/expire` → commit result /
+  typed failure; "not leader" is one more error to translate, not a new success path.
+
+### 4.5 Acceptance bar (test criteria for a later session; not implementation)
+
+- **Write on a non-leader succeeds end-to-end.** Client does `put` that lands on a non-leader
+  node; the client sees the typed "not leader — leader=X" error, re-targets to X, and the same
+  write commits under the leader (the client's response names the leader's committed term/index).
+  Replicated to all nodes.
+- **Leader churn mid-redirect.** The named leader is demoted before the client's retry lands; the
+  client gets another "not leader" error (now naming the new leader, if discoverable),
+  re-discovers, retries, and the write commits under the finally-elected leader. The
+  exactly-one-leader invariant holds (no split-brain).
+- **No-leader window.** All nodes in election → the error carries no leader, the client backs
+  off/retries; it recovers when a leader exists.
+- **Anti-loop.** A scripted loop (each node says not leader, naming a different node) terminates
+  in a clean client error under the bounded-retry policy, not an infinite loop.
+- **Reads untouched.** Reads stay local-serving (eventually consistent on a follower); Redirect
+  is **write-only** scope.
+- **Gate:** `mvn -o -B test` green (461/0/0/1 baseline) before committing.
+
+### 4.6 Risks (Redirect)
+
+- **The client pays the second hop.** Under heavy leader churn, every write takes the
+  error→retry path and write latency from the client's perspective rises. That is the real,
+  known cost — the offsetting benefit is that the *cluster* gains nothing new to maintain.
+- **Complexity moves into the client.** Re-target/retry/anti-loop lives in `RemoteCacheClient`,
+  and every client implementation must have it (today: one). This is the *cost* of variant 2 and
+  the *benefit* of variant 1.
+- **Stale leader hints** — handled by the always-retryable + bounded re-discovery rules
+  (§4.3.2/§4.3.3).
+- **Positive:** zero new cluster↔cluster messages; zero new `RaftNodeBehavior` handlers; zero
+  `NodeRequests` correlation; the smallest *cluster-side* footprint of both variants — and it
+  doubles as continuous leader-tracking for the client.
 
 ---
 
-## 9. Suggested staging (proposed, not binding)
+## 5. The choice (deferred) — comparing the two
 
-- **C1** forward request + response types (one of §3.1 shapes) + the sender/receiver seams
+| | **Forward** (variant 1) | **Redirect** (variant 2) |
+|---|---|---|
+| Who fixes the second hop | **Cluster** (node → leader) | **Client** (node names the leader) |
+| New cluster↔cluster messages | **2** (forward request + response) | **0** (a typed error on B's existing wire) |
+| New `RaftNodeBehavior` handlers | **2** (Leader: submit+reply; Follower: getLeader+forward) | **0** (B's existing non-leader write handler returns the error) |
+| `NodeRequests` correlation | Yes (the in-cluster forward reuses it) | No |
+| Client complexity added | **Low** (fire and wait) | **Higher** (re-target / retry / anti-loop) |
+| Write latency under churn | One cluster hop (node→leader) | One client round-trip (error + retry) |
+| Cluster-side footprint | **Medium** (one message pair + two handlers + acyclicity guard) | **Small** (one error type, or one field on an existing response) |
+| Loop / acyclicity risk | Must guard cluster loops (stale leader) | None in-cluster; anti-loop is client-side policy |
+| Leader-tracking side effect | None (the cluster absorbs it) | **Continuous leader hints to the client** |
+| Resembles | In-process "forward to coordinator" | Redis-cluster `MOVED`/`ASK` |
+
+**Position, deliberately open.** Neither variant is in the B first cut. Come back to this when
+B is running (or tested) and we can *measure* how much the first-cut retryable-no-leader error
+costs, and make the choice on: (a) expected leader-churn profile, (b) whether we *want*
+client-side leader tracking (Redirect gives it free), (c) the cluster-side complexity budget,
+(d) write-latency tolerance under churn.
+
+**Record the choice in this file (or a successor) before implementing either variant.**
+Option A (the in-process shim) is rejected — B's non-leader write path is the *only* remaining
+caller of either variant.
+
+---
+
+## 6. Cross-cutting (both variants)
+
+- **Read consistency — out of scope for both.** Both variants are the *write* path; reads
+  remain local-serving (eventually consistent on a follower). A consistent-read mechanism
+  (read-index / leases), if ever wanted, is the cross-cutting item in `REMOTE-CLIENT.md` §4.1,
+  **not** part of C — a hand-off session must not fold it in.
+- **Auth.** Forward rides the existing peer↔peer channel (peer auth, not client auth); Redirect
+  is a new error type on B's client-facing surface (so B's auth decision applies).
+- **Timeout.** Forward's in-cluster request hits the `NodeRequests` 5 s TODO (§3.5.4); Redirect
+  hits B's client-side timeout (B §4.6). Whichever we pick, do **not** silently hardcode 5 s.
+- **Zero-dependency.** Both variants stay zero-dep by construction (existing frame, existing
+  codec).
+
+---
+
+## 7. Suggested staging (once the choice is a go)
+
+**If Forward is chosen:**
+
+- **C1** forward request + response types (one of §3.1's shapes) + the sender/receiver seams
   (§3.4). No behavior yet. Keep `mvn -o -B test` green at the end.
 - **C2** leader-side handler: on receiving a forward, call `submit` and reply with the committed
-  `RaftLog<…>`; typed failures for the known error paths.
-- **C3** non-leader forwarder: `getLeader`, open/reuse the connection, send forward, relay
-  result; acyclicity guard; typed-retryable error on no-leader.
+  `RaftLog<…>`; typed failures on the known error paths.
+- **C3** non-leader forwarder: `getLeader`, open/reuse the connection, send the forward, relay
+  the result; the acyclicity guard; the typed-retryable no-leader error.
 - **C4** integration test: write on a non-leader commits under the leader; leader failover
-  mid-forward recovers; no-leader clean-error; reads remain eventually-consistent. Gate green.
+  mid-forward recovers; no-leader clean error; reads remain eventually-consistent. Gate green.
 
-**Sequencing note:** C is the smallest, most self-contained option. A hand-off session should
-expect C to be landable **before** B's B3/B4/B5, and A's A2 can pick it up as a "forward if I
-am not the leader" branch instead of the current `findLeaderNode` refusal.
+**If Redirect is chosen:**
+
+- **D1** error shape decision (§4.3.1) + wire it into B's non-leader write handler (B §3.4),
+  naming the leader address when known. Keep `mvn -o -B test` green at the end.
+- **D2** `RemoteCacheClient`: the re-target/retry + anti-loop on "not leader" (§4.3.2/§4.3.3).
+- **D3** integration test: the §4.5 acceptance bar (non-leader write succeeds; leader-churn
+  convergence; no-leader clean error; anti-loop; reads unchanged). Gate green.
+
+**Sequencing:** neither C-nor-D staging changes B's B1–B5 (see B §6); it lands **after** B's
+client exists and **after** the choice in §5 is recorded.

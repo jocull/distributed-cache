@@ -1,8 +1,11 @@
-# Option B — Client RPC on the wire (a truly remote cache client)
+# Option B — Client RPC on the wire (the CHOSEN design)
 
-> **Status:** design/spike only — not implemented. Under-specified where implementation will
-> discover detail; concrete where the code already fixes the answer. Parent:
-> `design/REMOTE-CLIENT.md`.
+> **Status:** ✅ **The CHOSEN design — the spec to implement** (decision 2026-11-24). Not yet
+> implemented. A was considered and is **rejected & archived** — `design/REMOTE-CLIENT-A-EMBEDDED-SHIM.md`
+> keeps the record and the why; C is **deferred** — the open forward-vs-redirect (Redis-style)
+> decision for non-leader writes, in `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md`. Under-
+> specified where implementation will discover detail; concrete where the code already fixes the
+> answer. Parent: `design/REMOTE-CLIENT.md`.
 >
 > **One-line:** put the cache-client operations on the existing wire protocol so **any node can
 > accept a client** connection, and build a thin `RemoteCacheClient` (a separate JVM) that
@@ -20,24 +23,30 @@
         │   2) ops:        put / get / delete / expire over the existing frame + Serializable codec
         ▼
    ┌──────────── any node ────────────┐
-   │ not leader?  ──> forward entry ──> leader   (this is Option C)
+   │ not leader? ──> FIRST CUT: typed retryable "not leader" error — client
+   │               re-discovers the leader and retries   (deferred Option C:
+   │               cluster forwards it in-cluster, OR the error names the leader and the client re-targets)
    │ leader?       ──> submit (existing) → commit → apply ──> CacheWriteResponse
    │ read:         ──> serve from local (or leader) PartitionMap ──> CacheReadResponse
    └───────────────────────────────────┘
 ```
 
 - **Any node is a valid client entry point.** The client picks a node (bootstrap list), asks the
-  cluster for its state, and routes. A follower that receives a write forwards it to the leader
-  (Option C). This means surviving nodes keep serving clients even when the current leader — or
-  the leader's co-located JVM — is gone.
+  cluster for its state, and routes. First cut: a write that lands on a non-leader gets a *typed,
+  retryable "not leader" error* and the client re-discovers the leader and retries. The follow-up
+  (Option C, **deferred** — forward vs. redirect, undecided) either has the cluster *forward*
+  that write to the leader, or the error *names the leader* and the client re-targets to it.
+  Either way, surviving nodes keep serving clients even when the current leader — or the leader's
+  co-located JVM — is gone.
 - **It reuses the existing wire** — same 4-byte-BE-length + `Serializable` frame
   (`NETWORKING.md` §2.1), same `ChannelMiddleware`/`ChannelSide`, same `NodeRequests`
   request/response correlation, same `instanceof` dispatch chain (`NodeConnectionOutboundImpl`).
 - **A new client-side object** (`RemoteCacheClient`, name tentative) lives in the client JVM and
   exposes the same verbs as `DistributedCache` but over the network.
 
-**Why it's the "proper" answer:** it is the only option where the cache cluster is a genuinely
-*externally-reachable, distributed service* with no central JVM. **Why it's the largest:** it
+**Why it's the CHOSEN design:** it is the only option that makes the cache cluster a genuinely
+*externally-reachable, distributed service* with no central JVM (A — the central-JVM route — was
+considered and rejected; see its archived record). **Why it's the largest:** it
 touches the dispatch chain (`// TODO: not very maintainable` in-code), needs a decision on how a
 *client* connection is distinguished from a *Raft-peer* connection, and must fix the
 non-`Serializable` read payload. Each of those is called out below with honest open questions.
@@ -113,10 +122,16 @@ option, not a requirement:**
 ### 3.4 Node-side handlers (behavior)
 - **Write on a leader** → call the same `submit(entry)` the in-JVM path uses (commit → apply →
   acknowledge), return the committed entry in `CacheWriteResponse`. **No new commit logic.**
-- **Write on a non-leader** → forward to the leader (this is **Option C** — see
-  `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md`). B is *complete but not optimal* without C: it
-  still works if the client always discovers the leader first, but C is what makes "hit any node"
-  robust across leader churn.
+- **Write on a non-leader** → first cut (B ships this): do **not** submit locally; reply with a
+  typed **retryable "not leader" error** (shape open; if a leader is discoverable it may carry the
+  leader's address as a hint — that hint *is* C's redirect mechanism). The client re-discovers
+  the leader and retries (the §3.5 retry behavior already covers this case).
+- **Write on a non-leader — the deferred Option C on top of this** → either the cluster
+  *forwards* the write to the leader in-cluster and relays the leader's commit result back (C
+  variant 1), or the error above *names the leader* and the client re-targets its connection and
+  retries (C variant 2, *redirect*, Redis-style). The choice is in
+  `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md`; **neither variant is chosen yet** — implement B
+  with the first-cut error and attach C only when (and if) the choice is recorded.
 - **Read** → serve from the node's `PartitionMap` (eventually consistent on a follower) **or**
   route to the leader / add a consistent-read policy (cross-cutting, parent §4.1). The simplest
   first cut is local serving; record it.
@@ -126,7 +141,10 @@ A `RemoteCacheClient` (tentative name) configured with a **bootstrap node list**
 (`NodeAddress`es), that:
 - discovers the leader (reuses `StateRequest`/leader discovery, §4),
 - exposes `put/delete/expire → CompletableFuture<…>` and `get → Optional<…>` or a future,
-- retries/re-discovers on leader loss and on no-leader (election in progress).
+- retries/re-discovers on leader loss, on no-leader (election in progress), and on the
+  first-cut "not leader" write error (§3.4); if C's *redirect* variant is later chosen, the same
+  loop re-targets to the address the error named (bounded retries + anti-loop — policy, see the
+  C spec).
 - **Must not** hold or require any `RaftNode` reference. That is the whole point.
 
 ---
@@ -154,7 +172,7 @@ A `RemoteCacheClient` (tentative name) configured with a **bootstrap node list**
    `consistency=` knob later** — do not couple B's first cut to the consistent-read design.
 4. **Authentication / authorization.** None exists. A client listener is externally reachable →
    an auth decision is required before trusted-network deployment (parent §4.2). Open; the
-   handshake decision (§5.1) is the natural place to attach it.
+   handshake decision (§4.1) is the natural place to attach it.
 5. **Write idempotency / dedup on retry.** A failed-then-retried write may re-submit the same
    client intent → two log entries. In this cache `put` is last-writer-wins by key, so a
    double-forward of the *same* put converges to the same value (record this as a **beneficial
@@ -194,9 +212,12 @@ A `RemoteCacheClient` (tentative name) configured with a **bootstrap node list**
 - **B5 (optional)** consistent-read knob / read-index (parent §4.1), and/or the dispatch
   registry refactor (§3.3 optional).
 
-**Sequencing note:** B is most natural **after C** has landed (so B2's non-leader write path just
-delegates to C's forwarding). If C is deferred, B can still ship with the client always
-discovering the leader first — but then B does *not* satisfy "any node is an entry point."
+**Sequencing note:** B ships with the first-cut non-leader error (§3.4) — "any node is an entry
+point" holds in the weak sense (writes still succeed, via the client re-discovering the leader).
+Option C — the deferred decision of whether the cluster *forwards* non-leader writes (variant 1)
+or the error *names the leader* and the client *re-targets* (variant 2) — lands **after B**, and
+only after `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md` records which variant was chosen. C
+blocks nothing in B1–B5.
 
 ---
 
@@ -207,20 +228,26 @@ discovering the leader first — but then B does *not* satisfy "any node is an e
 - **The client-vs-peer distinction is foundational** and interacts with auth + connection
   lifecycle; a wrong early choice is costly. Mitigation: decide it first (B3) and record it.
 - **Security surface** — an externally reachable client listener is a real auth decision (§4.4).
-- **Positive:** this is the only option that makes the cluster a genuinely externally-reachable
-  distributed service with any surviving node as an entry point — the stated end goal ("leverage
-  the cache cluster from another Java server"). Zero new dependencies by construction.
+- **Positive:** this is the chosen design precisely because it is the only option that makes the
+  cluster a genuinely externally-reachable distributed service with any surviving node as an
+  entry point — the stated end goal ("leverage the cache cluster from another Java server").
+  Zero new dependencies by construction.
 
 ---
 
 ## 8. Dependencies & hand-offs
 
-- **Depends on:** the read-payload `Serializable` fix (§3.2). **Strongly benefits from:**
-  **Option C** (`design/REMOTE-CLIENT-C-LEADER-FORWARDING.md`) for the non-leader write path and
-  leader-churn robustness.
-- **Subsumes / alternative to:** **Option A** (`design/REMOTE-CLIENT-A-EMBEDDED-SHIM.md`). If you
-  want fastest cross-JVM access with a central entry point, A; if you want the distributed
-  service, B. They can coexist (A is a thin convenience, B is the substrate), but for hand-off
-  clarity treat them as two endpoints and pick the one matching the goal.
+- **Depends on:** the read-payload `Serializable` fix (§3.2). Nothing else.
+- **Option C (DEFERRED — decision pending):**
+  `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md` — what a non-leader does with a client write:
+  *forward* it in-cluster to the leader (variant 1) vs. *redirect* — a typed "not leader —
+  leader is X" error and the client re-targets (variant 2, Redis-style). B's first-cut §3.4
+  error path is the attachment point: under *forward*, the node-side handler calls C's forwarder
+  instead of erroring; under *redirect*, B's not-leader error *is* the mechanism (plus the
+  client re-target loop). Neither variant is chosen — do not implement either before the choice
+  is recorded in the C spec.
+- **Option A (REJECTED — archived):** `design/REMOTE-CLIENT-A-EMBEDDED-SHIM.md` — no dependency
+  either way; the file is kept as the record of *why A was not pursued* (central write entry
+  point). Not a live alternative to B.
 - **Cross-cutting (do not fold in by default):** read consistency (read-index/leases), auth model
   — parent §4.

@@ -1,8 +1,13 @@
-# Remote Client Access — Orientation & Options (A / B / C)
+# Remote Client Access — Orientation & Options (B chosen / A rejected / C deferred)
 
 > **Status:** design/spike only. Nothing in this folder is implemented. These are hand-off
 > designs for later sessions. They are deliberately *under-specified* where implementation
 > is likely to discover details, and *concrete* where the answer is already fixed by the code.
+> **State of the choice (2026-11-24):** **B is the chosen design — the spec to implement.**
+> A was considered and is **rejected (archived)**. C is **deferred**, and is really a pending
+> *decision*: when a client write lands on a non-leader node, should the cluster **forward** it
+> in-cluster to the leader, or **redirect** — reply with a typed "not leader — leader is X" error
+> and let the client re-target and retry (Redis-style)? **Neither is chosen.**
 > Read this file first; it links the three option specs and lays out the shared ground truth.
 
 ---
@@ -17,8 +22,14 @@ JVM** and — for writes — that the caller is co-located with the leader
 socket transport, but it only moves **node↔node Raft messages** (vote, append-entries,
 snapshot, `StateRequest`). There is **no wire protocol for cache client operations**, and
 therefore **no way to leverage the cluster from another Java server today.** These three
-options are ways to get there. A and B are the two endpoints of the solution space; C is a
-small enabler that both benefit from.
+options are ways to get there. A and B were the two endpoints of the solution space; C is one
+orthogonal follow-up. **The choice is B** — that is the project this folder points at. A was
+considered and is **rejected and archived** (its file is kept so a reviewer can see *why the
+project does not take the "central cache-server JVM" route*). C is **deferred**, and is reframed
+from "a small enabler" to a *pending decision*: what a non-leader node does with a received write
+— **forward** it in-cluster to the leader vs **redirect** to the leader with an error
+(Redis-style). Neither is chosen; B ships without C (its first-cut non-leader path is a typed,
+retryable "not leader" error the client resolves by re-discovering the leader).
 
 ---
 
@@ -79,22 +90,22 @@ These are facts about the current tree, not proposals. Cite them when implementi
 
 ---
 
-## 3. The three options at a glance
+## 3. The options at a glance (state of the choice)
 
-| | **A — Embedded shim** | **B — Client RPC on the wire** | **C — Leader forwarding** |
+| | **A — Embedded shim** | **B — Client RPC on the wire** | **C — Non-leader writes: forward or redirect?** |
 |---|---|---|---|
-| What | Run the cluster in one "cache server" JVM; add a thin outer API (HTTP/JSON or JDK-socket) that delegates to the in-JVM `DistributedCache` | Add cache-client message types to the existing wire protocol + a thin `RemoteCacheClient` that discovers the leader and routes ops; any node accepts clients | Let **any** node accept a client write and forward the entry to the current leader, returning the leader's commit result |
-| Scope of change | **No Raft/wire changes** — a new layer above the facade | New message types + dispatch/sender/receiver seams + a client | A new node↔node forwarding pair + handlers; reuses `submit` |
-| Cross-JVM client? | ✅ via the outer API (central entry point) | ✅ direct to any node | partial — is the *node's* forwarding; needs a client to be useful |
-| Central point of failure? | **Yes** (the cache-server JVM is the write entry) | No (any surviving node takes clients) | Reduces it (writes work if *leader* is alive, client can hit any node) |
-| Effort / risk | **Low** / low (isolated) | **High** / medium-high (touches dispatch chain) | **Low–medium** / low (self-contained) |
-| Best for | Fastest cross-JVM; outer ecosystem already HTTP/gRPC | The "proper" fully-distributed client (the stated goal) | First self-contained commit; unblocks B |
+| **Status** | ⛔ **REJECTED — archived.** Not being pursued; the file remains as the record of *why* there is no central "cache server" JVM. | ✅ **CHOSEN — the spec to implement.** | ⏸ **DEFERRED — a pending decision.** Not part of B's first cut; both variants specified in the C spec; neither is chosen. |
+| What | Run the cluster in one "cache server" JVM; add a thin outer API (HTTP/JSON or JDK-socket) that delegates to the in-JVM `DistributedCache` | Add cache-client message types to the existing wire protocol + a thin `RemoteCacheClient` that discovers the leader and routes ops; any node accepts clients | What a **non-leader** node does with a received client write: **forward** the entry to the current leader in-cluster and relay the leader's commit result back (variant 1), or reply with a typed **"not leader — leader is X"** error and let the client re-target its connection and retry (variant 2, Redis-style) |
+| Why that state | A central write entry point: if the server JVM dies, external writes are down **even when** the Raft quorum is alive elsewhere. B achieves the same goal without the center of gravity. | It *is* the stated goal: the cluster as a genuinely externally-reachable distributed service; zero new dependencies; any surviving node is a valid entry point. | B is **correct without C** (client re-discovers the leader and retries). C is the later decision of *who fixes* that second hop — the cluster (forward) or the client (redirect) — and should be made once B is running, when the first-cut error cost is measurable. |
+| Effort / risk (had it proceeded) | **Low** / low (isolated) | **High** / medium-high (touches dispatch chain) | Variant 1: **Low–medium** (one message pair + two handlers, acyclicity guard). Variant 2: **low** (one typed error on B's wire + a client re-target loop) |
 
-**Recommended order (matches the tasking):** spike **A** first (initial design / quick path),
-then **B** (the end-state design), then **C** (the enabler that makes B simpler and A more
-fault-tolerant). In *implementation* terms C is the smallest and most self-contained, and B
-benefits most from C — so a hand-off session may well land C before finishing B. Each spec
-below states its own dependencies.
+**Why B and not A:** both reach the stated goal, but B does so without a central write entry
+point, without a second API surface, and without a permanent extra protocol layer. A's record of
+the rejection stays in its file. **Why not C yet:** B's first-cut non-leader write path is a
+*typed, retryable "not leader" error* resolved by the client re-discovering the leader; C is the
+follow-up choice of who does the second hop — cluster-side forwarding vs client-side
+redirect-with-leader-address — and it is deliberately left open. Each spec states its own
+dependencies and current state.
 
 ---
 
@@ -102,19 +113,22 @@ below states its own dependencies.
 
 These are **decisions, not code** — flag them, do not silently decide them in an option spec:
 
-1. **Read consistency policy.** Options A/B/C all inherit the "follower reads are eventually
-   consistent" behavior. A linearizable-read mechanism (read-index or leases) is **orthogonal**
-   to all three and can be added independently. Do **not** fold it into one option by default.
+1. **Read consistency policy.** B (and both C variants, if either is ever adopted) inherit the
+   "follower reads are eventually consistent" behavior. A linearizable-read mechanism
+   (read-index or leases) is **orthogonal** to all of them and can be added independently. Do
+   **not** fold it into one option by default.
 2. **Authentication / authorization.** None exists today. Any *externally reachable* surface
    (A's outer API, B's client listener) is a security decision. Open, per option.
-3. **Zero-dependency policy.** Affects **A** (pick the outer transport: JDK
-   `com.sun.net.httpserver` + JSON keeps it zero-dep; gRPC does not). **B** stays zero-dep by
-   construction (it reuses the existing `Serializable` wire). C is zero-dep by construction.
+3. **Zero-dependency policy.** B stays zero-dep by construction (it reuses the existing
+   `Serializable` wire); so does C, under **both** variants. (A's transport question — JDK
+   `com.sun.net.httpserver` + JSON vs gRPC — is moot with A rejected; it remains only as
+   historical record in the archived A spec.)
 4. **Read payload serializability.** `KeyDataOutput` is not `Serializable`. Any wire option
    serving `get` must resolve this (make it serializable, or mint a wire response type). Open.
 5. **Bootstrap / discovery.** How does a *client* learn the node addresses and the current
-   leader? (A: configuration of the shim endpoint; B: a bootstrap node list + a discovery
-   exchange; C: inherits B's or A's.)
+   leader? B: a bootstrap node list + a discovery exchange (reusing `StateRequest` / leader
+   discovery). C inherits B's — and under the *redirect* variant in particular, the client's
+   leader view *is* the routing information and must be kept warm.
 
 ---
 
@@ -135,8 +149,8 @@ These are **decisions, not code** — flag them, do not silently decide them in 
 
 ## 6. Links
 
-- Option A — `design/REMOTE-CLIENT-A-EMBEDDED-SHIM.md`
-- Option B — `design/REMOTE-CLIENT-B-CLIENT-RPC.md`
-- Option C — `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md`
+- **B — CHOSEN design (the spec to implement)** — `design/REMOTE-CLIENT-B-CLIENT-RPC.md`
+- **A — REJECTED (archived record of the choice)** — `design/REMOTE-CLIENT-A-EMBEDDED-SHIM.md`
+- **C — DEFERRED (forward vs redirect, undecided)** — `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md`
 - Existing design context — `SCOPE.md` (status/decisions), `NETWORKING.md` (wire + transport),
   `SNAPSHOTS.md` (snapshot/compaction, addenda-only), `README.md`.
