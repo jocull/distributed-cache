@@ -172,6 +172,9 @@ A `RemoteCacheClient` (tentative name) configured with a **bootstrap node list**
 
 ## 4. The pivotal open questions (B's decisions — flag, do not silently choose)
 
+> **Status (2026-11-25):** all six decisions are resolved and recorded under each question
+> below; the B first cut is built against them.
+
 1. **How is a *client* connection distinguished from a *Raft-peer* connection?**
    Both would arrive via `RaftNode#acceptConnection` → `onNewConnection` → a fresh
    `NodeConnectionOutbound`. A Raft peer performs `Introduction` (establishing `remoteNodeId`);
@@ -183,24 +186,57 @@ A `RemoteCacheClient` (tentative name) configured with a **bootstrap node list**
      `StateRequest`), so they never require `remoteNodeId`.
    **This is the foundational B decision.** The spec deliberately leaves it open because the
    answer drives the auth model (§4.2) and the connection lifecycle.
+   **Decision (2026-11-25): pre-introduction dispatch, single port.** The connection is
+   distinguished by its *first frame*: a Raft peer's first frame is `Introduction` (which
+   establishes `remoteNodeId`); a client's first frame is a client verb, served from the
+   pre-introduction dispatch phase beside `StateRequest` — it never requires `remoteNodeId`.
+   No extra client handshake message, no second port/listener. Cross-checked against Redis at
+   the user's request: Redis also multiplexes clients and replicas on the single data port,
+   first message determining the role (replicas speak the internal `REPLCONF` protocol;
+   clients send commands); its only additional port is the admin channel, which clients
+   never use; cluster clients learn the full node set from any node (`CLUSTER SLOTS`).
 2. **Leader discovery shape.** Does the client send `StateRequest` to a bootstrap node and have
    *that node* relay to peers? Do clients bootstrap with a full node list (like
    `InMemoryTopologyDiscovery` does)? What is the failover/retry/backoff when "no leader
    currently available"? Open (mirror the facade's `IllegalStateException` refusal behavior as
    the *error*, and add bounded retry as the *policy*).
+   **Decision (2026-11-25): hybrid topology discovery, via an extended `StateResponse`.**
+   Each node shares its cluster view by adding ONE optional `cluster` (repeated
+   `NodeAddress`) field to the existing `StateResponse` — an additive proto field (next
+   free number, 7), not a new envelope variant; the frozen 14-variant closed set and all
+   existing peer traffic are untouched. Client loop: (a) probe the bootstrap nodes (they
+   may be a partial list), (b) UNION the cluster views they report, (c) fan out
+   `StateRequest` to that union, (d) pick the LEADER (highest term). No leader ⇒ clean,
+   typed, retryable error + bounded client backoff.
 3. **Read consistency policy.** Local-serving (eventually consistent) vs. leader-routed vs.
    read-index/leases (parent §4.1). Recommend: **local-serving first, document it, add a
    `consistency=` knob later** — do not couple B's first cut to the consistent-read design.
+   **Decision (2026-11-25): local-serving reads first** (eventually consistent — the same
+   semantics in-JVM `DistributedCache#get` already has), documented as such; a
+   `consistency=` knob / read-index remains a follow-up, not part of B's first cut.
 4. **Authentication / authorization.** None exists. A client listener is externally reachable →
    an auth decision is required before trusted-network deployment (parent §4.2). Open; the
    handshake decision (§4.1) is the natural place to attach it.
+   **Decision (2026-11-25): no auth in v1** — B's first cut ships without authentication
+   (trusted-network assumption, documented). The pre-introduction dispatch zone (decision 1)
+   is recorded as the SEAM where authentication attaches later; the §5 "unknown client is
+   refused cleanly" acceptance item applies when that lands.
 5. **Write idempotency / dedup on retry.** A failed-then-retried write may re-submit the same
    client intent → two log entries. In this cache `put` is last-writer-wins by key, so a
    double-forward of the *same* put converges to the same value (record this as a **beneficial
    property**, not a bug). Confirm the semantics rather than adding a dedup table.
+   **Decision (2026-11-25): LWW convergence, no dedup table.** Semantics confirmed: the
+   cache is last-writer-wins by key — a failed-then-retried write re-applies the same
+   key→value, so the state converges to the same value; `delete`/`expire` on an absent key
+   is a no-op. No dedup table is added; this is recorded as a documented beneficial property
+   of the wire layer.
 6. **Timeout.** `NodeRequests` is currently a hard **5 s** (in-code TODO "Is this appropriate?").
    A remote write under load should not be assumed to fit 5 s. Flag: make the timeout
    configurable or derive it per request class; *do not* hardcode 5 s as permanent.
+   **Decision (2026-11-25): per-request timeout on B's sender seams.** The client-request
+   path (B's sender/receiver seams) uses a per-request, client-configurable timeout with a
+   **10 s default**. The existing 5 s hard timeout in `NodeRequests` and its in-code TODO
+   stay untouched for the 12 Raft traffic types — that question is out of B's scope.
 
 ---
 
@@ -218,7 +254,7 @@ A `RemoteCacheClient` (tentative name) configured with a **bootstrap node list**
 - **No-leader window:** all nodes in election → the client gets a clean, retryable error (not a
   crash), and recovers when a leader exists.
 - **Unknown client:** if §4.4 auth is added, an unauthenticated client is refused cleanly.
-- **Gate:** `mvn -o -B test` green (461/0/0/1 baseline) before committing.
+- **Gate:** `mvn -o -B test` green (464/0/0/1 baseline as of 2026-11-25) before committing.
 
 ---
 
