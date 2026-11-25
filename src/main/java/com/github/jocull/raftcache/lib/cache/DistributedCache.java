@@ -43,9 +43,13 @@ import java.util.stream.Collectors;
  * Callers only need to supply their view of the cluster, the local state machine, and that
  * bus; no further wiring is required.
  *
- * <p>Caveat: leader routing is in-process -- the supplied {@link RaftNode} instances must be
- * directly accessible (as in the in-process test cluster). Once real network transport lands
- * (phase 3), writes will be routed over a connection to the leader instead.
+ * <p>Leader routing for writes is in-process -- the supplied {@link RaftNode} instances must
+ * be directly accessible (as in the in-process test cluster) -- but the same commit path is
+ * also exposed over the wire for remote clients (Client B §3.4): the constructor wires the
+ * node it owns with this cache's state machine via {@link RaftNode#setCacheReader(java.util.function.Function)}
+ * (local-serving reads) and the leader behavior serves remote write verbs by submitting them
+ * through {@link RaftNode#submit(Object)}, so remote and local writes commit and apply
+ * identically.
  */
 public class DistributedCache implements AutoCloseable {
     private final List<RaftNode> nodes;
@@ -71,7 +75,14 @@ public class DistributedCache implements AutoCloseable {
         // own keep whatever supplier their own facade installed.
         nodes.stream()
                 .filter(node -> clusterEventBus.equals(node.getEventBus()))
-                .forEach(node -> node.setSnapshotSupplier(stateMachineBridge::getSnapshot));
+                .forEach(node -> {
+                    node.setSnapshotSupplier(stateMachineBridge::getSnapshot);
+                    // Client B §3.4 (2026-11-25): the same owned-node filter supplies the
+                    // local-serving read view for remote reads over the wire — remote
+                    // CacheReadRequests reaching this node are answered from THIS facade's
+                    // PartitionMap, exactly like {@link #get(String)} does in-process.
+                    node.setCacheReader(key -> partitionMap.getData(key).orElse(null));
+                });
     }
 
     /**

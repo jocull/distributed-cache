@@ -8,6 +8,7 @@ import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 public interface RaftNode {
@@ -128,6 +129,33 @@ public interface RaftNode {
      * which supplies no snapshots at all.
      */
     default com.github.jocull.raftcache.lib.event.EventBus getEventBus() {
+        return null;
+    }
+
+    /**
+     * Supplies this node's local state-machine view for remote cache reads
+     * (Client B §3.4, 2026-11-25): a function of key to the entry currently visible on this
+     * node, or {@code null} when the key is not there. The value crosses as a loose
+     * {@code Object} the same way {@link #setSnapshotSupplier(Supplier) snapshot payloads}
+     * do — the raft layer stays state-machine-agnostic, and a read handler that cannot name
+     * the supplied view replies "not found" (with a warning) instead of failing the link.
+     *
+     * <p>Default is a no-op: {@link RaftNode} implementations that carry no state machine to
+     * read (test doubles, middleware fakes) simply never have their {@link #cacheReader()
+     * reader} consulted, and cache reads reaching such a node reply "not found" (see
+     * {@code RaftNodeBehavior#onCacheRead}).
+     */
+    default void setCacheReader(Function<String, Object> cacheReader) {
+        // Intentionally empty: see above.
+    }
+
+    /**
+     * The cache reader installed via {@link #setCacheReader(Function)}, or {@code null}
+     * when this node has no state-machine view to read from. Readers must treat
+     * {@code null} as "no local view" and reply not-found rather than failing the request
+     * (a {@code null} ENTRY from the reader itself means "key absent on this node").
+     */
+    default Function<String, Object> cacheReader() {
         return null;
     }
 }

@@ -1,10 +1,18 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.communication.KeyDataDeleteInput;
+import com.github.jocull.raftcache.lib.communication.KeyDataExpireInput;
+import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.event.EventSubscriber;
 import com.github.jocull.raftcache.lib.raft.events.AppendLog;
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.CacheDeleteRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheExpireRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CachePutRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheStatus;
+import com.github.jocull.raftcache.lib.raft.messages.CacheWriteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshot;
 import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshotResponse;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
@@ -678,5 +686,76 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
         sender.setLastEntriesAcknowledged(Instant.now());
         // Pipeline: send the next chunk now rather than waiting for the next tick.
         appendEntries(AppendEntriesTrigger.CONTINUATION);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Client B §3.4 (2026-11-25, B2) — cache write verbs over the wire
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Client B §3.4 (2026-11-25, B2): the leader's write verbs. The entry rides the SAME
+     * commit path an in-JVM facade write takes — {@code self.submit(append, replicate,
+     * commit, apply)} — and the reply is sent once THAT future completes, so an OK reply
+     * implies majority-commit AND leader-local apply (the read-your-own-write guarantee).
+     * A failure in flight — this node stepped down between dispatch and commit, or lost
+     * its quorum — yields a retryable NOT_LEADER reply, never a hung or broken client
+     * (B §4.2: the client re-discovers and retries on the new leader).
+     *
+     * <p>The reply carries the request's correlation id only: {@code CacheWriteResponse}
+     * has no entry field by contract (the POJOs win over the doc line "return the
+     * committed entry" — the ack-after-commit guarantee is the response itself).
+     */
+    @Override
+    public void onCachePut(NodeConnectionOutbound sender, CachePutRequest request) {
+        final KeyDataInput payload = request.getPayload();
+        LOGGER.debug("{} CachePutRequest from {} (key={}) — submitting to the commit log",
+                self.getId(), sender.getRemoteNodeId(), payload.getKey());
+        self.submit(payload)
+                .whenComplete((ignored, error) -> {
+                    if (error != null) {
+                        LOGGER.warn("{} CachePut (key={}) did not commit ({}: {}) — replying NOT_LEADER (retryable)",
+                                self.getId(), payload.getKey(), error.getClass().getSimpleName(), error.getMessage());
+                        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+                    } else {
+                        LOGGER.debug("{} CachePut (key={}) committed and applied — replying OK", self.getId(), payload.getKey());
+                        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.OK, null));
+                    }
+                });
+    }
+
+    @Override
+    public void onCacheDelete(NodeConnectionOutbound sender, CacheDeleteRequest request) {
+        final KeyDataDeleteInput payload = request.getPayload();
+        LOGGER.debug("{} CacheDeleteRequest from {} (key={}) — submitting to the commit log",
+                self.getId(), sender.getRemoteNodeId(), payload.getKey());
+        self.submit(payload)
+                .whenComplete((ignored, error) -> {
+                    if (error != null) {
+                        LOGGER.warn("{} CacheDelete (key={}) did not commit ({}: {}) — replying NOT_LEADER (retryable)",
+                                self.getId(), payload.getKey(), error.getClass().getSimpleName(), error.getMessage());
+                        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+                    } else {
+                        LOGGER.debug("{} CacheDelete (key={}) committed and applied — replying OK", self.getId(), payload.getKey());
+                        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.OK, null));
+                    }
+                });
+    }
+
+    @Override
+    public void onCacheExpire(NodeConnectionOutbound sender, CacheExpireRequest request) {
+        final KeyDataExpireInput payload = request.getPayload();
+        LOGGER.debug("{} CacheExpireRequest from {} (key={}) — submitting to the commit log",
+                self.getId(), sender.getRemoteNodeId(), payload.getKey());
+        self.submit(payload)
+                .whenComplete((ignored, error) -> {
+                    if (error != null) {
+                        LOGGER.warn("{} CacheExpire (key={}) did not commit ({}: {}) — replying NOT_LEADER (retryable)",
+                                self.getId(), payload.getKey(), error.getClass().getSimpleName(), error.getMessage());
+                        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+                    } else {
+                        LOGGER.debug("{} CacheExpire (key={}) committed and applied — replying OK", self.getId(), payload.getKey());
+                        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.OK, null));
+                    }
+                });
     }
 }

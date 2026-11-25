@@ -72,6 +72,10 @@ class RaftNodeImpl implements RaftNode {
     // volatile: wired from outside the node executor, read on it afterwards.
     private volatile SnapshotStore snapshotStore = null;
 
+    // volatile: wired from outside the node executor (the cache facade supplies its local
+    // state machine, Client B §3.4) and read on it during onCacheRead dispatch.
+    private volatile Function<String, Object> cacheReader = null;
+
     RaftNodeImpl(String id,
                  NodeAddress nodeAddress,
                  TopologyDiscovery topologyDiscovery,
@@ -471,6 +475,16 @@ class RaftNodeImpl implements RaftNode {
     @Override
     public Supplier<Object> snapshotSupplier() {
         return snapshotSupplier;
+    }
+
+    @Override
+    public void setCacheReader(Function<String, Object> cacheReader) {
+        this.cacheReader = cacheReader;
+    }
+
+    @Override
+    public Function<String, Object> cacheReader() {
+        return cacheReader;
     }
 
     @Override

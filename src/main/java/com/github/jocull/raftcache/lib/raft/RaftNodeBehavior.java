@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.raft;
 
+import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.raft.messages.*;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
@@ -7,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
@@ -283,10 +285,33 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
         sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
     }
 
+    /**
+     * Client B §3.4 (2026-11-25, B2): a cache read is served from this node's LOCAL
+     * state-machine view when one is wired (the facade's {@code setCacheReader} seam):
+     * the entry currently visible here, or not-found when the key is absent. A node with
+     * no reader, or whose reader yields a view a cache handler cannot name, replies
+     * not-found with a warning rather than failing the link — reads are best-effort and
+     * local-serving first (B §4.3), so a follower (or a laggard view) may serve a value
+     * that slightly trails a very recent leader write; that's the eventual-consistency
+     * trade of LWW reads, not a defect (B §4.5).
+     */
     @Override
     public void onCacheRead(NodeConnectionOutbound sender, CacheReadRequest request) {
-        LOGGER.warn("{} CacheReadRequest from {} (key={}) — {} does not serve reads yet; replying not found",
-                self.getId(), sender.getRemoteNodeId(), request.getKey(), state);
-        sender.sendCacheReadResponse(new CacheReadResponse(request, false, null));
+        final Function<String, Object> reader = self.cacheReader();
+        if (reader == null) {
+            LOGGER.warn("{} CacheReadRequest from {} (key={}) reaches a node with no wired cache reader; replying not-found",
+                    self.getId(), sender.getRemoteNodeId(), request.getKey());
+            sender.sendCacheReadResponse(new CacheReadResponse(request, false, null));
+            return;
+        }
+        final Object view = reader.apply(request.getKey());
+        if (!(view instanceof KeyDataOutput output)) {
+            LOGGER.warn("{} CacheReadRequest from {} (key={}) produced a view of type {} — no cache handler can serve it; replying not-found",
+                    self.getId(), sender.getRemoteNodeId(), request.getKey(),
+                    view == null ? "absent" : view.getClass().getName());
+            sender.sendCacheReadResponse(new CacheReadResponse(request, false, null));
+            return;
+        }
+        sender.sendCacheReadResponse(new CacheReadResponse(request, true, output));
     }
 }
