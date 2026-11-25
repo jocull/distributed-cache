@@ -1,5 +1,6 @@
 package com.github.jocull.raftcache.lib.raft.middleware;
 
+import com.github.jocull.raftcache.lib.raft.RaftNode;
 import com.github.jocull.raftcache.lib.raft.messages.TermIndex;
 import com.github.jocull.raftcache.lib.raft.messages.VoteResponse;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
@@ -240,8 +241,11 @@ class SocketChannelMiddlewareTest {
                     () -> mwA.openChannel(nodeA, new NodeAddress("host-only-no-port")),
                     "A node address without host:port must be rejected before any dial");
 
-            assertThrows(NullPointerException.class, () -> mwA.openChannel(null, nodeA.getNodeAddress()),
+            assertThrows(NullPointerException.class, () -> mwA.openChannel((RaftNode) null, nodeA.getNodeAddress()),
                     "Null source node must be rejected");
+
+            assertThrows(NullPointerException.class, () -> mwA.openChannel((NodeAddress) null, nodeA.getNodeAddress()),
+                    "Null client address must be rejected");
 
             // Two middlewares bind distinct ephemeral ports on the same loopback host.
             try (final SocketChannelMiddleware mwB = new SocketChannelMiddleware()) {

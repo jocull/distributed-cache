@@ -180,6 +180,24 @@ public class SocketChannelMiddleware implements ChannelMiddleware, AutoCloseable
         Objects.requireNonNull(source, "source must not be null");
         final NodeAddress clientAddress = Objects.requireNonNull(source.getNodeAddress(),
                 "source.getNodeAddress() must not be null");
+        return openChannel(clientAddress, targetAddress);
+    }
+
+    /**
+     * Open a client-side channel to {@code targetAddress} presenting {@code clientAddress} as
+     * the client identity — for callers that are not a registered {@link RaftNode} (e.g. the
+     * remote cache client). Identical dial sequence to {@link #openChannel(RaftNode,
+     * NodeAddress)}: handshake, ACK, reader started; when this returns both receivers exist.
+     *
+     * @param clientAddress the address the handshake presents as its client (must not be null)
+     * @param targetAddress the peer's bound {@code host:port} (must not be null)
+     * @return the client-side {@link ChannelSide}
+     * @throws IllegalStateException if this middleware is closed, the dial fails, or the
+     *         handshake does not complete
+     */
+    public ChannelSide openChannel(NodeAddress clientAddress, NodeAddress targetAddress) {
+        Objects.requireNonNull(clientAddress, "clientAddress must not be null");
+        Objects.requireNonNull(targetAddress, "targetAddress must not be null");
         if (closed) {
             throw new IllegalStateException("This middleware is closed");
         }
