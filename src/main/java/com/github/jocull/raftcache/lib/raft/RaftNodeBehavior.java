@@ -207,6 +207,11 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     StateResponse getStateResponse(StateRequest request) {
         final TermIndex current = self.logs.getCurrentTermIndex();
         final TermIndex committed = self.logs.getCommittedTermIndex();
+        // Client B §4.2 (2026-11-25): share our cluster view so a probing client
+        // learns the node set to fan out StateRequest to. Empty for an unknown view.
+        final List<NodeAddress> cluster = self.clusterTopology.getTopology().stream()
+                .map(NodeIdentifier::getNodeAddress)
+                .collect(Collectors.toList());
         return new StateResponse(
                 request,
                 self.getId(),
@@ -218,7 +223,8 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
                         current.getIndex()),
                 new com.github.jocull.raftcache.lib.raft.messages.TermIndex(
                         committed.getTerm(),
-                        committed.getIndex()));
+                        committed.getIndex()),
+                cluster);
     }
 
     @Override
@@ -248,5 +254,39 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
         LOGGER.warn("{} Ignoring InstallSnapshotResponse from {} (term={}, index={}) — {} does not track snapshot installs",
                 self.getId(), sender.getRemoteNodeId(), installSnapshotResponse.getTerm(),
                 installSnapshotResponse.getIndex(), state);
+    }
+
+    /**
+     * Client B first cut (B §3.4, 2026-11-25): a cache write reaching a node that is not
+     * the leader is a typed retryable error, not a failure — reply NOT_LEADER (and warn),
+     * so the client re-discovers a leader and retries. The leader-side handler (B2)
+     * overrides this and applies the verb instead.
+     */
+    @Override
+    public void onCachePut(NodeConnectionOutbound sender, CachePutRequest request) {
+        LOGGER.warn("{} CachePutRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER",
+                self.getId(), sender.getRemoteNodeId(), request.getPayload().getKey(), state);
+        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+    }
+
+    @Override
+    public void onCacheDelete(NodeConnectionOutbound sender, CacheDeleteRequest request) {
+        LOGGER.warn("{} CacheDeleteRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER",
+                self.getId(), sender.getRemoteNodeId(), request.getPayload().getKey(), state);
+        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+    }
+
+    @Override
+    public void onCacheExpire(NodeConnectionOutbound sender, CacheExpireRequest request) {
+        LOGGER.warn("{} CacheExpireRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER",
+                self.getId(), sender.getRemoteNodeId(), request.getPayload().getKey(), state);
+        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+    }
+
+    @Override
+    public void onCacheRead(NodeConnectionOutbound sender, CacheReadRequest request) {
+        LOGGER.warn("{} CacheReadRequest from {} (key={}) — {} does not serve reads yet; replying not found",
+                self.getId(), sender.getRemoteNodeId(), request.getKey(), state);
+        sender.sendCacheReadResponse(new CacheReadResponse(request, false, null));
     }
 }

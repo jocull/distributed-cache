@@ -93,6 +93,33 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
             receiverProvider.run(receiver -> requests.completeRequest((StateResponse) message));
             return;
         }
+        // Client B §4.1 (2026-11-25): client verbs are pre-introduction traffic — a
+        // client never performs Introduction, so these must dispatch (like StateRequest)
+        // BEFORE the remoteNodeId guard below, not after it.
+        if (message instanceof CachePutRequest) {
+            receiverProvider.run(receiver -> receiver.onCachePut(this, (CachePutRequest) message));
+            return;
+        }
+        if (message instanceof CacheDeleteRequest) {
+            receiverProvider.run(receiver -> receiver.onCacheDelete(this, (CacheDeleteRequest) message));
+            return;
+        }
+        if (message instanceof CacheExpireRequest) {
+            receiverProvider.run(receiver -> receiver.onCacheExpire(this, (CacheExpireRequest) message));
+            return;
+        }
+        if (message instanceof CacheReadRequest) {
+            receiverProvider.run(receiver -> receiver.onCacheRead(this, (CacheReadRequest) message));
+            return;
+        }
+        if (message instanceof CacheWriteResponse) {
+            receiverProvider.run(receiver -> requests.completeRequest((CacheWriteResponse) message));
+            return;
+        }
+        if (message instanceof CacheReadResponse) {
+            receiverProvider.run(receiver -> requests.completeRequest((CacheReadResponse) message));
+            return;
+        }
         if (remoteNodeId == null) {
             throw new IllegalStateException("Cannot process " + message.getClass().getSimpleName()
                     + " before introduction! remoteNodeId is null");
@@ -208,5 +235,43 @@ class NodeConnectionOutboundImpl implements NodeConnectionOutbound {
     @Override
     public void sendInstallSnapshotResponse(InstallSnapshotResponse installSnapshotResponse) {
         send(installSnapshotResponse);
+    }
+
+    @Override
+    public CompletableFuture<CacheWriteResponse> sendCachePut(CachePutRequest request) {
+        final CompletableFuture<CacheWriteResponse> response = requests.getRequestFuture(request, CacheWriteResponse.class);
+        send(request);
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CacheWriteResponse> sendCacheDelete(CacheDeleteRequest request) {
+        final CompletableFuture<CacheWriteResponse> response = requests.getRequestFuture(request, CacheWriteResponse.class);
+        send(request);
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CacheWriteResponse> sendCacheExpire(CacheExpireRequest request) {
+        final CompletableFuture<CacheWriteResponse> response = requests.getRequestFuture(request, CacheWriteResponse.class);
+        send(request);
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CacheReadResponse> sendCacheRead(CacheReadRequest request) {
+        final CompletableFuture<CacheReadResponse> response = requests.getRequestFuture(request, CacheReadResponse.class);
+        send(request);
+        return response;
+    }
+
+    @Override
+    public void sendCacheWriteResponse(CacheWriteResponse response) {
+        send(response);
+    }
+
+    @Override
+    public void sendCacheReadResponse(CacheReadResponse response) {
+        send(response);
     }
 }

@@ -8,6 +8,13 @@ import com.github.jocull.raftcache.lib.raft.NodeStates;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.CacheDeleteRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheExpireRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CachePutRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheReadRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheReadResponse;
+import com.github.jocull.raftcache.lib.raft.messages.CacheStatus;
+import com.github.jocull.raftcache.lib.raft.messages.CacheWriteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshot;
 import com.github.jocull.raftcache.lib.raft.messages.InstallSnapshotResponse;
 import com.github.jocull.raftcache.lib.raft.messages.Introduction;
@@ -390,11 +397,11 @@ class WireSerializationTest {
 
     @Test
     void closedWireSetMatchesTheEnvelopeVariants() throws Exception {
-        // (1) The envelope is a closed set of exactly 14 variants, field numbers 1..14 —
+        // (1) The envelope is a closed set of exactly 20 variants, field numbers 1..20 —
         // this pin freezes the numbering a cross-language sender (the Task 2 client)
         // would rely on.
         WireMessage.MessageCase[] variants = WireMessage.MessageCase.values();
-        assertEquals(15, variants.length, "MESSAGE_NOT_SET + 14 frozen variants");
+        assertEquals(21, variants.length, "MESSAGE_NOT_SET + 20 frozen variants");
         Map<WireMessage.MessageCase, Integer> expected = new java.util.EnumMap<>(WireMessage.MessageCase.class);
         expected.put(WireMessage.MessageCase.ACKNOWLEDGE_ENTRIES, 1);
         expected.put(WireMessage.MessageCase.ANNOUNCE_CLUSTER_TOPOLOGY, 2);
@@ -410,7 +417,13 @@ class WireSerializationTest {
         expected.put(WireMessage.MessageCase.VOTE_RESPONSE, 12);
         expected.put(WireMessage.MessageCase.HANDSHAKE, 13);
         expected.put(WireMessage.MessageCase.ACKNOWLEDGEMENT, 14);
-        assertEquals(14, expected.size());
+        expected.put(WireMessage.MessageCase.CACHE_DELETE_REQUEST, 15);
+        expected.put(WireMessage.MessageCase.CACHE_EXPIRE_REQUEST, 16);
+        expected.put(WireMessage.MessageCase.CACHE_PUT_REQUEST, 17);
+        expected.put(WireMessage.MessageCase.CACHE_READ_REQUEST, 18);
+        expected.put(WireMessage.MessageCase.CACHE_READ_RESPONSE, 19);
+        expected.put(WireMessage.MessageCase.CACHE_WRITE_RESPONSE, 20);
+        assertEquals(20, expected.size());
         for (WireMessage.MessageCase variant : variants) {
             if (variant == WireMessage.MessageCase.MESSAGE_NOT_SET) {
                 continue;
@@ -419,7 +432,7 @@ class WireSerializationTest {
                     "frozen field number for " + variant.name() + " drifted");
         }
 
-        // (2) Every one of the 14 POJO frame types round-trips to its exact class through
+        // (2) Every one of the 20 POJO frame types round-trips to its exact class through
         // the codec (the receiver's instanceof dispatch chain).
         for (Object frame : List.of(
                 new Introduction("n1", new NodeAddress("127.0.0.1:1"), new TermIndex(1, 1)),
@@ -428,6 +441,9 @@ class WireSerializationTest {
                 new StateRequest(),
                 new StateResponse(new StateRequest(), "n1", new NodeAddress("127.0.0.1:1"),
                         NodeStates.FOLLOWER, 1, new TermIndex(1, 1), new TermIndex(1, 1)),
+                new StateResponse(new StateRequest(), "n1", new NodeAddress("127.0.0.1:1"),
+                        NodeStates.FOLLOWER, 1, new TermIndex(1, 1), new TermIndex(1, 1),
+                        List.of(new NodeAddress("127.0.0.1:1"), new NodeAddress("127.0.0.1:2"))),
                 new VoteRequest(1, "n1", new TermIndex(1, 1)),
                 new VoteResponse(1, new TermIndex(1, 1), false),
                 new PreVoteRequest(1, "n1", new TermIndex(1, 1)),
@@ -437,14 +453,62 @@ class WireSerializationTest {
                 new InstallSnapshot(1, "leader", 1, 1, 0L, new byte[]{1, 2, 3}, true),
                 new InstallSnapshotResponse(1, 1, 0L),
                 new Handshake(new NodeAddress("c:1"), new NodeAddress("t:1")),
-                new Acknowledgement())) {
+                new Acknowledgement(),
+                // B1 (2026-11-25): the client verb frames. The responses carry the
+                // request's id, so the loop's round-trip check covers their correlation pin too.
+                new CachePutRequest(new KeyDataInput("k", Map.of("f", new byte[]{1}))),
+                new CacheDeleteRequest(new KeyDataDeleteInput("k")),
+                new CacheExpireRequest(new KeyDataExpireInput("k", Duration.ofSeconds(30))),
+                new CacheReadRequest("k"),
+                new CacheWriteResponse(new StateRequest(), CacheStatus.OK, new NodeAddress("127.0.0.1:9")),
+                new CacheWriteResponse(new StateRequest(), CacheStatus.NOT_LEADER, null),
+                new CacheReadResponse(new StateRequest(), true,
+                        new KeyDataOutput("k", Map.of("f", new byte[]{1}), 7L)),
+                new CacheReadResponse(new StateRequest(), false, null))) {
             Object back = WireCodec.deserialize(WireCodec.serialize(frame));
             assertEquals(frame.getClass(), back.getClass(),
                     frame.getClass().getName() + " must round-trip to its exact class");
-            // The envelope's type tag must be a valid frozen variant (no drift outside 1..14).
+            // The envelope's type tag must be a valid frozen variant (no drift outside 1..20).
             int number = WireMessage.parseFrom(WireCodec.serialize(frame)).getMessageCase().getNumber();
-            assertTrue(number >= 1 && number <= 14,
+            assertTrue(number >= 1 && number <= 20,
                     frame.getClass().getName() + " must carry a valid envelope tag, got " + number);
+        }
+        // The 1:1 wire value mapping pins (field values, not just the class): the request's
+        // exact requestId must come back so NodeRequests#completeRequest can correlate.
+        {
+            // Note (same as the PUT pin above): KeyDataInput/Output #equals compares byte[]
+            // values by identity, so compare key, keySet and bytes field-by-field.
+            CachePutRequest put = new CachePutRequest(new KeyDataInput("k", Map.of("f", new byte[]{1})));
+            CachePutRequest putBack = (CachePutRequest) WireCodec.deserialize(WireCodec.serialize(put));
+            assertEquals(put.getRequestId(), putBack.getRequestId(), "request id must round-trip exactly");
+            assertKeyDataInput("k", Map.of("f", new byte[]{1}), putBack.getPayload());
+
+            CacheWriteResponse ok = new CacheWriteResponse(put, CacheStatus.OK, new NodeAddress("127.0.0.1:9"));
+            CacheWriteResponse okBack = (CacheWriteResponse) WireCodec.deserialize(WireCodec.serialize(ok));
+            assertEquals(ok.getRequestId(), okBack.getRequestId());
+            assertEquals(CacheStatus.OK, okBack.getStatus());
+            assertEquals(new NodeAddress("127.0.0.1:9"), okBack.getLeaderHint());
+
+            Map<String, byte[]> readData = Map.of("f", new byte[]{1});
+            CacheReadResponse read = new CacheReadResponse(put, true, new KeyDataOutput("k", readData, 7L));
+            CacheReadResponse readBack = (CacheReadResponse) WireCodec.deserialize(WireCodec.serialize(read));
+            assertEquals(read.getRequestId(), readBack.getRequestId());
+            assertTrue(readBack.isFound());
+            KeyDataOutput readValue = readBack.getValue();
+            assertEquals("k", readValue.getKey());
+            assertEquals(readData.keySet(), readValue.getData().keySet());
+            for (Map.Entry<String, byte[]> e : readData.entrySet()) {
+                assertTrue(java.util.Arrays.equals(e.getValue(), readValue.getData().get(e.getKey())),
+                        "value for " + e.getKey() + " must match byte-for-byte");
+            }
+            assertEquals(7L, readValue.getVersion());
+
+            // UNSPECIFIED (proto zero value) round-trips 1:1 too, but a null leader hint
+            // must stay null (has-bit is the discriminator on the wire).
+            CacheWriteResponse unspecified = new CacheWriteResponse(put, CacheStatus.UNSPECIFIED, null);
+            CacheWriteResponse unspecifiedBack = (CacheWriteResponse) WireCodec.deserialize(WireCodec.serialize(unspecified));
+            assertEquals(CacheStatus.UNSPECIFIED, unspecifiedBack.getStatus());
+            assertEquals(null, unspecifiedBack.getLeaderHint());
         }
 
         // (3) Anything OUTSIDE the closed set is rejected with a clear error — including the

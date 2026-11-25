@@ -28,4 +28,18 @@ public interface NodeCommunicationSender {
     void sendInstallSnapshot(InstallSnapshot installSnapshot);
 
     void sendInstallSnapshotResponse(InstallSnapshotResponse installSnapshotResponse);
+
+    // Client B §3.3 (2026-11-25): the client verb set — correlated sends (the request
+    // future is completed by the matching reply frame) plus the void reply senders.
+    CompletableFuture<CacheWriteResponse> sendCachePut(CachePutRequest request);
+
+    CompletableFuture<CacheWriteResponse> sendCacheDelete(CacheDeleteRequest request);
+
+    CompletableFuture<CacheWriteResponse> sendCacheExpire(CacheExpireRequest request);
+
+    CompletableFuture<CacheReadResponse> sendCacheRead(CacheReadRequest request);
+
+    void sendCacheWriteResponse(CacheWriteResponse response);
+
+    void sendCacheReadResponse(CacheReadResponse response);
 }

@@ -196,6 +196,13 @@ message StateResponse {
   int32          term       = 4;
   TermIndex      current_term_index  = 5;
   TermIndex      committed_term_index = 6;
+  // Additive (B §4.2, 2026-11-25): the node's current cluster view — the dialable
+  // node addresses it knows, so a client probing one bootstrap node learns the
+  // full node set to fan out `StateRequest` to (CLUSTER-SLOTS-style discovery).
+  // OPTIONAL: an old receiver skips it; an old sender omits it (empty = "no view
+  // reported", the client falls back to its bootstrap list). Payload evolution of
+  // an existing message — the frozen closed set is NOT changed by this.
+  repeated NodeAddress cluster = 7;
 }
 
 // Vote request (leader-election §5.2): candidate -> node.
@@ -210,6 +217,65 @@ message VoteResponse {
   int32     term = 1;
   TermIndex committed_term_index = 2;
   bool      vote_granted = 3;
+}
+
+// ---------------------------------------------------------------------------
+// cache client verbs (Task 2, B §3.1 — the remote client's per-operation
+// request/response set; the one-type-per-operation convention of
+// lib/raft/messages, born straight into this codec so a non-JVM client can
+// drive the same verbs without loading a JVM class)
+// ---------------------------------------------------------------------------
+
+// Result of a cache verb. OK is the success case; NOT_LEADER is the B first-cut
+// typed retryable error (§3.4 — the node is not the leader, re-discover and
+// retry; C's redirect variant will later carry `leader_hint` in the response).
+enum CacheStatus {
+  CACHE_STATUS_UNSPECIFIED = 0;   // zero value; a well-formed response always sets one of below
+  CACHE_STATUS_OK          = 1;   // the verb applied / the read served
+  CACHE_STATUS_NOT_LEADER  = 2;   // retryable: the node refused the write (not leader)
+}
+
+// Write (put): carries the same KeyDataInput the leader would append to its log.
+message CachePutRequest {
+  string       request_id = 1;    // Request base: UUID as canonical string
+  KeyDataInput payload      = 2;
+}
+
+// Delete: key only (the state machine needs nothing else to remove an entry).
+message CacheDeleteRequest {
+  string             request_id = 1;
+  KeyDataDeleteInput payload      = 2;
+}
+
+// Expire: key + TTL (nanoseconds, flat, per the KeyDataExpireInput rule).
+message CacheExpireRequest {
+  string             request_id = 1;
+  KeyDataExpireInput payload      = 2;
+}
+
+// Read: a single key in; the reply carries value + version (or "not found").
+message CacheReadRequest {
+  string request_id = 1;
+  string key        = 2;
+}
+
+// One shared write response for put/delete/expire (B §3.1). `leader_hint` is
+// additive and OPTIONAL: under today's first cut it is absent; under C's
+// chosen variant (forward vs redirect) it may name the node the client should
+// re-target (B §3.4).
+message CacheWriteResponse {
+  string      request_id  = 1;    // Response base: echoes the request's id
+  CacheStatus status      = 2;
+  NodeAddress leader_hint = 3;
+}
+
+// Read response: `found` false = the key is not in this node's local view
+// (eventually consistent under B §4.3's local-serving reads); `found` true
+// means `value` carries key + data + version.
+message CacheReadResponse {
+  string        request_id = 1;   // Response base: echoes the request's id
+  bool          found      = 2;
+  KeyDataOutput value      = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,15 +309,18 @@ message Acknowledgement {
 // message decoder WITHOUT loading any JVM class, which is the cross-language
 // property B (a non-JVM client) needs.
 //
-// The 14 variants are exactly the live wire set (the 12 raft messages of
-// lib/raft/messages the node dispatches on, plus the two channel frames
-// Handshake/Acknowledgement). Value types (TermIndex, NodeAddress,
-// NodeIdentifier, the KeyData* payloads, AppendEntries.RaftLog) are NOT variants
-// here: they never ride the wire standalone — they travel as nested fields of
-// the messages that carry them.
+// The 20 variants are exactly the live wire set: the 12 raft messages of
+// lib/raft/messages the node dispatches on, the two channel frames
+// Handshake/Acknowledgement, and — since B step B1 (2026-11-25) — the six cache
+// client verbs (§3.1) that a non-JVM client can drive without loading a JVM
+// class. Value types (TermIndex, NodeAddress, NodeIdentifier, the KeyData*
+// payloads, AppendEntries.RaftLog) are NOT variants here: they never ride the
+// wire standalone — they travel as nested fields of the messages that carry
+// them.
 //
-// Field numbers are FROZEN once this ships (compatibility rule 1). To add a new
-// wire message later: append a new variant with the next unused number.
+// Field numbers 1–14 are FROZEN (compatibility rule 1); 15–20 were appended by
+// B1 following the same rule. To add a new wire message later: append a new
+// variant with the next unused number (15–20 are already allocated).
 message WireMessage {
   oneof message {
     AcknowledgeEntries        acknowledge_entries         = 1;
@@ -268,5 +337,14 @@ message WireMessage {
     VoteResponse              vote_response               = 12;
     Handshake                 handshake                   = 13;
     Acknowledgement           acknowledgement             = 14;
+    // B step B1 (2026-11-25) — the client verb set, B §3.1. Appended after the
+    // frozen 1–14 (compatibility rule 1): each new wire message takes the next
+    // unused number, never renumbers or deletes an existing one.
+    CacheDeleteRequest        cache_delete_request        = 15;
+    CacheExpireRequest        cache_expire_request        = 16;
+    CachePutRequest           cache_put_request           = 17;
+    CacheReadRequest          cache_read_request          = 18;
+    CacheReadResponse         cache_read_response         = 19;
+    CacheWriteResponse        cache_write_response        = 20;
   }
 }

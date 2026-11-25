@@ -5,6 +5,12 @@ import com.github.jocull.raftcache.lib.data.Snapshot;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
 import com.github.jocull.raftcache.lib.raft.messages.AppendEntries;
+import com.github.jocull.raftcache.lib.raft.messages.CacheDeleteRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheExpireRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CachePutRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheReadRequest;
+import com.github.jocull.raftcache.lib.raft.messages.CacheReadResponse;
+import com.github.jocull.raftcache.lib.raft.messages.CacheWriteResponse;
 import com.github.jocull.raftcache.lib.raft.messages.Introduction;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteRequest;
 import com.github.jocull.raftcache.lib.raft.messages.PreVoteResponse;
@@ -1330,6 +1336,35 @@ class RaftNodeBehaviorLeaderInstallSnapshotTest {
         @Override
         public void sendInstallSnapshotResponse(InstallSnapshotResponse installSnapshotResponse) {
             throw new UnsupportedOperationException("test stub");
+        }
+
+        // Client B first cut (B §3.3, 2026-11-25): the cache verb seams are not exercised by these behavior tests.
+        @Override
+        public CompletableFuture<CacheWriteResponse> sendCachePut(CachePutRequest request) {
+            throw new UnsupportedOperationException("test stub");
+        }
+
+        @Override
+        public CompletableFuture<CacheWriteResponse> sendCacheDelete(CacheDeleteRequest request) {
+            throw new UnsupportedOperationException("test stub");
+        }
+
+        @Override
+        public CompletableFuture<CacheWriteResponse> sendCacheExpire(CacheExpireRequest request) {
+            throw new UnsupportedOperationException("test stub");
+        }
+
+        @Override
+        public CompletableFuture<CacheReadResponse> sendCacheRead(CacheReadRequest request) {
+            throw new UnsupportedOperationException("test stub");
+        }
+
+        @Override
+        public void sendCacheWriteResponse(CacheWriteResponse response) {
+        }
+
+        @Override
+        public void sendCacheReadResponse(CacheReadResponse response) {
         }
     }
 }

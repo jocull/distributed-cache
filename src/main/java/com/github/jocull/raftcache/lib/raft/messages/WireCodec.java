@@ -32,12 +32,15 @@ import java.util.UUID;
  * cross-language property the remote client (Task 2) needs.
  *
  * <h2>Closed set</h2>
- * Exactly 14 types ride the wire as frames:
+ * Exactly 20 types ride the wire as frames:
  * {@link Introduction}, {@link AnnounceClusterTopology}, {@link StateRequest},
  * {@link StateResponse}, {@link VoteRequest}, {@link VoteResponse},
  * {@link PreVoteRequest}, {@link PreVoteResponse}, {@link AppendEntries},
  * {@link AcknowledgeEntries}, {@link InstallSnapshot}, {@link InstallSnapshotResponse},
- * {@link Handshake}, {@link Acknowledgement}.
+ * {@link Handshake}, {@link Acknowledgement} — and, since client B step B1
+ * (2026-11-25, B §3.1), the six client cache verbs: {@link CachePutRequest},
+ * {@link CacheDeleteRequest}, {@link CacheExpireRequest}, {@link CacheReadRequest},
+ * {@link CacheWriteResponse}, {@link CacheReadResponse}.
  * Value types ({@link TermIndex}, both {@code NodeIdentifier}s, {@link NodeAddress})
  * and the {@code KeyData*} payloads are NOT frame types — they travel as nested
  * fields of the messages that carry them ({@code RaftLog.oneof entry} and
@@ -68,13 +71,13 @@ import java.util.UUID;
  * package-private wire-reconstruction factories on {@code Request}/{@code StateRequest}.
  */
 public final class WireCodec {
-    private static final int FRAME_VARIANTS = 14;
+    private static final int FRAME_VARIANTS = 20;
 
     private WireCodec() {
     }
 
     /**
-     * Encode one wire frame (one of the 14 frame types) to its protocol-buffers bytes.
+     * Encode one wire frame (one of the 20 frame types) to its protocol-buffers bytes.
      *
      * @param message a wire message — one of the closed set above, or one of the
      *                {@code KeyData*} payloads (for the read response, B §3.2)
@@ -124,6 +127,24 @@ public final class WireCodec {
         }
         if (message instanceof Acknowledgement) {
             return WireMessage.newBuilder().setAcknowledgement(com.github.jocull.raftcache.lib.raft.messages.proto.Acknowledgement.getDefaultInstance()).build().toByteArray();
+        }
+        if (message instanceof CachePutRequest) {
+            return WireMessage.newBuilder().setCachePutRequest(toProto((CachePutRequest) message)).build().toByteArray();
+        }
+        if (message instanceof CacheDeleteRequest) {
+            return WireMessage.newBuilder().setCacheDeleteRequest(toProto((CacheDeleteRequest) message)).build().toByteArray();
+        }
+        if (message instanceof CacheExpireRequest) {
+            return WireMessage.newBuilder().setCacheExpireRequest(toProto((CacheExpireRequest) message)).build().toByteArray();
+        }
+        if (message instanceof CacheReadRequest) {
+            return WireMessage.newBuilder().setCacheReadRequest(toProto((CacheReadRequest) message)).build().toByteArray();
+        }
+        if (message instanceof CacheWriteResponse) {
+            return WireMessage.newBuilder().setCacheWriteResponse(toProto((CacheWriteResponse) message)).build().toByteArray();
+        }
+        if (message instanceof CacheReadResponse) {
+            return WireMessage.newBuilder().setCacheReadResponse(toProto((CacheReadResponse) message)).build().toByteArray();
         }
         if (message instanceof KeyDataOutput) {
             // The read response (B §3.2) — a payload, not a frame: no envelope variant,
@@ -177,6 +198,18 @@ public final class WireCodec {
                 return fromProto(message.getHandshake());
             case ACKNOWLEDGEMENT:
                 return new Acknowledgement();
+            case CACHE_PUT_REQUEST:
+                return fromProto(message.getCachePutRequest());
+            case CACHE_DELETE_REQUEST:
+                return fromProto(message.getCacheDeleteRequest());
+            case CACHE_EXPIRE_REQUEST:
+                return fromProto(message.getCacheExpireRequest());
+            case CACHE_READ_REQUEST:
+                return fromProto(message.getCacheReadRequest());
+            case CACHE_WRITE_RESPONSE:
+                return fromProto(message.getCacheWriteResponse());
+            case CACHE_READ_RESPONSE:
+                return fromProto(message.getCacheReadResponse());
             case MESSAGE_NOT_SET:
             default:
                 throw new com.google.protobuf.InvalidProtocolBufferException(
@@ -309,6 +342,8 @@ public final class WireCodec {
                         .setTerm(response.getTerm())
                         .setCurrentTermIndex(toProto(response.getCurrentTermIndex()))
                         .setCommittedTermIndex(toProto(response.getCommittedTermIndex()));
+        // Client B §4.2 (2026-11-25): share the cluster view (additive proto field 7).
+        response.getCluster().forEach(address -> builder.addCluster(toProto(address)));
         return builder.build();
     }
 
@@ -393,6 +428,66 @@ public final class WireCodec {
                 .build();
     }
 
+    // Client B §3.1 (2026-11-25): the six client cache verb frames.
+
+    private static com.github.jocull.raftcache.lib.raft.messages.proto.CacheStatus toProto(CacheStatus status) {
+        return switch (status) {
+            case UNSPECIFIED -> com.github.jocull.raftcache.lib.raft.messages.proto.CacheStatus.CACHE_STATUS_UNSPECIFIED;
+            case OK -> com.github.jocull.raftcache.lib.raft.messages.proto.CacheStatus.CACHE_STATUS_OK;
+            case NOT_LEADER -> com.github.jocull.raftcache.lib.raft.messages.proto.CacheStatus.CACHE_STATUS_NOT_LEADER;
+        };
+    }
+
+    private static com.github.jocull.raftcache.lib.raft.messages.proto.CachePutRequest toProto(CachePutRequest request) {
+        return com.github.jocull.raftcache.lib.raft.messages.proto.CachePutRequest.newBuilder()
+                .setRequestId(request.getRequestId().toString())
+                .setPayload(toProto(request.getPayload()))
+                .build();
+    }
+
+    private static com.github.jocull.raftcache.lib.raft.messages.proto.CacheDeleteRequest toProto(CacheDeleteRequest request) {
+        return com.github.jocull.raftcache.lib.raft.messages.proto.CacheDeleteRequest.newBuilder()
+                .setRequestId(request.getRequestId().toString())
+                .setPayload(toProto(request.getPayload()))
+                .build();
+    }
+
+    private static com.github.jocull.raftcache.lib.raft.messages.proto.CacheExpireRequest toProto(CacheExpireRequest request) {
+        return com.github.jocull.raftcache.lib.raft.messages.proto.CacheExpireRequest.newBuilder()
+                .setRequestId(request.getRequestId().toString())
+                .setPayload(toProto(request.getPayload()))
+                .build();
+    }
+
+    private static com.github.jocull.raftcache.lib.raft.messages.proto.CacheReadRequest toProto(CacheReadRequest request) {
+        return com.github.jocull.raftcache.lib.raft.messages.proto.CacheReadRequest.newBuilder()
+                .setRequestId(request.getRequestId().toString())
+                .setKey(request.getKey())
+                .build();
+    }
+
+    private static com.github.jocull.raftcache.lib.raft.messages.proto.CacheWriteResponse toProto(CacheWriteResponse response) {
+        com.github.jocull.raftcache.lib.raft.messages.proto.CacheWriteResponse.Builder builder =
+                com.github.jocull.raftcache.lib.raft.messages.proto.CacheWriteResponse.newBuilder()
+                        .setRequestId(response.getRequestId().toString())
+                        .setStatus(toProto(response.getStatus()));
+        if (response.getLeaderHint() != null) {
+            builder.setLeaderHint(toProto(response.getLeaderHint()));
+        }
+        return builder.build();
+    }
+
+    private static com.github.jocull.raftcache.lib.raft.messages.proto.CacheReadResponse toProto(CacheReadResponse response) {
+        com.github.jocull.raftcache.lib.raft.messages.proto.CacheReadResponse.Builder builder =
+                com.github.jocull.raftcache.lib.raft.messages.proto.CacheReadResponse.newBuilder()
+                        .setRequestId(response.getRequestId().toString())
+                        .setFound(response.isFound());
+        if (response.getValue() != null) {
+            builder.setValue(toProto(response.getValue()));
+        }
+        return builder.build();
+    }
+
     // ---------------------------------------------------------------------
     // from proto
     // ---------------------------------------------------------------------
@@ -444,12 +539,57 @@ public final class WireCodec {
         // The constructor derives the lib.topology NodeIdentifier from id+address — mirror
         // the construction, not the fields (there is no setter surface to fill).
         com.github.jocull.raftcache.lib.raft.messages.proto.NodeIdentifier wireId = response.getIdentifier();
+        // Client B §4.2 (2026-11-25): cluster view (additive proto field 7; absent on
+        // a pre-B sender, and the POJO constructor then defaults to an empty list).
+        List<NodeAddress> cluster = new ArrayList<>(response.getClusterCount());
+        response.getClusterList().forEach(address -> cluster.add(fromProto(address)));
         return new StateResponse(new Request(UUID.fromString(response.getRequestId())),
                 wireId.getId(), fromProto(wireId.getNodeAddress()),
                 fromProto(response.getState()),
                 response.getTerm(),
                 fromProto(response.getCurrentTermIndex()),
-                fromProto(response.getCommittedTermIndex()));
+                fromProto(response.getCommittedTermIndex()),
+                cluster);
+    }
+
+    // Client B §3.1 (2026-11-25): the six client cache verb frames.
+
+    private static CacheStatus fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.CacheStatus status) {
+        return switch (status) {
+            case CACHE_STATUS_UNSPECIFIED -> CacheStatus.UNSPECIFIED;
+            case CACHE_STATUS_OK -> CacheStatus.OK;
+            case CACHE_STATUS_NOT_LEADER -> CacheStatus.NOT_LEADER;
+            default -> throw new IllegalArgumentException(
+                    "Unknown cache status on the wire: " + status + " — a well-formed CacheWriteResponse carries UNSPECIFIED/OK/NOT_LEADER");
+        };
+    }
+
+    private static CachePutRequest fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.CachePutRequest request) {
+        return new CachePutRequest(UUID.fromString(request.getRequestId()), fromProto(request.getPayload()));
+    }
+
+    private static CacheDeleteRequest fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.CacheDeleteRequest request) {
+        return new CacheDeleteRequest(UUID.fromString(request.getRequestId()), fromProto(request.getPayload()));
+    }
+
+    private static CacheExpireRequest fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.CacheExpireRequest request) {
+        return new CacheExpireRequest(UUID.fromString(request.getRequestId()), fromProto(request.getPayload()));
+    }
+
+    private static CacheReadRequest fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.CacheReadRequest request) {
+        return new CacheReadRequest(UUID.fromString(request.getRequestId()), request.getKey());
+    }
+
+    private static CacheWriteResponse fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.CacheWriteResponse response) {
+        return new CacheWriteResponse(new Request(UUID.fromString(response.getRequestId())),
+                fromProto(response.getStatus()),
+                response.hasLeaderHint() ? fromProto(response.getLeaderHint()) : null);
+    }
+
+    private static CacheReadResponse fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.CacheReadResponse response) {
+        return new CacheReadResponse(new Request(UUID.fromString(response.getRequestId())),
+                response.getFound(),
+                response.hasValue() ? fromProto(response.getValue()) : null);
     }
 
     private static VoteRequest fromProto(com.github.jocull.raftcache.lib.raft.messages.proto.VoteRequest vote) {

@@ -24,4 +24,14 @@ public interface NodeCommunicationReceiver {
     void onInstallSnapshot(NodeConnectionOutbound sender, InstallSnapshot installSnapshot);
 
     void onInstallSnapshotResponse(NodeConnectionOutbound sender, InstallSnapshotResponse installSnapshotResponse);
+
+    // Client B §3.3 (2026-11-25): the client verb handlers (pre-introduction dispatch,
+    // B §4.1 — these never require remoteNodeId).
+    void onCachePut(NodeConnectionOutbound sender, CachePutRequest request);
+
+    void onCacheDelete(NodeConnectionOutbound sender, CacheDeleteRequest request);
+
+    void onCacheExpire(NodeConnectionOutbound sender, CacheExpireRequest request);
+
+    void onCacheRead(NodeConnectionOutbound sender, CacheReadRequest request);
 }
