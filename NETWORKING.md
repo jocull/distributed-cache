@@ -49,8 +49,11 @@ line-verified against `finish` @ `0fee1c9`.
 ### 1.3 Constraints
 
 - **Offline Maven**: no new dependencies (local repo has only spring-boot-starter, commons-lang3,
-  commons-codec, resilience4j-retry, junit, mockito). Decision (below, #D8): JDK `Serializable` is the
-  format — zero new dependencies, and the wire surface is small and closed exactly as needed.
+  commons-codec, resilience4j-retry, junit, mockito). This constrained the *original* codec choice
+  (JDK `Serializable`, decision #D8 above — `SCOPE.md` Decision #9) to zero new dependencies.
+  **Superseded 2026-11-24:** the user approved a one-off exception ("I don't care") and the
+  migration to Protocol Buffers (2026-11-25, one-time online fetch, offline `mvn -o` builds
+  restored — see §2.1 addendum and `SCOPE.md` Follow-up #11).
 - **Java 17** (`pom.xml` release 17): no virtual threads; plain `Thread`/executors.
 - `RaftNodeImpl.stop()` is terminal (`nodeExecutor.shutdownNow()`, `RaftNodeImpl.java:84-89`): a
   taken-down node is *restarted as a fresh manager*, mirroring a process restart (no persistence
@@ -62,21 +65,40 @@ line-verified against `finish` @ `0fee1c9`.
 
 ```
 +---------+======================================+
-| length  | JDK-serialized payload stream        |
-| 4 bytes | (ObjectOutputStream, length bytes)  |
+| length  | protobuf-serialized message         |
+| 4 bytes | (one protobuf message, length bytes)|
 | BE int  |======================================|
 +---------+--------------------------------------+
 ```
 
-- Length-prefixed (big-endian), one frame = one `Object`. Serialized with
-  `java.io.ObjectOutputStream` / `ObjectInputStream` — the JDK's built-in binary format: every
-  involved class `implements Serializable` with an explicit `serialVersionUID`.
-- Rationale (recorded decision #D8 in `SCOPE.md`): no dependency is available and none may be added;
-  the surface is closed (11 message types + 3 payload types + 5 value types), so the
-  `Serializable`-cast cost is bounded; round-trip is byte-exact in-JVM and stable across JVMs of the
-  same code. A hand-rolled codec is the escape valve if a payload type ever stops implementing
-  `Serializable` or cross-version compatibility is needed — the frame format above does not change
-  either way (framing is payload-neutral).
+- Length-prefixed (big-endian), one frame = one protobuf message. The codec is Protocol
+  Buffers: `WireCodec.serialize`/`WireCodec.deserialize` (`lib/raft/messages/WireCodec.java`)
+  maps the closed wire surface to/from the `WireMessage` oneof envelope in
+  `src/main/proto/wire.proto` (14 envelope variants, field numbers 1–14, frozen and pinned by
+  `WireSerializationTest`); `KeyDataOutput` (the read reply born with the B design) is a
+  dedicated proto message with named encode/decode (`decodeKeyDataOutput`) rather than an
+  envelope variant. The `.proto` file **is** the wire contract: a receiver reads the envelope
+  discriminator and field numbers without loading any JVM class — the cross-language property
+  an out-of-process client needs.
+- **Codec migration (2026-11-25, Successor to the original JDK-serialization decision —
+  `SCOPE.md` Follow-up #11)**: this section originally specified
+  `java.io.ObjectOutputStream`/`ObjectInputStream` (`SCOPE.md` Decision #9 — cited in this
+  document as design decision #D8), on the offline-Maven basis that no new dependency was
+  available or permitted; the surface
+  was then closed (11 message types + 3 payload types + 5 value types) and every involved
+  class was given `implements Serializable` + `serialVersionUID`. On 2026-11-24 the user
+  cleared the new-dependency gate as a one-off exception ("You can add a new dependency? I
+  don't care"), and the wire codec was migrated 2026-11-25 (commits `94ce636` → `1780c32`)
+  to Protocol Buffers — which the JDK-serialization decision recorded only as an escape
+  valve — because (a) the IDL becomes the shared contract for non-JVM clients, (b) protobuf's
+  field-number evolution is the cross-version safety JDK serialization honestly lacked, and
+  (c) it pre-empted B §3.2's `KeyDataOutput` wireability debt. `WireCodec.deserialize`
+  materializes the concrete hand-written POJOs (the wire is type-erased; the envelope restores
+  class identity), so the Java `instanceof` dispatch chain in `NodeConnectionOutboundImpl`
+  kept working untouched. The `Serializable` markers + `serialVersionUID` were left on the
+  POJOs (harmless, small diff — recorded in `SCOPE.md` Follow-up #11), and the in-band
+  snapshot payload (`InstallSnapshot`, `SNAPSHOTS.md`) deliberately still rides JDK
+  serialization — the codec swaps only the socket-frame payload.
 - **Invariants the format must respect** (reader discipline): the reader thread MUST always consume
   a complete frame before any drop decision (invariant N3) — dropping must never desynchronize the
   byte stream.
@@ -127,6 +149,11 @@ line-verified against `finish` @ `0fee1c9`.
 
 ### 2.3 Serialization surface (stage A of the plan)
 
+**Historical (2026-11-25, codec migration §2.1):** with the wire codec now Protocol Buffers, these
+markers no longer carry the wire — they remain on the POJOs as the harmless leftover the migration
+recorded in `SCOPE.md` Follow-up #11 (the in-band snapshot payload still rides JDK serialization).
+The original requirement was:
+
 Add `implements Serializable` + `static final long serialVersionUID` to exactly the closed wire set:
 
 - messages: `Request` (base, covers `Response`/`StateRequest`), `StateResponse`, `Introduction`,
@@ -165,7 +192,10 @@ No behavior change: these are value classes (fields are `final`, constructors al
   `RaftNodeImpl` does over `PassThru` must work unchanged over sockets.
 - **N2 — round-trip fidelity.** Every wire type, including the open-typed entry slot
   (`KeyData*Input` payloads and String entries), deserializes to an `equals`-equal instance of the
-  identical class, in order, across the real socket.
+  identical class, in order, across the real socket. *(Under the 2026-11-25 protobuf codec the
+  12 frame POJOs — which define no `equals`, see item 6 below — are pinned field-by-field and
+  count-by-count instead (e.g. the transport tests assert delivered frame count + each frame's
+  `term`); the `KeyData*` value payloads keep the `equals`-equal assertion.)*
 - **N3 — frame discipline.** Interrupt/restore never leaves a half-read frame on the stream: the
   reader always consumes a full frame and drops the *message*. After `restore`, both directions work
   immediately and correctly (no desync, no stuck futures on the *restored* path).
@@ -215,6 +245,11 @@ a minute of wall time.
 
 ## 5. Staged implementation (each stage = green suite + one commit)
 
+> **Done — kept as the historical plan:** every stage below landed (2026-11-21→22; per-stage suite
+> evidence in `SCOPE.md`'s Test evidence). The *wire* half of Stage A's record is superseded by the
+> 2026-11-25 codec migration (§2.1 — `WireSerializationTest` now pins the protobuf round-trips);
+> everything else here remains accurate history and is deliberately not rewritten.
+
 Existing bar: **242 green / 0 fail / 1 skip** (the only skip is the pre-existing `@Disabled`
 `proto.raft.RaftNodeTest`). Any new failure = STOP before committing.
 
@@ -237,8 +272,10 @@ Existing bar: **242 green / 0 fail / 1 skip** (the only skip is the pre-existing
    landed (2026-11-24, infra-debt item 4), and its javadoc explicitly notes that reconnection is
    *not* automatic.
 2. **Cross-JVM / multi-host.** The per-node-server design already dials real host:port strings, so a
-   node in another JVM is addressable; not exercised here (single-JVM IT) and would need the
-   serialization decision revisited for cross-version compatibility.
+   node in another JVM is addressable; not exercised here (single-JVM IT). With the 2026-11-25
+   protobuf codec, cross-*version* compatibility is now the codec's own field-number story
+   (unknown fields skip on read), which is exactly the property the original JDK-serialization
+   basis recorded as lacking.
 3. **TLS / authentication.** Out of scope; loopback IT only.
 4. **`DistributedCache` leader routing over the wire.** Today it still finds the leader in-process
   (direct `RaftNode` access). Once the client is out-of-process, routing becomes "connect to any

@@ -425,6 +425,14 @@ subsequently decided, fixed, and regression-tested):
    escape valve in `NETWORKING.md` §2.1, is the step if cross-version compatibility is ever
    required). Frame format (4-byte BE length + payload) is payload-neutral, so that swap does not
    re-touch framing.
+   **Superseded as the wire codec (2026-11-25, Follow-up #11 — done):** the user cleared the
+   new-dependency gate on 2026-11-24 as a one-off exception, and the wire codec was migrated to
+   Protocol Buffers (commits `94ce636` → `1780c32`) via exactly the escape-valve path this
+   decision recorded. It stands as the record of why JDK serialization was the *original* choice
+   (offline Maven: no new dependency available or permitted) and why that basis later did not
+   transfer to a non-JVM client. The `implements Serializable` + `serialVersionUID` markers it
+   required remain on the POJOs (harmless, small diff — Follow-up #11's progress record), and
+   the in-band snapshot payload still rides JDK serialization by design (`SNAPSHOTS.md`'s S3 pin).
 
 ## Follow-ups / backlog
 
@@ -525,9 +533,9 @@ which stay the detailed record.
     degradation window. The baseline implementation was spec-compliant without pre-vote — it
     is an availability improvement, not a correctness fix.
 
-11. **Cross-language wire codec — migrate off JDK `java.io.Serializable`** *(deferred; trigger:
-    a first client in a non-Java language (e.g. Node.js), or recorded as B's §3.1 message contract
-    is being written)* — Decision #9 chose JDK serialization on the offline-constraint basis
+11. **Cross-language wire codec — migrate off JDK `java.io.Serializable`** *(done 2026-11-25 —
+    steps A and B landed, commits `94ce636`/`1780c32`; the first-client trigger below is what
+    started it)* — Decision #9 chose JDK serialization on the offline-constraint basis
     (nothing beyond the current pom in the local repo) and recorded it honestly as
     not cross-version-safe, with a hand-rolled codec as the escape valve. For a non-JVM client
     that basis does not transfer at all: Java serialization binds to Java classes and
@@ -571,6 +579,51 @@ which stay the detailed record.
     implementation time); whether `Handshake` negotiates the codec (the natural
     rolling-upgrade seam — a node speaking both during the migration); and whether B lands on JDK
     serialization and the six messages are ported later, or B lands after the codec swap.
+    **Progress (2026-11-25 — item done, every sub-question answered and recorded):**
+    - **Step A (commit `94ce636`) — IDL + dependency.** `src/main/proto/wire.proto`: 23 messages
+      + the `NodeState` enum + the `WireMessage` oneof envelope; `protobuf-java` **4.35.0**
+      (latest stable at pickup, per the default recorded above); codegen via
+      `protobuf-maven-plugin` **0.6.1** + `os-maven-plugin` **1.7.1** (OS detection — this
+      ARM box resolves the `linux-aarch_64` protoc artifact); generated package
+      `lib.raft.messages.proto`. One-time online fetch warmed the local repo; the offline gate
+      (`mvn -o -B test`) has been green since. **Build-mechanics sub-question: `protobuf-maven-plugin`
+      + the `protoc` artifact** over a reflection/dynamic-message runtime — codegen keeps the
+      IDL the single source of truth and emits real Java types the Java side compiles against.
+    - **Step B (commit `1780c32`) — codec swap.** `WireCodec` (`lib/raft/messages`) maps the
+      14 wire POJOs to/from the `WireMessage` envelope: variants 1–14, field numbers frozen in
+      the IDL and pinned by the reworked `WireSerializationTest` (16 round-trips, incl.
+      unknown-field tolerance and non-wire-type rejection — the closed set is the contract).
+      `SocketChannelMiddleware`'s frame seam now delegates to it: the 4-byte-BE length frame,
+      the 64 MB payload caps, the `sendLock`, the N3 seal-and-consume discipline and the per-channel
+      FIFO are untouched — only the payload bytes changed format. `Request`/`StateRequest` gained
+      wire-reconstruction factories so the exact request `UUID` survives the round-trip
+      (`NodeRequests.completeRequest` correlates on it). The 4 string-payload transport tests now
+      send a real wire type (`VoteResponse`, whose `term` is the delivery tag) and pin delivered
+      **count + fields** instead of object equality: the closed-set codec rejects non-wire types
+      by construction, and none of the 14 frames defines `equals` (the `KeyData*` value payloads
+      keep `equals`-based pins). Suite: **464 tests, 0 failed, 0 errors, 1 skip**.
+    - **Envelope vs per-type decode — the envelope was adopted on the wire.** `WireMessage` is
+      the IDL's top-level envelope, so a receiver reads the discriminator without loading any JVM
+      class — the cross-language property Task 2 needs. The Java `instanceof` dispatch chain in
+      `NodeConnectionOutboundImpl` was **kept**: `deserialize` materializes the concrete POJO,
+      so the chain still works as-is and its registry-refactor opportunity stays the open option
+      recorded in B §3.3 (minimal additive change mandated there).
+    - **`Handshake` codec negotiation — skipped in v1.** The PoC harness is a same-version
+      cluster, so the rolling-upgrade seam (a node negotiating codec during migration) is
+      deliberately not built; it remains the recorded follow-up for that case.
+    - **`Serializable`/`serialVersionUID` kept** on the POJOs (harmless, small diff), per the
+      sub-question's default. The in-band snapshot payload (`InstallSnapshot.payload`,
+      `SNAPSHOTS.md`'s pinned `SnapshotTransfer` serialization) still rides JDK serialization by
+      design — the codec swaps only the socket-frame payload; nothing in `lib/proto` (the earlier
+      communication spike) was touched.
+    - **Pre-emption closed: `KeyDataOutput` is now wireable.** It is a dedicated proto message
+      with named encode/decode (`WireCodec.decodeKeyDataOutput`), carried as proto bytes rather
+      than as an envelope variant (it is not one of the 14 frames — it is the read *reply*).
+      B §3.2's required read-payload serializability fix is therefore satisfied without changing
+      `KeyDataOutput`'s API surface at all; recorded as a cross-ref addendum in
+      `design/REMOTE-CLIENT-B-CLIENT-RPC.md` §3.2 (nothing deleted or renumbered).
+    - **Status: done.** The trigger — a first non-JVM client — is what started this, and B's six
+      new message types (B §3.1) are born straight into this codec and the IDL.
 
 ## Test evidence
 

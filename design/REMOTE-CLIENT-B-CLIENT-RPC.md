@@ -20,7 +20,7 @@
    [client JVM]  —  no RaftNode objects, no in-JVM references —  (the "another Java server" goal)
         │
         │   1) discover:  "who is the leader?"        (reuse StateRequest / leader discovery)
-        │   2) ops:        put / get / delete / expire over the existing frame + Serializable codec
+        │   2) ops:        put / get / delete / expire over the existing frame + protobuf codec (2026-11-25)
         ▼
    ┌──────────── any node ────────────┐
    │ not leader? ──> FIRST CUT: typed retryable "not leader" error — client
@@ -38,8 +38,9 @@
   that write to the leader, or the error *names the leader* and the client re-targets to it.
   Either way, surviving nodes keep serving clients even when the current leader — or the leader's
   co-located JVM — is gone.
-- **It reuses the existing wire** — same 4-byte-BE-length + `Serializable` frame
-  (`NETWORKING.md` §2.1), same `ChannelMiddleware`/`ChannelSide`, same `NodeRequests`
+- **It reuses the existing wire** — same 4-byte-BE-length frame, the payload codec having
+  been Protocol Buffers since the 2026-11-25 migration (`NETWORKING.md` §2.1; the §3.2
+  addendum below), same `ChannelMiddleware`/`ChannelSide`, same `NodeRequests`
   request/response correlation, same `instanceof` dispatch chain (`NodeConnectionOutboundImpl`).
 - **A new client-side object** (`RemoteCacheClient`, name tentative) lives in the client JVM and
   exposes the same verbs as `DistributedCache` but over the network.
@@ -49,22 +50,26 @@
 considered and rejected; see its archived record). **Why it's the largest:** it
 touches the dispatch chain (`// TODO: not very maintainable` in-code), needs a decision on how a
 *client* connection is distinguished from a *Raft-peer* connection, and must fix the
-non-`Serializable` read payload. Each of those is called out below with honest open questions.
+non-`Serializable` read payload (now resolved — see the §3.2 addendum). Each of those is called
+out below with honest open questions.
 
 ---
 
 ## 2. What already exists that B reuses (no changes)
 
-- **Frame + codec** (`NETWORKING.md` §2.1, D8/#9) — B is zero-dep *today* by construction; it
-  only adds `Serializable` message types. One caveat on codec: the JDK serialization choice is a
-  PoC-grade one — offline-constraint-driven (Decision #9 in `SCOPE.md`), not cross-version-safe,
-  and unusable by non-JVM clients (a Node.js client cannot deserialize Java serialization).
-  The cross-language codec migration is tracked as Follow-up #11 in `SCOPE.md`, and its
-  one-off new-dependency exception was approved by the user 2026-11-24 (chosen target: Protocol
-  Buffers over this same frame). Consequence for B: its new messages should keep
-  **flat, language-portable payloads** (string / byte[] / long, wrapping the `KeyData*`
-  inputs) rather than nested Java object graphs, so the swap into the target codec stays
-  mechanical.
+- **Frame + codec** (`NETWORKING.md` §2.1, D8/#9) — the 4-byte-BE-length framing is untouched;
+  the payload codec has been Protocol Buffers since the 2026-11-25 migration
+  (`SCOPE.md` Follow-up #11 — **done**; the one-off new-dependency exception was approved by the
+  user 2026-11-24). The old JDK-serialization basis (Decision #9) that made the codec a
+  PoC-grade one — offline-constraint-driven, not cross-version-safe, unusable by non-JVM
+  clients — is what the migration replaced, via that decision's own recorded escape-valve path.
+  Consequence for B (binding): its new messages must keep **flat, language-portable payloads**
+  (string / byte[] / long, wrapping the `KeyData*` inputs) rather than nested Java object
+  graphs, and they are born straight into the existing codec — either as new `WireMessage`
+  envelope variants with fresh protobuf field numbers (1–14 are frozen, never re-used), or as
+  dedicated messages with named encode/decode like `KeyDataOutput` rather than re-opening an
+  existing one; a non-JVM client can read the discriminator and payloads without loading a JVM
+  class, a property the old basis lacked.
 - **`Request`/`Response` correlation** — `Request.requestId` (UUID), `Response(Request)` echo,
   `NodeRequests#getRequestFuture/completeRequest` (a generic pending-future map; currently a
   **5 s** timeout — in-code TODO). B's client requests reuse this **verbatim** (same pattern as
@@ -108,6 +113,14 @@ its siblings) **or** introduce a dedicated serializable read-response payload. T
 real* change to a type in `lib/communication/` — flag it to any session so it isn't missed, and
 pick one approach and record the choice. (Both are low-risk; the decision affects whether
 `KeyDataOutput`'s API surface changes.)
+
+> **Addendum (2026-11-25, resolved by the Task 1 codec migration — commits `94ce636`/`1780c32`):**
+> this debt is already closed. `KeyDataOutput` is a dedicated message in
+> `src/main/proto/wire.proto`, and `WireCodec` carries it with named encode and
+> `decodeKeyDataOutput` — so `CacheReadResponse`'s value + version cross the wire as proto bytes
+> without `KeyDataOutput` gaining `Serializable` or a new payload type (no API-surface change at
+> all). The §3.1 wire message types are born straight into the same codec and IDL. Record here so
+> whoever stages B does not re-open the question; nothing above is deleted or renumbered.
 
 ### 3.3 Dispatch / sender / receiver seams (the concrete integration points)
 Adding a message type means touching the existing chain — this is the `// TODO: not very
@@ -211,7 +224,8 @@ A `RemoteCacheClient` (tentative name) configured with a **bootstrap node list**
 
 ## 6. Suggested staging (proposed, not binding)
 
-- **B1** message types + the read-payload `Serializable` fix (§3.2) + dispatch/sender/receiver
+- **B1** message types (born into the protobuf codec — §3.2 addendum) + the read-payload
+  wireability (already done via the codec migration — §3.2 addendum) + dispatch/sender/receiver
   seams (§3.3). No client yet. Keep `mvn -o -B test` green at the end.
 - **B2** node-side **write** handler on a leader (reuse `submit`), plus the read handler
   (local-serving). Wire the correlation futures.
@@ -239,13 +253,15 @@ blocks nothing in B1–B5.
 - **Positive:** this is the chosen design precisely because it is the only option that makes the
   cluster a genuinely externally-reachable distributed service with any surviving node as an
   entry point — the stated end goal ("leverage the cache cluster from another Java server").
-  Zero new dependencies by construction.
+  The wire's one new dependency is the user-approved one-off (protobuf, the 2026-11-24 exception,
+  `SCOPE.md` Follow-up #11) — B itself adds no further.
 
 ---
 
 ## 8. Dependencies & hand-offs
 
-- **Depends on:** the read-payload `Serializable` fix (§3.2). Nothing else.
+- **Depends on:** the read-payload wireability — **done** (the 2026-11-25 codec migration closed
+  it; §3.2 addendum). Nothing else.
 - **Option C (DEFERRED — decision pending):**
   `design/REMOTE-CLIENT-C-LEADER-FORWARDING.md` — what a non-leader does with a client write:
   *forward* it in-cluster to the leader (variant 1) vs. *redirect* — a typed "not leader —
