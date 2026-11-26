@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -259,30 +260,56 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     }
 
     /**
+     * The NOT_LEADER reply's leader hint (C §5 DECISION, 2026-11-25 — Redirect variant):
+     * this node's current leader view, resolved ASYNCHRONOUSLY — the node executor runs
+     * the fan-out, so the dispatch thread that invoked the handler never blocks (no
+     * {@code join()} on the client path's thread). The hint carries the leader's
+     * {@link NodeAddress} so a remote client can re-target immediately instead of
+     * re-discovering; when the view names no leader (or resolution itself fails) the hint
+     * is {@code null} and the client falls back to re-discovery.
+     */
+    private CompletableFuture<NodeAddress> leaderHint() {
+        return self.getLeader()
+                .thenApply(opt -> opt
+                        .map(s -> s.getIdentifier().getNodeAddress())
+                        .orElse(null))
+                .exceptionally(failure -> null);
+    }
+
+    /**
      * Client B first cut (B §3.4, 2026-11-25): a cache write reaching a node that is not
      * the leader is a typed retryable error, not a failure — reply NOT_LEADER (and warn),
      * so the client re-discovers a leader and retries. The leader-side handler (B2)
      * overrides this and applies the verb instead.
+     *
+     * <p>C §5 (2026-11-25, Redirect variant): the reply now ALSO carries a leader hint
+     * when this node's view names one ({@link #leaderHint()}), so the client can re-target
+     * straight to the named leader; a {@code null} hint (no leader visible, or a
+     * resolution failure) means "re-discover" and is indistinguishable from the B shape to
+     * such a client.
      */
     @Override
     public void onCachePut(NodeConnectionOutbound sender, CachePutRequest request) {
-        LOGGER.warn("{} CachePutRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER",
+        LOGGER.warn("{} CachePutRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER (leader hint when discoverable)",
                 self.getId(), sender.getRemoteNodeId(), request.getPayload().getKey(), state);
-        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+        leaderHint().thenAccept(hint ->
+                sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, hint)));
     }
 
     @Override
     public void onCacheDelete(NodeConnectionOutbound sender, CacheDeleteRequest request) {
-        LOGGER.warn("{} CacheDeleteRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER",
+        LOGGER.warn("{} CacheDeleteRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER (leader hint when discoverable)",
                 self.getId(), sender.getRemoteNodeId(), request.getPayload().getKey(), state);
-        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+        leaderHint().thenAccept(hint ->
+                sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, hint)));
     }
 
     @Override
     public void onCacheExpire(NodeConnectionOutbound sender, CacheExpireRequest request) {
-        LOGGER.warn("{} CacheExpireRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER",
+        LOGGER.warn("{} CacheExpireRequest from {} (key={}) — {} does not serve writes; replying NOT_LEADER (leader hint when discoverable)",
                 self.getId(), sender.getRemoteNodeId(), request.getPayload().getKey(), state);
-        sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, null));
+        leaderHint().thenAccept(hint ->
+                sender.sendCacheWriteResponse(new CacheWriteResponse(request, CacheStatus.NOT_LEADER, hint)));
     }
 
     /**

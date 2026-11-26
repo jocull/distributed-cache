@@ -26,6 +26,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -60,8 +61,9 @@ import java.util.concurrent.TimeUnit;
  * <p>Hybrid topology discovery: fan out {@code StateRequest} over the bootstrap list, UNION
  * the cluster views the replies report (the extended {@code StateResponse.cluster}), fan out
  * again over that union, and pick the LEADER (tie-break: highest term). The discovered leader
- * is cached and reused; any NOT_LEADER reply or any dial failure to it abandons the claim, so
- * the next verb re-discovers.
+ * is cached and reused; any NOT_LEADER reply or any dial failure to it abandons the claim —
+ * the SAME verb may re-target straight to the leader the NOT_LEADER reply names (Redirect,
+ * C §5 decision, 2026-11-25) before a subsequent verb re-discovers.
  *
  * <h3>Error policy (B doc §5 acceptance)</h3>
  * <ul>
@@ -69,8 +71,11 @@ import java.util.concurrent.TimeUnit;
  *       clean, TYPED, RETRYABLE error that mirrors the facade's {@code IllegalStateException}
  *       refusal; a subsequent attempt re-discovers (bounded: every attempt re-probes, no
  *       unbounded loop).</li>
- *   <li><b>NOT_LEADER write reply</b> ⇒ one re-discovery + ONE retry on the fresh leader
- *       (B §3.5 bounded retry / anti-loop).</li>
+ *   <li><b>NOT_LEADER write reply</b> ⇒ re-target straight to the leader the reply NAMES
+ *       (the Redirect hint, C §5 decision 2026-11-25); when it names none — or that node
+ *       was already refused — one re-discovery + ONE retry on the fresh leader (B §3.5
+ *       bounded retry / anti-loop: no node dialed twice per verb call, so a scripted
+ *       not-leader loop terminates in a clean {@link NoLeaderException}).</li>
  *   <li><b>unresponsive peer</b> ⇒ the per-request timeout (B §4.6 decision, 2026-11-25):
  *       every request is bounded by {@code requestTimeout} via {@link
  *       CompletableFuture#orTimeout}, so a silent peer surfaces as a typed
@@ -178,8 +183,7 @@ public final class RemoteCacheClient implements AutoCloseable {
         if (data == null) {
             throw new IllegalArgumentException("data must not be null");
         }
-        return ensureLeader()
-                .thenCompose(leader -> write(new CachePutRequest(new KeyDataInput(key, data)), leader));
+        return write(new CachePutRequest(new KeyDataInput(key, data)));
     }
 
     /**
@@ -190,8 +194,7 @@ public final class RemoteCacheClient implements AutoCloseable {
         if (key == null) {
             throw new IllegalArgumentException("key must not be null");
         }
-        return ensureLeader()
-                .thenCompose(leader -> write(new CacheDeleteRequest(new KeyDataDeleteInput(key)), leader));
+        return write(new CacheDeleteRequest(new KeyDataDeleteInput(key)));
     }
 
     /**
@@ -204,8 +207,7 @@ public final class RemoteCacheClient implements AutoCloseable {
             throw new IllegalArgumentException("key must not be null");
         }
         Objects.requireNonNull(ttl, "ttl must not be null");
-        return ensureLeader()
-                .thenCompose(leader -> write(new CacheExpireRequest(new KeyDataExpireInput(key, ttl)), leader));
+        return write(new CacheExpireRequest(new KeyDataExpireInput(key, ttl)));
     }
 
     /**
@@ -292,37 +294,56 @@ public final class RemoteCacheClient implements AutoCloseable {
     }
 
     /**
-     * Writes one verb to {@code leader}; on NOT_LEADER abandons the leadership claim, re-
-     * discovers, and retries EXACTLY once on the fresh leader (B §3.5 bounded retry — one
-     * attempt per verb call, never a loop).
+     * Writes one verb (C §5 DECISION, 2026-11-25 — Redirect variant): to the current leader
+     * (discovered if none is confirmed yet), and on a NOT_LEADER reply FIRST re-targeting
+     * straight to the leader the reply names (§5 fast path), else falling back to a fresh
+     * discovery (the B §3.5 shape). A verb call tries each distinct node at most once
+     * (anti-loop), so a pathological not-leader loop terminates in a clean
+     * {@link NoLeaderException} rather than spinning.
      */
-    private CompletableFuture<Void> write(Request writeRequest, NodeAddress leader) {
-        return sendTo(leader, writeRequest).thenCompose(response -> {
+    private CompletableFuture<Void> write(Request writeRequest) {
+        return ensureLeader()
+                .thenCompose(initial -> attemptWrite(writeRequest, initial, new HashSet<>()));
+    }
+
+    /**
+     * One hop of {@link #write(Request)}: send the verb to {@code target}; on a NOT_LEADER
+     * reply abandon the leadership claim, then take the Redirect fast path (re-target straight
+     * to the reply's leader hint) when it names a node this verb call has not already refused,
+     * else one re-discovery plus retry on the fresh leader. Any other refusal is a terminal
+     * {@link IllegalStateException}.
+     *
+     * <p>{@code refused} is this verb call's anti-loop bound (B §3.5): the hint branch and the
+     * discovery branch both check it, so no node is ever dialed twice by one verb call and the
+     * redirect chain terminates.
+     */
+    private CompletableFuture<Void> attemptWrite(Request writeRequest, NodeAddress target, Set<NodeAddress> refused) {
+        refused.add(target);
+        return sendTo(target, writeRequest).thenCompose(response -> {
             final CacheWriteResponse reply = (CacheWriteResponse) response;
             if (reply.getStatus() == CacheStatus.OK) {
                 return CompletableFuture.<Void>completedFuture(null);
             }
-            abandonLeaderIf(leader);
+            abandonLeaderIf(target);
             if (reply.getStatus() != CacheStatus.NOT_LEADER) {
                 return CompletableFuture.<Void>failedFuture(new IllegalStateException(
-                        "Leader " + leader + " refused the write: " + reply.getStatus()));
+                        "Node " + target + " refused the write: " + reply.getStatus()));
+            }
+            final NodeAddress hint = reply.getLeaderHint();
+            if (hint != null && !refused.contains(hint)) {
+                currentLeader.set(hint);
+                return attemptWrite(writeRequest, hint, refused);
             }
             return ensureLeader().thenCompose(fresh -> {
-                if (Objects.equals(fresh, leader)) {
+                if (refused.contains(fresh)) {
                     return CompletableFuture.<Void>failedFuture(new NoLeaderException(
-                            "Leader " + leader + " still NOT_LEADER after re-discovery — no live leader found"));
+                            "Every node this verb named or refused was not willing to lead (tried "
+                                    + refused + "); a leader may be electing — retry"));
                 }
-                return sendTo(fresh, writeRequest).thenApply(again -> {
-                    final CacheWriteResponse retry = (CacheWriteResponse) again;
-                    if (retry.getStatus() == CacheStatus.OK) {
-                        return null;
-                    }
-                    throw new IllegalStateException("Fresh leader " + fresh
-                            + " also refused the write: " + retry.getStatus());
-                });
+                return attemptWrite(writeRequest, fresh, refused);
             });
         }).exceptionally(failure -> {
-            abandonLeaderIf(leader);
+            abandonLeaderIf(target);
             throw unwrap(failure);
         });
     }
@@ -339,7 +360,11 @@ public final class RemoteCacheClient implements AutoCloseable {
         final CompletableFuture<Object> waiter = new CompletableFuture<>();
         final UUID requestId = request.getRequestId();
         pending.put(requestId, waiter);
-        waiter.whenComplete((ignored, failure) -> pending.remove(requestId));
+        // Identity-checked eviction: a Redirect hop (C §5) re-sends the SAME request id under a
+        // fresh waiter, and CompletableFuture fires dependents in LIFO order — so the earlier
+        // hop's cleanup runs AFTER the orTimeout relay has already executed the hop that
+        // re-registered the id. An unguarded remove here would evict the NEW hop's waiter.
+        waiter.whenComplete((ignored, failure) -> pending.remove(requestId, waiter));
         try {
             sideTo(target).send(request);
         } catch (RuntimeException dialFailure) {

@@ -1,7 +1,10 @@
-# Option C — Non-leader writes: forward, or redirect? (DEFERRED; undecided)
+# Option C — Non-leader writes: forward, or redirect?
 
-> **Status: DEFERRED — a decision, not yet a project.** Not in scope for B's first cut.
-> This documents the *choice to make at or after B lands*: what happens when a write lands on a
+> **Status: DECIDED — Redirect (variant 2) is the chosen mechanism** (choice recorded in §5,
+> 2026-11-25). Stages D1–D3 of §7 are the implementation plan. Forward (variant 1) is the
+> recorded alternative, deferred behind Redirect.
+>
+> Historical note: this originally documented the *choice to make at or after B lands*: what happens when a write lands on a
 > node that is **not** the leader.
 >
 > **Two candidate mechanisms are specified in this file:**
@@ -334,7 +337,27 @@ redirection; a Redis master's `READONLY` refusal on replica writes is a close re
 
 ---
 
-## 5. The choice (deferred) — comparing the two
+## 5. The choice — comparing the two
+
+> **DECISION — 2026-11-25 (redirect chosen).**
+>
+> **Variant 2 — Redirect** is the chosen mechanism for the non-leader write path. The node
+> refuses the write with the typed not-leader error **carrying the leader's `NodeAddress`**
+> when one is discoverable; the client (B's `RemoteCacheClient`) re-targets directly to the
+> named leader and retries the same write (bounded, with the re-discovery / anti-loop policy of
+> §4.3.2/§4.3.3 applied). No new cluster↔cluster messages, no new `RaftNodeBehavior` handlers,
+> no `NodeRequests` correlation — the cluster-side change is limited to B's existing non-leader
+> write handler returning the leader-naming error. The continuous leader-hint side effect of
+> §4.1 is accepted as a benefit. Forward (variant 1) is **not** rejected outright — it remains
+> the recorded alternative if measured client-side latency under leader churn proves
+> unacceptable — but it is deferred behind Redirect. Stages D1–D3 of §7 are the implementation
+> plan.
+>
+> *Reasoning recorded at the time of the choice:* B's client already owns the NOT_LEADER retry
+> seam (one retry per B §3.5); Redirect extends the existing typed error with the leader's
+> address and gives the client a direct re-target rather than a full probe sweep. This keeps the
+> cluster footprint minimal (frozen codec surface, the `instanceof` dispatch chain left
+> untouched) and concentrates the new behavior in the single existing client implementation.
 
 | | **Forward** (variant 1) | **Redirect** (variant 2) |
 |---|---|---|
