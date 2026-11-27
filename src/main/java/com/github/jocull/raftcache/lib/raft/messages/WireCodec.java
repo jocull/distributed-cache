@@ -301,6 +301,8 @@ public final class WireCodec {
             builder.setKeyDataExpire(toProto((KeyDataExpireInput) value));
         } else if (value instanceof String) {
             builder.setStringEntry((String) value);
+        } else if (value instanceof com.github.jocull.raftcache.lib.raft.messages.proto.RaftLog.MembershipEntry protoMem) { // S3: membership variant for leader-driven join
+            builder.setMembership(protoMem);
         } else {
             throw new IllegalArgumentException(
                     "Unsupported RaftLog entry type: " + value.getClass().getName()
@@ -628,6 +630,9 @@ public final class WireCodec {
                 break;
             case STRING_ENTRY:
                 value = entry.getStringEntry();
+                break;
+            case MEMBERSHIP: // S3 (2026-11-27): membership variant for leader-driven join
+                value = entry.getMembership();  // return proto type directly
                 break;
             case ENTRY_NOT_SET:
             default:

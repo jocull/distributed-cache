@@ -18,12 +18,14 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     final RaftNodeImpl self;
     final NodeStates state;
     final int term;
+    final com.github.jocull.raftcache.lib.topology.ClusterTopology cluster; // S3: expose cluster topology for membership checks
     private volatile boolean terminated = false;
 
     public RaftNodeBehavior(RaftNodeImpl self, NodeStates state, int term) {
         this.self = self;
         this.state = state;
         this.term = term;
+        this.cluster = self.clusterTopology;
     }
 
     boolean isTerminated() {

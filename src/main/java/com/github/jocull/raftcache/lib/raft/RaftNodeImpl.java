@@ -36,6 +36,7 @@ class RaftNodeImpl implements RaftNode {
     // Node details
     final String id;
     final NodeAddress nodeAddress;
+    final String nodeId;  // S3: node ID for membership entries (field 6)
     private RaftNodeBehavior behavior = new RaftNodeBehaviorFollowerInitial(this);
 
     // Consistent-observation pinning, touched only on the node executor thread.
@@ -103,6 +104,7 @@ class RaftNodeImpl implements RaftNode {
         // Each node has its own view of cluster topology and self registers with it
         this.clusterTopology = new ClusterTopology();
         this.clusterTopology.register(new NodeIdentifier(id, nodeAddress));
+        this.nodeId = id;  // S3: set nodeId for membership entries in RaftLog field 6
     }
 
     private void startInternal() {

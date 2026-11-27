@@ -110,10 +110,17 @@ message KeyDataOutput {
 message RaftLog {
   TermIndex term_index = 1;
   oneof entry {
-    KeyDataInput      key_data_put    = 2;
-    KeyDataDeleteInput key_data_delete = 3;
-    KeyDataExpireInput key_data_expire = 4;
-    string            string_entry    = 5;
+    KeyDataInput      key_data_put       = 2;
+    KeyDataDeleteInput key_data_delete   = 3;
+    KeyDataExpireInput key_data_expire   = 4;
+    string            string_entry       = 5;
+    // S3 (2026-11-27): OQ-2(a) membership variant field for leader-driven join
+    MembershipEntry   membership         = 6;
+  }
+  
+  message MembershipEntry {              // define at same level as entry oneof options
+    string node_id = 1;                  // Identifier of the node being added/removed
+    bool add_member = 2;                 // true = add, false = remove
   }
 }
 
