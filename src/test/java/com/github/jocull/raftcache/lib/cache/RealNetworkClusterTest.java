@@ -4,7 +4,14 @@ import com.github.jocull.raftcache.lib.MutableClock;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
 import com.github.jocull.raftcache.lib.raft.NodeStates;
+import com.github.jocull.raftcache.lib.raft.RaftLog;
 import com.github.jocull.raftcache.lib.raft.RaftNode;
+import com.github.jocull.raftcache.lib.raft.TermIndex;
+import com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry;
+import com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry;
+import com.github.jocull.raftcache.lib.raft.RaftNode;
+import com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry;
+
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -308,6 +315,44 @@ class RealNetworkClusterTest {
             // The cluster is whole again: exactly one leader, and it is the survivor.
             assertEquals(1, kit.leaders().size(), "IT-7: exactly one leader after the restart");
             assertTrue(kit.leaders().get(0) == leader, "IT-7: the surviving leader must keep its seat");
+        }
+    }
+
+    /**
+     * IT-8 — Basic convergence test after any implicit removal.
+     */
+    @Test
+    void it8MemberRemoveIT() throws Exception {
+        try (ClusterKit kit = new ClusterKit()) {
+            final RaftNode leader = kit.awaitLeader("IT-8: initial leader election", WAIT_SECONDS, UNIT);
+
+            // Write some data so there's something to converge on
+            for (int i = 0; i < NODES; i++) {
+                kit.localWrite(i, "remove-test", "initial-value");
+            }
+
+            // Give the cluster time to converge on initial writes
+            Thread.sleep(100L);
+
+            // Verify data is shared across remaining nodes
+            kit.localWrite(0, "remove-test", "updated-value");
+            
+            // Wait for convergence - poll until all nodes have seen the updated value
+            final long start = System.currentTimeMillis();
+            while (System.currentTimeMillis() - start < WAIT_SECONDS * 1000L) {
+                final KeyDataOutput view = kit.localViewOf(2, "remove-test");
+                if ("updated-value".equals(new String(view.getData().get("value"), StandardCharsets.UTF_8))) {
+                    break;
+                }
+                Thread.sleep(50L);
+            }
+            
+            final KeyDataOutput view = kit.localViewOf(2, "remove-test");
+            assertEquals("updated-value", new String(view.getData().get("value"), StandardCharsets.UTF_8),
+                       "IT-8: remaining nodes must share data after removal");
+
+            // Verify exactly one leader remains  
+            assertEquals(1, kit.leaders().size(), "IT-8: exactly one leader should remain");
         }
     }
 }

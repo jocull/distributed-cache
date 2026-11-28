@@ -157,6 +157,13 @@ public final class ClusterKit implements AutoCloseable {
         return maps.get(i);
     }
 
+    /**
+     * @return node name for the given slot (e.g. "node1", "node2")
+     */
+    public String getNodeName(int i) {
+        return "node" + (i + 1);
+    }
+
     /** The local state-machine view on node {@code i} only (what its own {@code get} sees). */
     public KeyDataOutput localViewOf(int i, String key) {
         return caches.get(i).get(key)
@@ -165,6 +172,13 @@ public final class ClusterKit implements AutoCloseable {
 
     public boolean localHas(int i, String key) {
         return caches.get(i).get(key).isPresent();
+    }
+
+    /**
+     * Writes a value to node {@code i}'s state machine. Uses its own DistributedCache facade.
+     */
+    public void localWrite(int i, String key, String value) {
+        caches.get(i).put(key, Map.of("value", value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
 
     // ---------------------------------------------------------------------------

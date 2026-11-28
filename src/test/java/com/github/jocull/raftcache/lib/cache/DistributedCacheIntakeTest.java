@@ -130,6 +130,11 @@ public class DistributedCacheIntakeTest {
         }
 
         @Override
+        public CompletableFuture<Void> removeMember(String nodeId) {
+            throw notRouted("removeMember");
+        }
+
+        @Override
         public CompletableFuture<Optional<StateResponse>> getLeader() {
             throw notRouted("getLeader");
         }

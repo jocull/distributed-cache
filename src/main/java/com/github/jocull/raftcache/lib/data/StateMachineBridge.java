@@ -6,6 +6,7 @@ import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.event.EventBus;
 import com.github.jocull.raftcache.lib.event.EventSubscriber;
 import com.github.jocull.raftcache.lib.raft.RaftLog;
+import com.github.jocull.raftcache.lib.raft.RaftNode;
 import com.github.jocull.raftcache.lib.raft.TermIndex;
 import com.github.jocull.raftcache.lib.raft.events.LogsCommitted;
 import com.github.jocull.raftcache.lib.raft.events.SnapshotInstalled;
@@ -51,10 +52,16 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
     private final EventBus eventBus;
     private final PartitionMap partitionMap;
     private final AtomicReference<TermIndex> lastApplied = new AtomicReference<>(NO_POSITION_APPLIED);
+    private final RaftNode localNode;
 
     public StateMachineBridge(EventBus eventBus, PartitionMap partitionMap) {
+        this(eventBus, partitionMap, null);
+    }
+
+    public StateMachineBridge(EventBus eventBus, PartitionMap partitionMap, RaftNode localNode) {
         this.eventBus = Objects.requireNonNull(eventBus, "eventBus");
         this.partitionMap = Objects.requireNonNull(partitionMap, "partitionMap");
+        this.localNode = localNode;  // For REMOVE entry handling (may be null for tests)
         eventBus.subscribe(this);
     }
 
@@ -140,10 +147,21 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
         } else if (entry instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry membership) {
             // Membership entries are handled via topology management:
             // - ADD: Leader drives the join, existing connectWithTopology machinery handles it  
-            // - REMOVE: Acknowledged here at commit time; actual severing deferred to disconnectFrom path if needed
+            // - REMOVE: Sever connection and track the removal
             if (!membership.getAddMember()) { // REMOVE operation (false means remove)
                 final String nodeId = membership.getNodeIdentifier();
-                LOGGER.info("Membership-REMOVE acknowledged for node {} @ index {}", nodeId, index);
+                final String localNodeId = localNode != null ? localNode.getId() : "unknown";
+                LOGGER.info("{} Applying Membership-REMOVE for node {} @ index {}", localNodeId, nodeId, index);
+                // Only call removeMember if we have a node reference - test doubles without nodes won't handle this
+                if (localNode != null) {
+                    localNode.removeMember(nodeId).whenComplete((ignored, ex) -> {
+                        if (ex != null) {
+                            LOGGER.error("Failed to disconnect from removed member {}: {}", nodeId, ex.getMessage());
+                        }
+                    });
+                } else {
+                    LOGGER.debug("No local node reference - skipping removeMember for node {}", nodeId);
+                }
             } else {
                 // ADD operation - no special handling needed at apply time
                 LOGGER.trace("Applying membership-ADD entry for node {}", membership.getNodeIdentifier());

@@ -16,6 +16,8 @@ import com.github.jocull.raftcache.lib.raft.messages.StateResponse;
 import com.github.jocull.raftcache.lib.topology.NodeAddress;
 import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -130,6 +132,7 @@ class RemoteCacheClientRedirectAcceptanceTest {
      * {@code FakeRaftNode} discipline: {@code connectTo} throws rather than dials out).
      */
     static final class ScriptedNode implements RaftNode, AutoCloseable {
+        private static final Logger LOGGER = LoggerFactory.getLogger(RemoteCacheClientRedirectAcceptanceTest.class);
         /** The state/term this node reports to a StateRequest. */
         private record StateView(NodeStates state, int term) {
         }
@@ -272,6 +275,13 @@ class RemoteCacheClientRedirectAcceptanceTest {
 
         @Override
         public CompletableFuture<Void> disconnectFrom(NodeConnectionOutbound connection) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public CompletableFuture<Void> removeMember(String nodeId) {
+            // Stub: for redirect tests, removal has no effect (no topology management tested here)
+            LOGGER.debug("ScriptedNode.removeMember({}): stubbed", nodeId);
             return CompletableFuture.completedFuture(null);
         }
 

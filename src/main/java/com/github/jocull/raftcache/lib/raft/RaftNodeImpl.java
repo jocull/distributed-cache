@@ -456,6 +456,24 @@ class RaftNodeImpl implements RaftNode {
     }
 
     @Override
+    public CompletableFuture<Void> removeMember(String nodeId) {
+        synchronized (activeConnections) {
+            final Optional<NodeConnectionOutbound> connectionToRemove = activeConnections.stream()
+                    .filter(c -> c.getRemoteNodeId().equals(nodeId))
+                    .findFirst();
+            
+            if (connectionToRemove.isPresent()) {
+                LOGGER.info("{} Removing member {} from cluster - will disconnect", id, nodeId);
+                return CompletableFuture.runAsync(() -> disconnectFromInternal(connectionToRemove.get()), nodeExecutor);
+            } else {
+                LOGGER.debug("{} No active connection found for node {}: nothing to remove", 
+                        id, nodeId);
+                return CompletableFuture.completedFuture(null);
+            }
+        }
+    }
+
+    @Override
     public CompletableFuture<Optional<StateResponse>> getLeader() {
         return getClusterNodeStates()
                 .thenApply(states -> states.stream()

@@ -14,6 +14,9 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Test-only {@link RaftNode} for exercising {@link SocketChannelMiddleware} in isolation.
  *
@@ -33,6 +36,8 @@ class FakeRaftNode implements RaftNode {
     /** Every inbound side this node accepted, in accept order. */
     private final List<ChannelMiddleware.ChannelSide> acceptedSides = new CopyOnWriteArrayList<>();
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(FakeRaftNode.class);
+
     FakeRaftNode(String id, NodeAddress address) {
         this.id = id;
         this.address = address;
@@ -49,6 +54,18 @@ class FakeRaftNode implements RaftNode {
 
     ChannelMiddleware.ChannelSide lastAcceptedSide() {
         return acceptedSides.isEmpty() ? null : acceptedSides.get(acceptedSides.size() - 1);
+    }
+
+    @Override
+    public CompletableFuture<List<NodeIdentifier>> getKnownNodes() {
+        return CompletableFuture.completedFuture(List.of());
+    }
+
+    @Override
+    public CompletableFuture<Void> removeMember(String nodeId) {
+        // Stub: just acknowledge removal (no actual disconnection for transport tests)
+        LOGGER.debug("FakeRaftNode.removeMember({}): stubbed", nodeId);
+        return CompletableFuture.completedFuture(null);
     }
 
     /** Sides accepted so far (a receiver was installed on each, in accept order). */
@@ -100,11 +117,6 @@ class FakeRaftNode implements RaftNode {
     @Override
     public CompletableFuture<TermIndex> getCommittedTermIndex() {
         return CompletableFuture.completedFuture(null);
-    }
-
-    @Override
-    public CompletableFuture<List<NodeIdentifier>> getKnownNodes() {
-        return CompletableFuture.completedFuture(List.of());
     }
 
     @Override

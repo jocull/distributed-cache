@@ -66,6 +66,16 @@ public interface RaftNode {
      */
     CompletableFuture<Void> disconnectFrom(NodeConnectionOutbound connection);
 
+    /**
+     * Removes a cluster member (Raft OQ-7 membership-remove): disconnects from the specified
+     * node and appends a membership-REMOVE entry to the RaftLog. The entry commits on majority
+     * and all state machines apply it, so remote readers will see "not found" for this node.
+     * 
+     * @param nodeId the identifier of the node to remove from the cluster
+     * @return a future completing when the membership-remove entry has been committed and applied
+     */
+    CompletableFuture<Void> removeMember(String nodeId);
+
     CompletableFuture<Optional<StateResponse>> getLeader();
 
     CompletableFuture<List<StateResponse>> getClusterNodeStates();

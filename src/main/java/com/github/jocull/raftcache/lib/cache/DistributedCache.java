@@ -55,6 +55,7 @@ public class DistributedCache implements AutoCloseable {
     private final List<RaftNode> nodes;
     private final PartitionMap partitionMap;
     private final StateMachineBridge stateMachineBridge;
+    private final RaftNode ownedNode;
 
     public DistributedCache(EventBus clusterEventBus, List<RaftNode> nodes, PartitionMap partitionMap) {
         Objects.requireNonNull(clusterEventBus, "clusterEventBus");
@@ -65,7 +66,17 @@ public class DistributedCache implements AutoCloseable {
         }
         this.nodes = List.copyOf(nodes);
         this.partitionMap = partitionMap;
-        this.stateMachineBridge = new StateMachineBridge(clusterEventBus, partitionMap);
+        // Wire the snapshot source and REMOVE handler on the node this facade OWNS:
+        final RaftNode localNode = nodes.stream()
+                .filter(node -> clusterEventBus.equals(node.getEventBus()))
+                .findFirst().orElse(null);
+        this.ownedNode = localNode;
+        if (localNode != null) {
+            stateMachineBridge = new StateMachineBridge(clusterEventBus, partitionMap, localNode);
+        } else {
+            // No local node - can't handle removals, but existing tests may still work
+            stateMachineBridge = new StateMachineBridge(clusterEventBus, partitionMap, null);
+        }
         // Wire the snapshot source (SNAPSHOTS.md stage 5) on the node this facade OWNS:
         // the node living on the event bus this cache's bridge subscribes to. A facade
         // supplies the state of exactly that node's state machine -- wiring every node in
