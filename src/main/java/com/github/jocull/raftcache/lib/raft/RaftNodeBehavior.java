@@ -7,7 +7,9 @@ import com.github.jocull.raftcache.lib.topology.NodeIdentifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -22,7 +24,42 @@ abstract class RaftNodeBehavior implements NodeCommunicationReceiver {
     
     /** Access to the package-private field for behavior implementations. */
     public com.github.jocull.raftcache.lib.topology.ClusterTopology getCluster() { return cluster; }
+    
+    /**
+     * Nodes being added via membership that haven't caught up yet (S4 catch-up tracking).
+     * A member in this set cannot vote until they've applied all logs and caught up.
+     */
+    private final Set<String> pendingJoins = new HashSet<>();
+    
     private volatile boolean terminated = false;
+
+    /** Add a node as pending join that needs to catch up before voting (S4). */
+    public void addPendingJoin(String nodeId) {
+        if (nodeId != null && !nodeId.isEmpty() && !pendingJoins.contains(nodeId)) {
+            pendingJoins.add(nodeId);
+            LOGGER.info("{} Added {} as pending join - awaiting catch-up complete", self.getId(), nodeId);
+        }
+    }
+
+    /** Remove from pending joins (catch-up complete or node removed) (S4). */
+    public void removePendingJoin(String nodeId) {
+        final boolean removed = pendingJoins.remove(nodeId);
+        if (removed) {
+            LOGGER.info("{} Removed {} from pending joins - catch-up complete", self.getId(), nodeId);
+        } else {
+            LOGGER.debug("{} Pending join removal attempt for {} already removed", self.getId(), nodeId);
+        }
+    }
+
+    /** Check if a node is pending join and needs to catch up (S4 quorum guard). */
+    public boolean isPendingJoin(String nodeId) {
+        return pendingJoins.contains(nodeId);
+    }
+
+    /** Get count of pending joins for quorum calculations (S4). */
+    public int getPendingJoinCount() {
+        return pendingJoins.size();
+    }
 
     public RaftNodeBehavior(RaftNodeImpl self, NodeStates state, int term) {
         this.self = self;

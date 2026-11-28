@@ -39,6 +39,32 @@ class RaftNodeImpl implements RaftNode {
     final String nodeId;  // S3: node ID for membership entries (field 6)
     private RaftNodeBehavior behavior = new RaftNodeBehaviorFollowerInitial(this);
 
+    // S4: Pending join tracking - nodes being added that haven't caught up yet
+    private final Set<String> pendingJoins = new HashSet<>();
+
+    /** Add a node as pending join that needs to catch up before voting (S4). */
+    public void addPendingJoin(String nodeId) {
+        if (nodeId != null && !nodeId.isEmpty() && !pendingJoins.contains(nodeId)) {
+            pendingJoins.add(nodeId);
+            LOGGER.info("{} Added {} as pending join - awaiting catch-up complete", id, nodeId);
+        }
+    }
+
+    /** Remove from pending joins (catch-up complete or node removed) (S4). */
+    public void removePendingJoin(String nodeId) {
+        final boolean removed = pendingJoins.remove(nodeId);
+        if (removed) {
+            LOGGER.info("{} Removed {} from pending joins - catch-up complete", id, nodeId);
+        } else {
+            LOGGER.debug("{} Pending join removal attempt for {} already removed", id, nodeId);
+        }
+    }
+
+    /** Check if a node is pending join and needs to catch up (S4 quorum guard). */
+    public boolean isPendingJoin(String nodeId) {
+        return pendingJoins.contains(nodeId);
+    }
+
     // Consistent-observation pinning, touched only on the node executor thread.
     // A behavior conversion (leader step-down, campaign, ...) replaces this single
     // immutable snapshot, so any individual read of it is valid -- but two SEPARATE

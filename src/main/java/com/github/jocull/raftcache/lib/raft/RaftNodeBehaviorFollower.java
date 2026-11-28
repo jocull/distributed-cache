@@ -458,6 +458,17 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             self.logs.appendLog(newTermIndex, r.getEntry());
         });
 
+        // S4: Check for membership entries that add this node - track as pending until catch-up complete
+        final boolean hasNewMember = appendEntries.getEntries().stream()
+                .map(AppendEntries.RaftLog::getEntry)  // Get the entry object from RaftLog
+                .anyMatch(v -> v instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry mem &&
+                    mem.getAddMember());  // true = add, false = remove
+
+        if (hasNewMember) {
+            self.addPendingJoin(self.getId());
+            LOGGER.info("{} New membership entry detected - marked as pending join", self.getId());
+        }
+
         // Align the commit index with the leader
         final TermIndex previousCommitIndex = self.logs.getCommittedTermIndex();
         final TermIndex leaderCommitIndex = new TermIndex(
@@ -471,6 +482,27 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
             self.eventBus.publish(new LogsCommitted(committedLogs));
             self.logs.notifyCommitted(committedLogs);
             LOGGER.debug("{} Move commit index forward {} -> {} @ term {}", self.getId(), previousCommitIndex, appendEntries.getLeaderCommitTermIndex(), appendEntries.getTerm());
+
+            // S4: Catch-up verification complete for any pending joins - they've now applied all logs up to commit point
+            // and can participate in elections/quorum. Remove from pending status if this node was tracked as pending.
+            final boolean wasPending = self.isPendingJoin(self.getId());
+            if (wasPending) {
+                self.removePendingJoin(self.getId());
+                LOGGER.info("{} Catch-up verification complete - {} removed from pending joins, eligible to vote", self.getId(), self.getId());
+            } else {
+                LOGGER.debug("{} Commit advanced but node not pending (already caught up)", self.getId());
+            }
+
+            // S4: Check for membership REMOVE operation - if a node is being removed, clear any pending status
+            final boolean hasRemoveMember = appendEntries.getEntries().stream()
+                    .map(AppendEntries.RaftLog::getEntry)  // Get the entry object from RaftLog
+                    .anyMatch(v -> v instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry mem &&
+                        !mem.getAddMember());  // false = remove, true = add
+
+            if (hasRemoveMember) {
+                LOGGER.debug("{} Found REMOVE membership entry - clearing pending status if any", self.getId());
+                self.removePendingJoin(self.getId()); // Clear pending for this node in case it was a newly added member that gets removed
+            }
         }
 
         // Clear the current timeout and register the next one
