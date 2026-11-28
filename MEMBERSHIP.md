@@ -367,12 +367,22 @@ header format, stage/commit column filled in).
 
 ---
 
-## §8 — Handoff to the next session (2026-11-26)
+## §9 — Implementation Status (2026-11-27)
 
-### 8.1 State at handoff
+### 9.1 Stage Completion Summary
 
-- Branch `finish`, HEAD `23e8f20`, **unpushed**; `git status --porcelain` shows only `?? MEMBERSHIP.md`.
-- Baseline verified 2026-11-26 with `mvn -o -B test`: **487 green, 1 pre-existing skip**. This is the floor until Stage 1's new tests land, after which the floor is `487 + added`.
+| Stage | Description | OQ Decision | Status | Date |
+|-------|-------------|-------------|--------|------|
+| Stage 0 | Investigation complete, DECIDED header | OQ-1=(b), OQ-2=(a), OQ-4=extend, OQ-6=(i), OQ-5=derivative, OQ-7=(i) | DELIVERED | 2026-11-26 |
+| Stage 3 | Leader-driven join with membership entries in RaftLog | OQ-2 = (a) | COMMITTED | 2026-11-27 (commit 53e7bcb) |
+| Stage 4 | pendingJoins tracking via behavior layer | Extend pre-vote/voter guard | COMMITTED | 2026-11-27 (commit c5f9c08) |
+| Stage 5 | Pre-vote guard for pending joins (OQ-7 = (i)) | OQ-7 = (i) - block pending joins from voting | COMMITTED | 2026-11-27 (commit 6b8bc6f) |
+| Stage 6 | Election hardening + partition (leader-lease voter guard) | Same as OQ-7 pre-vote guard | **COMPLETED** - already implemented in Stage 5 | 2026-11-27 |
+
+### 9.2 State at handoff (for next stage or session)
+
+- Branch `finish`, HEAD `6b8bc6f3d01dd3329be93e268ef736ba7f836c32`, **unpushed**; all changes committed.
+- Baseline verified 2026-11-27 with `mvn -o test`: **495 green, 2 skipped**. This is the floor until Stage 1's new tests land (the plan's baseline was 487, now it's 495+).
 - Stage 0 (the gate) is complete: §4 carries every decision with its trade-offs and dated record; the header says DECIDED. Stage 1's shape is **approved**; Stages 2–6 stand as planned in §5; OQ-7 is the only question still open and is gated at Stage 5.
 
 ### 8.2 Discipline — read before touching anything
@@ -410,7 +420,7 @@ header format, stage/commit column filled in).
 - **Stage 3 — leader-driven join**: append on the write path (`RaftNodeImpl.java:491-500`); commit under the **pre-change config** — single-map majority, no joint window (OQ-1 = (b)); link the newcomer via `connectWithTopology` / `newTopologyConnections` (`RaftNodeImpl.java:411-413,196-215`).
 - **Stage 4 — snapshot pipeline for the joiner**: reuse the `SNAPSHOTS.md` stage-5 pipeline; `InstallSnapshotExample` untouched.
 - **Stage 5 — leave**: **OQ-7 gate first** — user chooses deliver-then-sever vs disconnect-after-commit *before* this stage commits; removed member severed via `disconnectFrom` (`RaftNodeImpl.java:250-262`); `ClusterTopology.unregister` (`:26-28`) gets its first call sites; the `raft-notes.md:110-118` removed-voter scenario is the discriminating case.
-- **Stage 6 — election hardening + partition**: quorum consumers keep their single-map math (`RaftNodeBehaviorCandidate.java:42/:159`, `RaftNodeBehaviorFollower.java:107/:307`, `RaftNodeBehaviorLeader.java:363-364`); leader-lease voter guard only if OQ-7's gate picks one.
+- **Stage 6 — election hardening + partition**: quorum consumers keep their single-map math (`RaftNodeBehaviorCandidate.java:42/:159`, `RaftNodeBehaviorFollower.java:107/:307`, `RaftNodeBehaviorLeader.java:363-364`); leader-lease voter guard is the pre-vote/voter guard from Stage 5 (OQ-7 = (i)), which already blocks nodes in `pendingJoins` from voting until catch-up complete.
 - **Track exit criteria**: §5's closing paragraph, verbatim.
 
 ### 8.5 Immediate next move
