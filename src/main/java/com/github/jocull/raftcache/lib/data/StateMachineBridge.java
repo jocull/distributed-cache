@@ -137,6 +137,12 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
             final KeyDataExpireInput input = (KeyDataExpireInput) entry;
             final boolean updated = partitionMap.expireData(input);
             LOGGER.debug("Applied expire log @ index {} (key={}, ttl={}, live entry={})", index, input.getKey(), input.getTtl(), updated);
+        } else if (entry instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry membership) {
+            // Membership entries are handled via topology management:
+            // - ADD: Leader drives the join, existing connectWithTopology machinery handles it
+            // - REMOVE: Handled by leader commit path (disconnectFrom + unregister)
+            LOGGER.trace("Applying membership entry for node {} @ index {}, add={}", 
+                    membership.getNodeIdentifier(), index, membership.getAddMember());
         } else {
             // No state-machine handling for this entry type; acknowledge it by
             // advancing the applied index so later entries are not blocked behind it

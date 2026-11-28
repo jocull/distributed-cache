@@ -150,6 +150,14 @@ class RaftNodeBehaviorCandidate extends RaftNodeBehavior {
             return;
         }
 
+        // Stage 5 OQ-7 guard: Reject votes from newly added nodes that haven't caught up yet
+        final boolean isPending = self.isPendingJoin(sender.getRemoteNodeId());
+        if (isPending) {
+            LOGGER.debug("{} Received vote from pending join node {} - not counting until catch-up complete",
+                    self.getId(), sender.getRemoteNodeId());
+            return;
+        }
+
         final int newVoteSize;
         synchronized (votes) {
             votes.add(sender.getRemoteNodeId());

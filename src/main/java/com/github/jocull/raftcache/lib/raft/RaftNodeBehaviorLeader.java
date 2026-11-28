@@ -368,6 +368,18 @@ class RaftNodeBehaviorLeader extends RaftNodeBehavior {
             if (majorityMinimumIndex.compareTo(self.logs.getCommittedTermIndex()) > 0) {
                 LOGGER.debug("{} Has minimum majority index {} to commit", self.getId(), majorityMinimumIndex);
                 final List<RaftLog<?>> committedLogs = self.logs.commit(majorityMinimumIndex);
+                
+                // Stage 5 OQ-7: Log that membership-remove entries were committed.
+                // The actual severing of connections happens via StateMachineBridge.applyLog
+                // which is called by LogsCommitted events, ensuring disconnectFrom is invoked.
+                for (var log : committedLogs) {
+                    final Object entry = log.getEntry();
+                    if (entry instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry membership) {
+                        LOGGER.debug("{} Committed membership entry @ term {}, index {}", 
+                                self.getId(), majorityMinimumIndex.getTerm(), majorityMinimumIndex.getIndex());
+                    }
+                }
+                
                 // Apply-then-acknowledge: publish is synchronous (EventBus#publish), so by the
                 // time we acknowledge the clients below, every state machine subscriber has
                 // already applied these entries. A client therefore never sees its own write

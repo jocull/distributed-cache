@@ -252,6 +252,18 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
         // is liveness-only (it can at most let a stale node start a real election that it will
         // then lose at the vote gate); the real election below remains strictly vote-gated, so
         // safety is unaffected.
+        
+        // Stage 5 OQ-7 guard: A node in pendingJoins is being added and hasn't caught up yet
+        // — deny pre-vote to prevent it from participating in elections until catch-up complete
+        final boolean isPending = self.isPendingJoin(sender.getRemoteNodeId());
+        if (isPending) {
+            LOGGER.info("{} Pre-vote request from pending join node {} for term {} - DENIED (not caught up yet)",
+                    self.getId(), sender.getRemoteNodeId(), preVoteRequest.getTerm());
+            // Still send response with false grant but don't modify state
+            sender.sendPreVoteResponse(new PreVoteResponse(preVoteRequest.getTerm(), false));
+            return;
+        }
+        
         final boolean grant = preVoteRequest.getTerm() >= term && isUpToDate(preVoteRequest);
         LOGGER.info("{} Pre-vote request from {} for term {} vs own term {} - grant={}",
                 self.getId(), sender.getRemoteNodeId(), preVoteRequest.getTerm(), term, grant);
@@ -262,17 +274,23 @@ class RaftNodeBehaviorFollower extends RaftNodeBehavior {
     public void onPreVoteResponse(NodeConnectionOutbound sender, PreVoteResponse preVoteResponse) {
         // Stage 6(m) (SNAPSHOTS.md stage 6(m)): unbound sender is malformed by construction
         // (the transport layer throws on the live path); guarding is defense-in-depth for the
-        // direct-handler surface. Without this, preVoteGrants.add(null) below is legal for a
-        // HashSet and the null grant counts in 1 + preVoteGrants.size(): in a 3-node cluster
-        // that is self (+1) + {null} = 2 = the majority, so ONE unattributed grant converts
-        // us to candidate (inflation is capped at one by set semantics, but it is exactly
-        // majority-reachable in 3 nodes). Refuse before any round bookkeeping.
-        // Identity-family shape: warn, zero state change, no reply.
+        // direct-handler surface. Refuse BEFORE the higher-term branch so the null sender does
+        // not even advance our term via convertToFollower. Identity-family shape: warn, zero
+        // state change, no reply.
         if (sender.getRemoteNodeId() == null) {
             LOGGER.warn("{} PreVoteResponse from {} is unbound (null remoteNodeId) - refusing",
                     self.getId(), sender.getRemoteNodeAddress());
             return;
         }
+        
+        // Stage 5 OQ-7 guard: Skip counting pre-vote grants from pending join nodes that haven't caught up
+        final boolean isPending = self.isPendingJoin(sender.getRemoteNodeId());
+        if (isPending) {
+            LOGGER.debug("{} Ignoring pre-vote response from pending join node {} - not yet eligible to vote",
+                    self.getId(), sender.getRemoteNodeId());
+            return;
+        }
+        
         if (!preVoteRoundActive) {
             // A late grant for a round that already concluded (we reached a majority, a
             // leader appeared, or we were converted away). Acting on it now could restart
