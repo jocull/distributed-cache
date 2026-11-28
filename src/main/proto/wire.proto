@@ -248,6 +248,22 @@ message CachePutRequest {
   KeyDataInput payload      = 2;
 }
 
+// Single-config-change join request (Stage 3, OQ-1 = b). The responses carry the
+// request's id for correlation (§3.4), so WireCodec#completeRequest pins the
+// envelope tag to this variant across S1/S2.
+message ClusterJoinRequest {
+  string node_address = 1;       // Raft node ID (like "s1-n2:127.0.0.1:5555")
+}
+
+// Top-level membership entry for RaftLog consensus logging (Stage 3, OQ-4 extend).
+// The oneof contains either a MemberAdd or MemberRemove operation in the RaftLog
+// consensus log. This message wraps the existing entry variant into its own message
+// to distinguish from nested usage patterns.
+message MembershipEntry {
+  string node_identifier = 1;    // Identifier of the node being added/removed
+  bool add_member        = 2;    // true = add, false = remove
+}
+
 // Delete: key only (the state machine needs nothing else to remove an entry).
 message CacheDeleteRequest {
   string             request_id = 1;
@@ -353,5 +369,9 @@ message WireMessage {
     CacheReadRequest          cache_read_request          = 18;
     CacheReadResponse         cache_read_response         = 19;
     CacheWriteResponse        cache_write_response        = 20;
+    // S1 (2026-11-25) — single-config-change join request for Stage 3, OQ-1 = b.
+    ClusterJoinRequest        cluster_join_request        = 21;
+    // S3 — RaftLog consensus logging for membership operations (OQ-2 = a, OQ-4 extend).
+    MembershipEntry           membership_entry            = 22;
   }
 }

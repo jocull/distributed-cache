@@ -4,6 +4,7 @@ import com.github.jocull.raftcache.lib.communication.KeyDataDeleteInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataExpireInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataInput;
 import com.github.jocull.raftcache.lib.communication.KeyDataOutput;
+import com.github.jocull.raftcache.lib.raft.messages.ClusterJoinRequest;
 import com.github.jocull.raftcache.lib.raft.NodeStates;
 import com.github.jocull.raftcache.lib.raft.messages.AcknowledgeEntries;
 import com.github.jocull.raftcache.lib.raft.messages.AnnounceClusterTopology;
@@ -397,11 +398,11 @@ class WireSerializationTest {
 
     @Test
     void closedWireSetMatchesTheEnvelopeVariants() throws Exception {
-        // (1) The envelope is a closed set of exactly 20 variants, field numbers 1..20 —
+        // (1) The envelope is a closed set of exactly 22 variants, field numbers 1..22 —
         // this pin freezes the numbering a cross-language sender (the Task 2 client)
-        // would rely on.
+        // would rely on. S3 adds MembershipEntry at field 22+ for RaftLog consensus ops.
         WireMessage.MessageCase[] variants = WireMessage.MessageCase.values();
-        assertEquals(21, variants.length, "MESSAGE_NOT_SET + 20 frozen variants");
+        assertEquals(23, variants.length, "MESSAGE_NOT_SET + 22 frozen variants");
         Map<WireMessage.MessageCase, Integer> expected = new java.util.EnumMap<>(WireMessage.MessageCase.class);
         expected.put(WireMessage.MessageCase.ACKNOWLEDGE_ENTRIES, 1);
         expected.put(WireMessage.MessageCase.ANNOUNCE_CLUSTER_TOPOLOGY, 2);
@@ -423,7 +424,9 @@ class WireSerializationTest {
         expected.put(WireMessage.MessageCase.CACHE_READ_REQUEST, 18);
         expected.put(WireMessage.MessageCase.CACHE_READ_RESPONSE, 19);
         expected.put(WireMessage.MessageCase.CACHE_WRITE_RESPONSE, 20);
-        assertEquals(20, expected.size());
+        expected.put(WireMessage.MessageCase.CLUSTER_JOIN_REQUEST, 21);
+        expected.put(WireMessage.MessageCase.MEMBERSHIP_ENTRY, 22);
+        assertEquals(22, expected.size());
         for (WireMessage.MessageCase variant : variants) {
             if (variant == WireMessage.MessageCase.MESSAGE_NOT_SET) {
                 continue;
@@ -432,8 +435,8 @@ class WireSerializationTest {
                     "frozen field number for " + variant.name() + " drifted");
         }
 
-        // (2) Every one of the 20 POJO frame types round-trips to its exact class through
-        // the codec (the receiver's instanceof dispatch chain).
+        // (2) Every one of the 22 POJO frame types round-trips to its exact class through
+        // the codec (the receiver's instanceof dispatch chain). S1 adds ClusterJoinRequest, S3 adds MembershipEntry.
         for (Object frame : List.of(
                 new Introduction("n1", new NodeAddress("127.0.0.1:1"), new TermIndex(1, 1)),
                 new AnnounceClusterTopology(List.of(
@@ -454,6 +457,8 @@ class WireSerializationTest {
                 new InstallSnapshotResponse(1, 1, 0L),
                 new Handshake(new NodeAddress("c:1"), new NodeAddress("t:1")),
                 new Acknowledgement(),
+                // S1 (2026-11-25): single-config-change join request for Stage 3, OQ-1 = b.
+                new ClusterJoinRequest(),
                 // B1 (2026-11-25): the client verb frames. The responses carry the
                 // request's id, so the loop's round-trip check covers their correlation pin too.
                 new CachePutRequest(new KeyDataInput("k", Map.of("f", new byte[]{1}))),
@@ -468,11 +473,16 @@ class WireSerializationTest {
             Object back = WireCodec.deserialize(WireCodec.serialize(frame));
             assertEquals(frame.getClass(), back.getClass(),
                     frame.getClass().getName() + " must round-trip to its exact class");
-            // The envelope's type tag must be a valid frozen variant (no drift outside 1..20).
+            // The envelope's type tag must be a valid frozen variant (1-20 for legacy, 21+ for S1).
             int number = WireMessage.parseFrom(WireCodec.serialize(frame)).getMessageCase().getNumber();
-            assertTrue(number >= 1 && number <= 20,
+            assertTrue(number >= 1 && number <= 22,
                     frame.getClass().getName() + " must carry a valid envelope tag, got " + number);
         }
+
+        // (3) S1: ClusterJoinRequest round-trip for single-config-change join operations (Stage 3, OQ-1 = b)
+        ClusterJoinRequest joinReq = new ClusterJoinRequest();
+        Object joinBack = WireCodec.deserialize(WireCodec.serialize(joinReq));
+        assertEquals(ClusterJoinRequest.class, joinBack.getClass());
         // The 1:1 wire value mapping pins (field values, not just the class): the request's
         // exact requestId must come back so NodeRequests#completeRequest can correlate.
         {

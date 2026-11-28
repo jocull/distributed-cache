@@ -152,6 +152,19 @@ public final class WireCodec {
             // distinguishes it by call site (the reply to a registered read), not by type tag.
             return toProto((KeyDataOutput) message).toByteArray();
         }
+        if (message instanceof ClusterJoinRequest) {
+            // S1: single-config-change join request stub (Stage 3, OQ-1 = b) — the proto has nodeAddress field
+            return WireMessage.newBuilder().setClusterJoinRequest(
+                    com.github.jocull.raftcache.lib.raft.messages.proto.ClusterJoinRequest.newBuilder()
+                            .setNodeAddress(((ClusterJoinRequest) message).getNodeAddress()))
+                    .build().toByteArray();
+        }
+        if (message instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry) {
+            // S3 stub: RaftLog consensus logging for membership operations (OQ-2 = a, OQ-4 extend)
+            return WireMessage.newBuilder().setMembershipEntry(
+                    com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry.getDefaultInstance())
+                    .build().toByteArray();
+        }
         throw new IllegalArgumentException(
                 "Not a wire type (none of the " + FRAME_VARIANTS + " frame variants): "
                         + message.getClass().getName()
@@ -210,6 +223,11 @@ public final class WireCodec {
                 return fromProto(message.getCacheWriteResponse());
             case CACHE_READ_RESPONSE:
                 return fromProto(message.getCacheReadResponse());
+            case CLUSTER_JOIN_REQUEST:
+                return new ClusterJoinRequest();
+            case MEMBERSHIP_ENTRY:
+                // S3 stub — just create empty MembershipEntry; full node_id/add_member handled by RaftLog entry
+                return com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry.getDefaultInstance();
             case MESSAGE_NOT_SET:
             default:
                 throw new com.google.protobuf.InvalidProtocolBufferException(
