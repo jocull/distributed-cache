@@ -139,13 +139,18 @@ public class StateMachineBridge extends EventSubscriber implements AutoCloseable
             LOGGER.debug("Applied expire log @ index {} (key={}, ttl={}, live entry={})", index, input.getKey(), input.getTtl(), updated);
         } else if (entry instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry membership) {
             // Membership entries are handled via topology management:
-            // - ADD: Leader drives the join, existing connectWithTopology machinery handles it
-            // - REMOVE: Handled by leader commit path (disconnectFrom + unregister)
-            LOGGER.trace("Applying membership entry for node {} @ index {}, add={}", 
-                    membership.getNodeIdentifier(), index, membership.getAddMember());
-        } else {
-            // No state-machine handling for this entry type; acknowledge it by
-            // advancing the applied index so later entries are not blocked behind it
+            // - ADD: Leader drives the join, existing connectWithTopology machinery handles it  
+            // - REMOVE: Acknowledged here at commit time; actual severing deferred to disconnectFrom path if needed
+            if (!membership.getAddMember()) { // REMOVE operation (false means remove)
+                final String nodeId = membership.getNodeIdentifier();
+                LOGGER.info("Membership-REMOVE acknowledged for node {} @ index {}", nodeId, index);
+            } else {
+                // ADD operation - no special handling needed at apply time
+                LOGGER.trace("Applying membership-ADD entry for node {}", membership.getNodeIdentifier());
+            }
+            // Acknowledge the entry so later entries are not blocked behind it
+            LOGGER.trace("No state-machine handling for MembershipEntry @ index {}", raftLog.getLogClass().getName(), index);
+        } else if (entry instanceof String) {
             LOGGER.debug("No state-machine handling for entry type {} @ index {}", raftLog.getLogClass().getName(), index);
         }
 

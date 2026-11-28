@@ -159,11 +159,13 @@ public final class WireCodec {
                             .setNodeAddress(((ClusterJoinRequest) message).getNodeAddress()))
                     .build().toByteArray();
         }
-        if (message instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry) {
-            // S3 stub: RaftLog consensus logging for membership operations (OQ-2 = a, OQ-4 extend)
-            return WireMessage.newBuilder().setMembershipEntry(
-                    com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry.getDefaultInstance())
-                    .build().toByteArray();
+        if (message instanceof com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry membership) {
+            // S4 extend: Serialize/deserialize MembershipEntry with actual data
+            final String nodeIdentifier = membership.getNodeIdentifier();
+            final boolean addMember = membership.getAddMember();
+            // For ADD operations, use existing behavior to create proper WireMessage; 
+            // for REMOVE, wrap the proto member as a WireMessage variant
+            return WireMessage.newBuilder().setMembershipEntry(membership).build().toByteArray();
         }
         throw new IllegalArgumentException(
                 "Not a wire type (none of the " + FRAME_VARIANTS + " frame variants): "
@@ -226,8 +228,8 @@ public final class WireCodec {
             case CLUSTER_JOIN_REQUEST:
                 return new ClusterJoinRequest();
             case MEMBERSHIP_ENTRY:
-                // S3 stub — just create empty MembershipEntry; full node_id/add_member handled by RaftLog entry
-                return com.github.jocull.raftcache.lib.raft.messages.proto.MembershipEntry.getDefaultInstance();
+                // S4 extend: deserialize MembershipEntry proto message directly (no POJO wrapper needed)
+                return message.getMembershipEntry();
             case MESSAGE_NOT_SET:
             default:
                 throw new com.google.protobuf.InvalidProtocolBufferException(
